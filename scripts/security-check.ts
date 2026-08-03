@@ -40,31 +40,46 @@ const CRITICAL_SECURITY_RULES = [
 // TODO: Address these vulnerabilities in a separate security update
 const IGNORED_VULNERABLE_PACKAGES = [
   "jsondiffpatch", // XSS in ai dependency - tracked separately
-  "undici", // DoS in mem0ai dependency - requires upstream fix
   "ai", // File upload bypass - planned upgrade
+  // undici/lodash/lodash-es removed: now patched via pnpm.overrides.
+  // The @opentelemetry/* advisories below come ONLY from a stale @juspay/neurolink@9.37.0
+  // that pnpm auto-installs to satisfy @juspay/hippocampus's neurolink peer. That old
+  // neurolink directly depends on the vulnerable OTEL; the latest published neurolink
+  // (>=9.70.x) removed those deps. They are a dev-install artifact and do NOT reach
+  // consumers of the published package (peer deps are not bundled).
+  //
+  // UPSTREAM IS FIXED: @juspay/hippocampus@0.1.7 raised its neurolink peer to ">=9.70.0"
+  // (this change bumps the dependency to it). The entries remain only because of a pnpm
+  // resolver bug: pnpm keeps resolving the peer to 9.37.0 even though that violates the
+  // published ">=9.70.0" range — reproduced through --force, --fix-lockfile, dedupe,
+  // pnpm update, and a full lockfile regen. These entries clear automatically once pnpm
+  // resolves the peer correctly. Upstream: https://github.com/juspay/hippocampus (v0.1.7)
+  "@opentelemetry/sdk-node",
+  "@opentelemetry/auto-instrumentations-node",
+  "@opentelemetry/exporter-prometheus",
 ];
 
-interface SecurityIssue {
+type SecurityIssue = {
   level: string;
   category: string;
   message: string;
   details: Record<string, unknown> | null;
   timestamp: string;
-}
+};
 
-interface GitleaksFinding {
+type GitleaksFinding = {
   RuleID?: string;
   File?: string;
   StartLine?: number;
   Description?: string;
-}
+};
 
-interface SecurityResults {
+type SecurityResults = {
   secrets: { status: string; details: GitleaksFinding[] };
   dependencies: { status: string; details: unknown[] };
   licenses: { status: string; details: unknown[] };
   bestPractices: { status: string; details: unknown[] };
-}
+};
 
 class SecurityValidator {
   errors: SecurityIssue[];
@@ -147,13 +162,6 @@ class SecurityValidator {
           (pkg) =>
             output.includes(`│ Package             │ ${pkg}`) ||
             output.includes(`Package: ${pkg}`),
-        );
-
-        // Check if ALL vulnerabilities are from ignored packages
-        const allIgnored = IGNORED_VULNERABLE_PACKAGES.every(
-          (pkg) =>
-            !output.includes("│ Package") ||
-            output.includes(`│ Package             │ ${pkg}`),
         );
 
         if (isIgnoredPackage) {

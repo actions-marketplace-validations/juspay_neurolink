@@ -4,15 +4,13 @@
  */
 
 import { createClient, type RedisClientOptions } from "redis";
-import { logger } from "./logger.js";
 import type {
   ChatMessage,
-  RedisStorageConfig,
+  RedisClient,
   RedisConversationObject,
-} from "../types/conversation.js";
-
-// Redis client type
-type RedisClient = ReturnType<typeof createClient>;
+  RedisStorageConfig,
+} from "../types/index.js";
+import { logger } from "./logger.js";
 
 const SESSION_ONLY_PREFIX = "session-only:";
 
@@ -30,7 +28,9 @@ const pendingConnections = new Map<string, Promise<RedisClient>>();
 export async function getPooledRedisClient(
   config: Required<RedisStorageConfig>,
 ): Promise<RedisClient> {
-  const key = `${config.host}:${config.port}:${config.db}:${config.password ? "auth" : "noauth"}`;
+  const key = config.url
+    ? `url:${config.url.replace(/:\/\/[^:]+:[^@]+@/, "://[redacted]@")}`
+    : `${config.host}:${config.port}:${config.db}:${config.password ? "auth" : "noauth"}`;
   const existing = connectionPool.get(key);
 
   if (existing && existing.client.isOpen) {
@@ -146,7 +146,8 @@ export function getPoolStats(): Array<{
 export async function createRedisClient(
   config: Required<RedisStorageConfig>,
 ): Promise<RedisClient> {
-  const url = `redis://${config.host}:${config.port}/${config.db}`;
+  const url =
+    config.url || `redis://${config.host}:${config.port}/${config.db}`;
 
   // Create client options
   const clientOptions: RedisClientOptions = {
@@ -160,7 +161,7 @@ export async function createRedisClient(
         }
         const delay = Math.min(
           (config.connectionOptions?.retryDelayOnFailover || 100) *
-            Math.pow(2, retries),
+            2 ** retries,
           10000,
         );
         return delay;
@@ -168,7 +169,7 @@ export async function createRedisClient(
     },
   };
 
-  if (config.password) {
+  if (config.password && !config.url) {
     clientOptions.password = config.password;
   }
 
@@ -261,7 +262,7 @@ export function serializeConversation(
  * Deserializes conversation object from Redis storage
  */
 export function deserializeConversation(
-  data: string | null,
+  data: string | Buffer | null,
 ): RedisConversationObject | null {
   if (!data) {
     return null;
@@ -269,7 +270,7 @@ export function deserializeConversation(
 
   try {
     // Parse as unknown first, then validate before casting
-    const parsedData = JSON.parse(data) as unknown;
+    const parsedData = JSON.parse(String(data)) as unknown;
 
     // Check if the parsed data is an object with required properties
     if (
@@ -401,8 +402,8 @@ export async function scanKeys(
       });
 
       // Extract cursor and keys from result
-      cursor = result.cursor;
-      const keys = result.keys || [];
+      cursor = String(result.cursor);
+      const keys = (result.keys || []).map(String);
 
       // Add keys to result array
       allKeys.push(...keys);
@@ -448,11 +449,43 @@ export function getNormalizedConfig(
     "user:sessions:",
   );
 
+  let host = config.host || "localhost";
+  let port = config.port || 6379;
+  let username = config.username || "";
+  let password = config.password || "";
+  let db = config.db || 0;
+  let url = config.url;
+
+  if (url) {
+    try {
+      const parsedUrl = new URL(url);
+      host = parsedUrl.hostname;
+      port = parsedUrl.port ? parseInt(parsedUrl.port) : 6379;
+      username = parsedUrl.username || username;
+      password = parsedUrl.password || password;
+      db = parsedUrl.pathname
+        ? parseInt(parsedUrl.pathname.replace("/", "")) || 0
+        : 0;
+    } catch (e) {
+      const sanitizedUrl = url.replace(/:\/\/[^@]+@/, "://[redacted]@");
+      logger.warn(
+        "[redisUtils] Failed to parse Redis URL, falling back to component-based connection",
+        {
+          url: sanitizedUrl,
+          error: e instanceof Error ? e.message : String(e),
+        },
+      );
+      url = undefined;
+    }
+  }
+
   return {
-    host: config.host || "localhost",
-    port: config.port || 6379,
-    password: config.password || "",
-    db: config.db || 0,
+    url: url || "",
+    host,
+    port,
+    password,
+    username,
+    db,
     keyPrefix,
     userSessionsKeyPrefix:
       config.userSessionsKeyPrefix || defaultUserSessionsPrefix,

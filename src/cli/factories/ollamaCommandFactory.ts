@@ -13,17 +13,7 @@ import { logger } from "../../lib/utils/logger.js";
 import { OllamaUtils } from "../utils/ollamaUtils.js";
 import { getTopModelChoices } from "../../lib/utils/modelChoices.js";
 import { AIProviderName } from "../../lib/types/index.js";
-
-// Allowed commands for security
-type AllowedCommand =
-  | "ollama"
-  | "curl"
-  | "systemctl"
-  | "pkill"
-  | "killall"
-  | "open"
-  | "taskkill"
-  | "start";
+import type { AllowedCommand } from "../../lib/types/index.js";
 
 /**
  * Factory for creating Ollama CLI commands using the Factory Pattern
@@ -410,7 +400,7 @@ export class OllamaCommandFactory {
       if (downloadModel) {
         const { selectedModel } = await inquirer.prompt([
           {
-            type: "list",
+            type: "select",
             name: "selectedModel",
             message: "Select a model to download:",
             choices: getTopModelChoices(AIProviderName.OLLAMA, 5).map(

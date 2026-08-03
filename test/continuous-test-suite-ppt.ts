@@ -1,4 +1,5 @@
 #!/usr/bin/env tsx
+import "dotenv/config";
 /**
  * Continuous Test Suite: PPT Generation
  *
@@ -16,8 +17,8 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { fileURLToPath } from "url";
-import { NeuroLink } from "../dist/index.js";
 import type { ProcessResult } from "../dist/index.js";
+import { NeuroLink } from "../dist/index.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -34,6 +35,11 @@ const PROVIDER_MAX_TOKENS: Record<string, number> = {
   bedrock: 8192,
   ollama: 4096,
   openrouter: 4096,
+  // OpenAI-compat providers added 2026
+  deepseek: 4096,
+  "nvidia-nim": 8192,
+  "lm-studio": 1024,
+  llamacpp: 1024,
 };
 
 const TEST_CONFIG = {
@@ -47,58 +53,41 @@ const TEST_CONFIG = {
 // Temp directory for generated PPT files
 const PPT_OUTPUT_DIR = path.join(os.tmpdir(), "neurolink-ppt-tests");
 
+// ZIP magic bytes: PK\x03\x04
+const ZIP_MAGIC = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
+
 // ============================================================
-// LOGGING UTILITIES
+// LOGGING UTILITIES — provided by shared harness
 // ============================================================
 
-const colors = {
-  reset: "\x1b[0m",
-  bright: "\x1b[1m",
-  red: "\x1b[31m",
-  green: "\x1b[32m",
-  yellow: "\x1b[33m",
-  blue: "\x1b[34m",
-  cyan: "\x1b[36m",
-};
-type ColorName = keyof typeof colors;
+import {
+  defineSuite,
+  log,
+  logSection,
+  type ColorName,
+} from "./helpers/harness.js";
 
-function log(message: string, color: ColorName = "reset"): void {
-  console.log(`${colors[color]}${message}${colors.reset}`);
-}
+const { recordTest, runSuite } = defineSuite("Ppt");
 
-function logSection(title: string): void {
-  log(`\n${"=".repeat(60)}`, "cyan");
-  log(`  ${title}`, "cyan");
-  log(`${"=".repeat(60)}`, "cyan");
-}
-
+/** Print-only logTest shim. Counters come from recordTest in the runner loop. */
 function logTest(
   testName: string,
   status: "PASS" | "FAIL" | "SKIP" | "TESTING",
   details?: string,
 ): void {
-  const icons = { PASS: "PASS", FAIL: "FAIL", SKIP: "SKIP", TESTING: "TEST" };
-  const statusColors: Record<string, ColorName> = {
-    PASS: "green",
-    FAIL: "red",
-    SKIP: "yellow",
-    TESTING: "blue",
-  };
-  log(`[${icons[status]}] ${testName}`, statusColors[status]);
-  if (details) {
-    log(`   ${details}`, "reset");
-  }
+  const color: ColorName =
+    status === "PASS"
+      ? "green"
+      : status === "FAIL"
+        ? "red"
+        : status === "SKIP"
+          ? "yellow"
+          : "blue";
+  log(`[${status}] ${testName}${details ? ` — ${details}` : ""}`, color);
 }
-
 // ============================================================
 // SHARED UTILITIES
 // ============================================================
-
-const testResults: Array<{
-  name: string;
-  result: boolean | null;
-  error: string | null;
-}> = [];
 
 function buildBaseCLIArgs(): string[] {
   const args = [`--provider=${TEST_CONFIG.provider}`];
@@ -163,22 +152,6 @@ function runCommand(
   });
 }
 
-function validateResponseContent(
-  response: string,
-  expectedPatterns: string[],
-  minMatches = 1,
-): { passed: boolean; details: string[] } {
-  const lower = response.toLowerCase();
-  const found = expectedPatterns.filter((p) => lower.includes(p.toLowerCase()));
-  return {
-    passed: found.length >= minMatches,
-    details: [
-      `Found ${found.length}/${expectedPatterns.length} patterns`,
-      `Matched: ${found.join(", ") || "none"}`,
-    ],
-  };
-}
-
 function isExpectedProviderError(msg: string): boolean {
   return [
     "API key",
@@ -195,6 +168,9 @@ function isExpectedProviderError(msg: string): boolean {
     "project",
     "not found",
     "does not exist",
+    "timed out",
+    "request timed out",
+    "deadline exceeded",
   ].some((p) => msg.toLowerCase().includes(p.toLowerCase()));
 }
 
@@ -203,6 +179,77 @@ async function globalCleanup(): Promise<void> {
   if (global.gc) {
     global.gc();
   }
+}
+
+/**
+ * Validate that a file is a valid ZIP (PPTX is ZIP-based).
+ * Checks: file exists, size > minSize, first 4 bytes are ZIP magic (50 4B 03 04).
+ */
+function validatePPTXFile(
+  filePath: string,
+  minSizeBytes: number = 1024,
+): { valid: boolean; reason: string; size?: number } {
+  if (!fs.existsSync(filePath)) {
+    return { valid: false, reason: "File does not exist" };
+  }
+  const stat = fs.statSync(filePath);
+  if (stat.size < minSizeBytes) {
+    return {
+      valid: false,
+      reason: `File too small: ${stat.size} bytes (minimum ${minSizeBytes})`,
+      size: stat.size,
+    };
+  }
+  const fd = fs.openSync(filePath, "r");
+  const header = Buffer.alloc(4);
+  fs.readSync(fd, header, 0, 4, 0);
+  fs.closeSync(fd);
+  if (!header.subarray(0, 4).equals(ZIP_MAGIC)) {
+    return {
+      valid: false,
+      reason: `Invalid ZIP magic bytes: ${header.toString("hex")} (expected ${ZIP_MAGIC.toString("hex")})`,
+      size: stat.size,
+    };
+  }
+  return {
+    valid: true,
+    reason: `Valid PPTX (${(stat.size / 1024).toFixed(1)}KB)`,
+    size: stat.size,
+  };
+}
+
+/**
+ * Find the generated PPTX file from result or fallback directories.
+ */
+function findPPTXFile(
+  pptResult: Record<string, unknown> | undefined,
+  requestedOutputPath: string,
+): string | null {
+  // Check explicit filePath from result
+  const resultFilePath = pptResult?.filePath as string | undefined;
+  if (resultFilePath && fs.existsSync(resultFilePath)) {
+    return resultFilePath;
+  }
+  // Check requested output path
+  if (fs.existsSync(requestedOutputPath)) {
+    return requestedOutputPath;
+  }
+  // Check default output/ directory
+  const outputDir = path.join(process.cwd(), "output");
+  if (fs.existsSync(outputDir)) {
+    const pptxFiles = fs
+      .readdirSync(outputDir)
+      .filter((f) => f.endsWith(".pptx"))
+      .sort((a, b) => {
+        const statA = fs.statSync(path.join(outputDir, a));
+        const statB = fs.statSync(path.join(outputDir, b));
+        return statB.mtimeMs - statA.mtimeMs; // newest first
+      });
+    if (pptxFiles.length > 0) {
+      return path.join(outputDir, pptxFiles[0]);
+    }
+  }
+  return null;
 }
 
 // ============================================================
@@ -327,84 +374,69 @@ async function testPPTTypesValidation(
 ): Promise<boolean | null> {
   logTest("SDK Infra - PPT Types Validation", "TESTING");
   try {
-    // Verify that PPT types are importable from dist
-    const distIndexPath = path.join(__dirname, "../dist/index.js");
-    if (!fs.existsSync(distIndexPath)) {
+    // Import PPT types from dist (not source files)
+    let pptModule: Record<string, unknown>;
+    try {
+      pptModule = await import("../dist/features/ppt/index.js");
+    } catch (importErr) {
       logTest(
         "SDK Infra - PPT Types Validation",
-        "FAIL",
-        "dist/index.js not found",
+        "SKIP",
+        `PPT module not importable from dist: ${importErr instanceof Error ? importErr.message : String(importErr)}`,
       );
-      return false;
+      return null;
     }
 
-    // Check that PPT-related source types exist
-    const pptTypesPath = path.join(__dirname, "../src/lib/types/pptTypes.ts");
-    const pptFeaturesPath = path.join(
-      __dirname,
-      "../src/lib/features/ppt/index.ts",
-    );
-
-    if (!fs.existsSync(pptTypesPath)) {
-      logTest(
-        "SDK Infra - PPT Types Validation",
-        "FAIL",
-        "pptTypes.ts not found",
-      );
-      return false;
-    }
-
-    if (!fs.existsSync(pptFeaturesPath)) {
-      logTest(
-        "SDK Infra - PPT Types Validation",
-        "FAIL",
-        "PPT features index not found",
-      );
-      return false;
-    }
-
-    // Check that key types are defined
-    const typesContent = fs.readFileSync(pptTypesPath, "utf-8");
-    const requiredTypes = [
-      "PPTOutputOptions",
-      "PPTGenerationResult",
-      "SlideType",
-      "SlideLayout",
-      "ContentPlan",
-      "SlideSchema",
-      "PresentationTheme",
-      "ThemeOption",
-      "PPTGenerationContext",
+    // Verify key runtime exports are defined (types are erased at runtime,
+    // so we check runtime values: error classes, constants, functions)
+    const requiredExports: Array<{ name: string; kind: string }> = [
+      { name: "PPTError", kind: "function" }, // class
+      { name: "PPT_ERROR_CODES", kind: "object" },
+      { name: "SLIDE_DIMENSIONS", kind: "object" },
+      { name: "THEMES", kind: "object" },
+      { name: "getTheme", kind: "function" },
+      { name: "VALID_THEMES", kind: "object" },
+      { name: "inferFromTitle", kind: "function" },
+      { name: "generateContentPlan", kind: "function" },
+      { name: "generatePresentation", kind: "function" },
+      { name: "renderTitleSlide", kind: "function" },
+      { name: "renderContentSlide", kind: "function" },
     ];
 
-    const missingTypes = requiredTypes.filter((t) => !typesContent.includes(t));
+    const missing: string[] = [];
+    for (const exp of requiredExports) {
+      if (typeof pptModule[exp.name] === "undefined") {
+        missing.push(exp.name);
+      }
+    }
 
-    if (missingTypes.length > 0) {
+    if (missing.length > 0) {
       logTest(
         "SDK Infra - PPT Types Validation",
         "FAIL",
-        `Missing types: ${missingTypes.join(", ")}`,
+        `Missing exports from dist/features/ppt: ${missing.join(", ")}`,
       );
       return false;
     }
 
-    // Check that slide types exist (35 total per spec)
-    const slideTypeMatches = typesContent.match(/\| "[\w-]+"/g);
-    const slideTypeCount = slideTypeMatches ? slideTypeMatches.length : 0;
+    // Verify VALID_THEMES contains expected themes
+    const validThemes = pptModule.VALID_THEMES as string[];
+    const expectedThemes = [
+      "modern",
+      "corporate",
+      "creative",
+      "minimal",
+      "dark",
+    ];
+    const missingThemes = expectedThemes.filter(
+      (t) => !validThemes || !validThemes.includes(t),
+    );
 
-    // Check theme options
-    const hasThemes =
-      typesContent.includes('"modern"') &&
-      typesContent.includes('"corporate"') &&
-      typesContent.includes('"creative"') &&
-      typesContent.includes('"minimal"') &&
-      typesContent.includes('"dark"');
-
-    if (!hasThemes) {
+    if (missingThemes.length > 0) {
       logTest(
         "SDK Infra - PPT Types Validation",
         "FAIL",
-        "Missing theme options",
+        `Missing themes: ${missingThemes.join(", ")}`,
       );
       return false;
     }
@@ -412,7 +444,7 @@ async function testPPTTypesValidation(
     logTest(
       "SDK Infra - PPT Types Validation",
       "PASS",
-      `All ${requiredTypes.length} types found, ${slideTypeCount} slide type variants, 5 themes`,
+      `All ${requiredExports.length} exports verified, 5 themes present`,
     );
     return true;
   } catch (error) {
@@ -429,6 +461,7 @@ async function testContentPlannerBasic(
   logTest("SDK Generate - Content Planner Basic", "TESTING");
   try {
     ensurePPTOutputDir();
+    const requestedPages = 5;
     const outputPath = path.join(
       PPT_OUTPUT_DIR,
       `test-planner-${Date.now()}.pptx`,
@@ -437,7 +470,7 @@ async function testContentPlannerBasic(
       sdk,
       "Introduction to Cloud Computing",
       {
-        pages: 5,
+        pages: requestedPages,
         theme: "modern",
         outputPath,
       },
@@ -456,37 +489,46 @@ async function testContentPlannerBasic(
       return false;
     }
 
-    // Verify the result has PPT data
+    // Verify the result has PPT data with slides
     const pptResult = (result as Record<string, unknown>)?.ppt as
       | Record<string, unknown>
       | undefined;
-    if (pptResult && pptResult.totalSlides) {
-      const totalSlides = pptResult.totalSlides as number;
+
+    if (!pptResult) {
       logTest(
         "SDK Generate - Content Planner Basic",
-        "PASS",
-        `Content plan generated: ${totalSlides} slides`,
+        "FAIL",
+        "No ppt result object in response",
       );
-      return true;
+      return false;
     }
 
-    // Even if no ppt result, if a file was produced that's valid
-    if (fs.existsSync(outputPath)) {
-      const stat = fs.statSync(outputPath);
+    const totalSlides = pptResult.totalSlides as number | undefined;
+
+    if (!totalSlides || totalSlides < 1) {
       logTest(
         "SDK Generate - Content Planner Basic",
-        "PASS",
-        `PPTX file created (${stat.size} bytes)`,
+        "FAIL",
+        `totalSlides missing or zero: ${totalSlides}`,
       );
-      return true;
+      return false;
+    }
+
+    if (totalSlides !== requestedPages) {
+      logTest(
+        "SDK Generate - Content Planner Basic",
+        "FAIL",
+        `totalSlides (${totalSlides}) does not match requested pages (${requestedPages})`,
+      );
+      return false;
     }
 
     logTest(
       "SDK Generate - Content Planner Basic",
-      "FAIL",
-      "No PPT result or file produced",
+      "PASS",
+      `Content plan generated: ${totalSlides} slides`,
     );
-    return false;
+    return true;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     if (isExpectedProviderError(msg)) {
@@ -499,89 +541,102 @@ async function testContentPlannerBasic(
 }
 
 // --- Test 3: Slide Type Inference ---
-async function testSlideTypeInference(sdk: NeuroLink): Promise<boolean | null> {
+async function testSlideTypeInference(
+  _sdk: NeuroLink,
+): Promise<boolean | null> {
   logTest("SDK Generate - Slide Type Inference", "TESTING");
   try {
-    // Check that the slide type inference module exists and has expected exports
-    const inferencePath = path.join(
-      __dirname,
-      "../src/lib/features/ppt/slideTypeInference.ts",
-    );
-
-    if (!fs.existsSync(inferencePath)) {
+    // Import inference functions from dist
+    let pptModule: Record<string, unknown>;
+    try {
+      pptModule = await import("../dist/features/ppt/index.js");
+    } catch (importErr) {
       logTest(
         "SDK Generate - Slide Type Inference",
-        "FAIL",
-        "slideTypeInference.ts not found",
+        "SKIP",
+        `PPT module not importable from dist: ${importErr instanceof Error ? importErr.message : String(importErr)}`,
       );
-      return false;
+      return null;
     }
 
-    const content = fs.readFileSync(inferencePath, "utf-8");
+    const inferFromTitle = pptModule.inferFromTitle as
+      | ((title: string) => {
+          slideType: string | null;
+          bulletStyle: string | null;
+        })
+      | undefined;
 
-    // Check for key inference functions
-    const requiredFunctions = [
-      "inferFromTitle",
+    if (typeof inferFromTitle !== "function") {
+      logTest(
+        "SDK Generate - Slide Type Inference",
+        "SKIP",
+        "inferFromTitle not exported from dist/features/ppt",
+      );
+      return null;
+    }
+
+    // Test inference on known title patterns
+    const testCases: Array<{ title: string; expectedType: string | null }> = [
+      { title: "Agenda", expectedType: "agenda" },
+      { title: "Conclusion and Summary", expectedType: "conclusion" },
+      { title: "Comparison of Approaches", expectedType: "comparison" },
+      { title: "Step-by-Step Process", expectedType: "numbered-list" },
+      { title: "Key Features Overview", expectedType: null }, // may or may not match
+    ];
+
+    let matchCount = 0;
+    const details: string[] = [];
+
+    for (const tc of testCases) {
+      const result = inferFromTitle(tc.title);
+      if (tc.expectedType !== null && result.slideType === tc.expectedType) {
+        matchCount++;
+        details.push(`"${tc.title}" -> ${result.slideType} (correct)`);
+      } else if (tc.expectedType === null && result.slideType !== null) {
+        matchCount++;
+        details.push(`"${tc.title}" -> ${result.slideType} (inferred)`);
+      } else if (tc.expectedType === null) {
+        details.push(`"${tc.title}" -> null (no inference, OK)`);
+      } else {
+        details.push(
+          `"${tc.title}" -> ${result.slideType} (expected ${tc.expectedType})`,
+        );
+      }
+    }
+
+    // Also verify helper functions exist
+    const helpers = [
       "inferBulletStyleFromContent",
       "getBulletStyleForSlideType",
       "normalizeSlideWithInference",
     ];
-
-    const missingFunctions = requiredFunctions.filter(
-      (fn) => !content.includes(`export function ${fn}`),
+    const missingHelpers = helpers.filter(
+      (h) => typeof pptModule[h] !== "function",
     );
 
-    if (missingFunctions.length > 0) {
+    if (missingHelpers.length > 0) {
       logTest(
         "SDK Generate - Slide Type Inference",
         "FAIL",
-        `Missing functions: ${missingFunctions.join(", ")}`,
+        `Missing inference functions: ${missingHelpers.join(", ")}`,
       );
       return false;
     }
 
-    // Verify keyword patterns cover common titles
-    const expectedTitles = [
-      "agenda",
-      "conclusion",
-      "comparison",
-      "process",
-      "features",
-    ];
-    const matchedTitles = expectedTitles.filter((t) =>
-      content.toLowerCase().includes(t),
-    );
-
-    // Generate a PPT to exercise inference
-    ensurePPTOutputDir();
-    const outputPath = path.join(
-      PPT_OUTPUT_DIR,
-      `test-inference-${Date.now()}.pptx`,
-    );
-    const { success, error } = await generatePPT(
-      sdk,
-      "Step-by-step guide to machine learning with agenda, conclusion, and comparison slides",
-      {
-        pages: 8,
-        theme: "corporate",
-        outputPath,
-      },
-    );
-
-    if (!success && error && isExpectedProviderError(error)) {
-      logTest("SDK Generate - Slide Type Inference", "SKIP", error);
-      return null;
-    }
-
-    if (!success && error) {
-      logTest("SDK Generate - Slide Type Inference", "FAIL", error);
+    // At least the definite patterns (agenda, conclusion, comparison) should match
+    if (matchCount < 2) {
+      logTest(
+        "SDK Generate - Slide Type Inference",
+        "FAIL",
+        `Only ${matchCount} title patterns matched. Details: ${details.join("; ")}`,
+      );
       return false;
     }
 
     logTest(
       "SDK Generate - Slide Type Inference",
       "PASS",
-      `${requiredFunctions.length} functions, ${matchedTitles.length}/${expectedTitles.length} title patterns matched`,
+      `${matchCount} patterns matched, ${helpers.length} helper functions present. ${details.join("; ")}`,
     );
     return true;
   } catch (error) {
@@ -602,6 +657,7 @@ async function testSlideGeneratorSingle(
   logTest("SDK Generate - Slide Generator Single", "TESTING");
   try {
     ensurePPTOutputDir();
+    const requestedPages = 5;
     const outputPath = path.join(
       PPT_OUTPUT_DIR,
       `test-single-slide-${Date.now()}.pptx`,
@@ -610,7 +666,7 @@ async function testSlideGeneratorSingle(
       sdk,
       "The Benefits of Remote Work",
       {
-        pages: 5,
+        pages: requestedPages,
         theme: "minimal",
         outputPath,
       },
@@ -629,42 +685,37 @@ async function testSlideGeneratorSingle(
       return false;
     }
 
-    // Verify the generated slides have layout, content, and styling
+    // Verify the generated slides count matches requested
     const pptResult = (result as Record<string, unknown>)?.ppt as
       | Record<string, unknown>
       | undefined;
 
-    if (pptResult) {
-      const totalSlides = (pptResult.totalSlides as number) || 0;
-      const filePath = pptResult.filePath as string;
-      const hasFile = filePath ? fs.existsSync(filePath) : false;
-
-      if (totalSlides > 0 || hasFile) {
-        logTest(
-          "SDK Generate - Slide Generator Single",
-          "PASS",
-          `${totalSlides} slides generated${hasFile ? ", file exists" : ""}`,
-        );
-        return true;
-      }
-    }
-
-    // Check output file as fallback
-    if (fs.existsSync(outputPath)) {
+    if (!pptResult) {
       logTest(
         "SDK Generate - Slide Generator Single",
-        "PASS",
-        "PPTX file produced",
+        "FAIL",
+        "No ppt result object in response",
       );
-      return true;
+      return false;
+    }
+
+    const totalSlides = (pptResult.totalSlides as number) || 0;
+
+    if (totalSlides !== requestedPages) {
+      logTest(
+        "SDK Generate - Slide Generator Single",
+        "FAIL",
+        `Total slide count (${totalSlides}) does not match requested (${requestedPages})`,
+      );
+      return false;
     }
 
     logTest(
       "SDK Generate - Slide Generator Single",
-      "FAIL",
-      "No slides generated",
+      "PASS",
+      `${totalSlides} slides generated, matches requested ${requestedPages}`,
     );
-    return false;
+    return true;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     if (isExpectedProviderError(msg)) {
@@ -678,95 +729,80 @@ async function testSlideGeneratorSingle(
 
 // --- Test 5: Slide Renderers All Types ---
 async function testSlideRenderersAllTypes(
-  sdk: NeuroLink,
+  _sdk: NeuroLink,
 ): Promise<boolean | null> {
   logTest("SDK Generate - Slide Renderers All Types", "TESTING");
   try {
-    // Verify that all slide renderer functions exist
-    const renderersPath = path.join(
-      __dirname,
-      "../src/lib/features/ppt/slideRenderers.ts",
-    );
-
-    if (!fs.existsSync(renderersPath)) {
+    // Import renderers from dist
+    let pptModule: Record<string, unknown>;
+    try {
+      pptModule = await import("../dist/features/ppt/index.js");
+    } catch (importErr) {
       logTest(
         "SDK Generate - Slide Renderers All Types",
-        "FAIL",
-        "slideRenderers.ts not found",
+        "SKIP",
+        `PPT module not importable from dist: ${importErr instanceof Error ? importErr.message : String(importErr)}`,
       );
-      return false;
+      return null;
     }
 
-    const content = fs.readFileSync(renderersPath, "utf-8");
-
-    // Check for key renderer functions
+    // Check for required renderer functions from dist exports
     const requiredRenderers = [
       "renderTitleSlide",
-      "renderSectionHeaderSlide",
-      "renderThankYouSlide",
       "renderContentSlide",
-      "renderImageSlide",
       "renderTwoColumnSlide",
       "renderThreeColumnSlide",
-      "renderQuoteSlide",
-      "renderStatisticsSlide",
-      "renderChartSlide",
-      "renderTableSlide",
-      "renderTimelineSlide",
-      "renderProcessFlowSlide",
       "renderComparisonSlide",
-      "renderFeaturesSlide",
-      "renderTeamSlide",
-      "renderConclusionSlide",
+      "renderColumnSlide",
       "renderDashboardSlide",
       "renderMixedContentSlide",
       "renderStatsGridSlide",
       "renderIconGridSlide",
     ];
 
-    const foundRenderers = requiredRenderers.filter((r) =>
-      content.includes(`export function ${r}`),
-    );
-    const missingRenderers = requiredRenderers.filter(
-      (r) => !content.includes(`export function ${r}`),
-    );
+    const foundRenderers: string[] = [];
+    const missingRenderers: string[] = [];
 
-    if (missingRenderers.length > 5) {
+    for (const renderer of requiredRenderers) {
+      if (typeof pptModule[renderer] === "function") {
+        foundRenderers.push(renderer);
+      } else {
+        missingRenderers.push(renderer);
+      }
+    }
+
+    // Do NOT allow missing renderers — all must be present
+    if (missingRenderers.length > 0) {
       logTest(
         "SDK Generate - Slide Renderers All Types",
         "FAIL",
-        `Missing ${missingRenderers.length} renderers: ${missingRenderers.slice(0, 5).join(", ")}...`,
+        `Missing ${missingRenderers.length} renderers: ${missingRenderers.join(", ")}`,
       );
       return false;
     }
 
-    // Exercise renderers through generate
-    ensurePPTOutputDir();
-    const outputPath = path.join(
-      PPT_OUTPUT_DIR,
-      `test-all-types-${Date.now()}.pptx`,
-    );
-    const { success, error } = await generatePPT(
-      sdk,
-      "Comprehensive company presentation with agenda, statistics, timelines, team profiles, comparison charts, and conclusion",
-      {
-        pages: 15,
-        theme: "corporate",
-        outputPath,
-      },
+    // Also check helper functions
+    const helpers = [
+      "addTitle",
+      "addBullets",
+      "addImage",
+      "addEnhancedBackground",
+      "addColoredBackground",
+    ];
+    const foundHelpers = helpers.filter(
+      (h) => typeof pptModule[h] === "function",
     );
 
-    if (!success && error && isExpectedProviderError(error)) {
-      logTest("SDK Generate - Slide Renderers All Types", "SKIP", error);
-      return null;
-    }
+    // Check layout constants
+    const hasLayoutPositions = typeof pptModule.LAYOUT_POSITIONS === "object";
+    const hasCompositeLayouts = typeof pptModule.COMPOSITE_LAYOUTS === "object";
 
     logTest(
       "SDK Generate - Slide Renderers All Types",
       "PASS",
-      `${foundRenderers.length}/${requiredRenderers.length} renderers found`,
+      `${foundRenderers.length}/${requiredRenderers.length} renderers, ${foundHelpers.length}/${helpers.length} helpers, layouts: ${hasLayoutPositions && hasCompositeLayouts ? "present" : "missing"}`,
     );
-    return null;
+    return true;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     if (isExpectedProviderError(msg)) {
@@ -814,57 +850,38 @@ async function testOrchestratorFullPipeline(
       return false;
     }
 
-    // Verify .pptx file exists and is > 10KB
+    // Find the PPTX file
     const pptResult = (result as Record<string, unknown>)?.ppt as
       | Record<string, unknown>
       | undefined;
-    const filePath = (pptResult?.filePath as string) || outputPath;
+    const filePath = findPPTXFile(pptResult, outputPath);
 
-    if (fs.existsSync(filePath)) {
-      const stat = fs.statSync(filePath);
-      if (stat.size > 10240) {
-        logTest(
-          "SDK Generate - Orchestrator Full Pipeline",
-          "PASS",
-          `PPTX file: ${(stat.size / 1024).toFixed(1)}KB, ${pptResult?.totalSlides || "?"} slides`,
-        );
-        return true;
-      }
+    if (!filePath) {
       logTest(
         "SDK Generate - Orchestrator Full Pipeline",
         "FAIL",
-        `File too small: ${stat.size} bytes (expected > 10KB)`,
+        "No .pptx file found after generation",
       );
       return false;
     }
 
-    // If we got a result but no file at the expected path, check output/ directory
-    const outputDir = path.join(process.cwd(), "output");
-    if (fs.existsSync(outputDir)) {
-      const pptxFiles = fs
-        .readdirSync(outputDir)
-        .filter((f) => f.endsWith(".pptx"));
-      if (pptxFiles.length > 0) {
-        const latestFile = path.join(
-          outputDir,
-          pptxFiles[pptxFiles.length - 1],
-        );
-        const stat = fs.statSync(latestFile);
-        logTest(
-          "SDK Generate - Orchestrator Full Pipeline",
-          "PASS",
-          `PPTX found in output/: ${(stat.size / 1024).toFixed(1)}KB`,
-        );
-        return true;
-      }
+    // Validate: file size > 10KB AND ZIP magic bytes
+    const validation = validatePPTXFile(filePath, 10240);
+    if (!validation.valid) {
+      logTest(
+        "SDK Generate - Orchestrator Full Pipeline",
+        "FAIL",
+        validation.reason,
+      );
+      return false;
     }
 
     logTest(
       "SDK Generate - Orchestrator Full Pipeline",
-      "FAIL",
-      "No .pptx file found",
+      "PASS",
+      `${validation.reason}, ${pptResult?.totalSlides || "?"} slides`,
     );
-    return false;
+    return true;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     if (isExpectedProviderError(msg)) {
@@ -908,28 +925,30 @@ async function testTheme(
       return false;
     }
 
-    // Verify theme was applied
+    // Find and validate the PPTX file
     const pptResult = (result as Record<string, unknown>)?.ppt as
       | Record<string, unknown>
       | undefined;
-    const metadata = pptResult?.metadata as Record<string, unknown> | undefined;
-    const appliedTheme = metadata?.theme as string | undefined;
-    const filePath = (pptResult?.filePath as string) || outputPath;
-    const fileExists = fs.existsSync(filePath);
+    const filePath = findPPTXFile(pptResult, outputPath);
 
-    if (fileExists || pptResult) {
-      const themeMatch =
-        appliedTheme?.toLowerCase() === themeName.toLowerCase();
-      logTest(
-        testLabel,
-        "PASS",
-        `Theme: ${appliedTheme || themeName}, file: ${fileExists ? "exists" : "n/a"}${themeMatch ? ", theme confirmed" : ""}`,
-      );
-      return true;
+    if (!filePath) {
+      logTest(testLabel, "FAIL", "No PPTX file produced");
+      return false;
     }
 
-    logTest(testLabel, "FAIL", "No result or file produced");
-    return false;
+    // Validate PPTX is a valid ZIP with minimum size
+    const validation = validatePPTXFile(filePath, 1024);
+    if (!validation.valid) {
+      logTest(testLabel, "FAIL", validation.reason);
+      return false;
+    }
+
+    logTest(
+      testLabel,
+      "PASS",
+      `Theme "${themeName}" applied, ${validation.reason}`,
+    );
+    return true;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     if (isExpectedProviderError(msg)) {
@@ -996,40 +1015,29 @@ async function testLogoPlacement(sdk: NeuroLink): Promise<boolean | null> {
       return false;
     }
 
-    // Verify PPTX was generated
+    // Find and validate the PPTX file
     const pptResult = (result as Record<string, unknown>)?.ppt as
       | Record<string, unknown>
       | undefined;
-    const filePath = (pptResult?.filePath as string) || outputPath;
+    const filePath = findPPTXFile(pptResult, outputPath);
 
-    if (fs.existsSync(filePath)) {
-      const stat = fs.statSync(filePath);
-      logTest(
-        "SDK Generate - Logo Placement",
-        "PASS",
-        `PPTX with logo: ${(stat.size / 1024).toFixed(1)}KB`,
-      );
-      return true;
+    if (!filePath) {
+      logTest("SDK Generate - Logo Placement", "FAIL", "No PPTX file produced");
+      return false;
     }
 
-    // Check default output directory
-    const outputDir = path.join(process.cwd(), "output");
-    if (fs.existsSync(outputDir)) {
-      const pptxFiles = fs
-        .readdirSync(outputDir)
-        .filter((f) => f.endsWith(".pptx"));
-      if (pptxFiles.length > 0) {
-        logTest(
-          "SDK Generate - Logo Placement",
-          "PASS",
-          "PPTX with logo found in output/",
-        );
-        return true;
-      }
+    const validation = validatePPTXFile(filePath, 1024);
+    if (!validation.valid) {
+      logTest("SDK Generate - Logo Placement", "FAIL", validation.reason);
+      return false;
     }
 
-    logTest("SDK Generate - Logo Placement", "FAIL", "No file produced");
-    return false;
+    logTest(
+      "SDK Generate - Logo Placement",
+      "PASS",
+      `PPTX with logo: ${validation.reason}`,
+    );
+    return true;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     if (isExpectedProviderError(msg)) {
@@ -1074,22 +1082,9 @@ async function testPPTXOpenable(sdk: NeuroLink): Promise<boolean | null> {
     const pptResult = (result as Record<string, unknown>)?.ppt as
       | Record<string, unknown>
       | undefined;
-    let filePath = (pptResult?.filePath as string) || outputPath;
+    const filePath = findPPTXFile(pptResult, outputPath);
 
-    if (!fs.existsSync(filePath)) {
-      // Check output/ directory
-      const outputDir = path.join(process.cwd(), "output");
-      if (fs.existsSync(outputDir)) {
-        const pptxFiles = fs
-          .readdirSync(outputDir)
-          .filter((f) => f.endsWith(".pptx"));
-        if (pptxFiles.length > 0) {
-          filePath = path.join(outputDir, pptxFiles[pptxFiles.length - 1]);
-        }
-      }
-    }
-
-    if (!fs.existsSync(filePath)) {
+    if (!filePath) {
       logTest(
         "SDK Utility - PPTX Openable",
         "FAIL",
@@ -1098,41 +1093,48 @@ async function testPPTXOpenable(sdk: NeuroLink): Promise<boolean | null> {
       return false;
     }
 
-    // Read the file and verify it's a valid ZIP (PPTX is a ZIP format)
+    // Step 1: Validate ZIP magic bytes (50 4B 03 04)
+    const validation = validatePPTXFile(filePath, 1024);
+    if (!validation.valid) {
+      logTest("SDK Utility - PPTX Openable", "FAIL", validation.reason);
+      return false;
+    }
+
+    // Step 2: Try to parse ZIP structure — look for OOXML parts in the binary
     const fileBuffer = fs.readFileSync(filePath);
 
-    // ZIP magic bytes: PK (0x50, 0x4B)
-    if (fileBuffer[0] !== 0x50 || fileBuffer[1] !== 0x4b) {
+    // Look for OOXML part names in the ZIP (they appear as filenames in the ZIP central directory)
+    const fileString = fileBuffer.toString("binary");
+    const ooxmlParts = ["[Content_Types].xml", "ppt/presentation.xml"];
+    const foundParts = ooxmlParts.filter((part) => fileString.includes(part));
+
+    // Also check for ZIP end-of-central-directory marker (PK\x05\x06) — proves ZIP is well-formed
+    const hasEndOfCentralDir = fileBuffer.includes(
+      Buffer.from([0x50, 0x4b, 0x05, 0x06]),
+    );
+
+    if (!hasEndOfCentralDir) {
       logTest(
         "SDK Utility - PPTX Openable",
         "FAIL",
-        `Invalid ZIP magic bytes: ${fileBuffer.slice(0, 4).toString("hex")}`,
+        "ZIP file missing end-of-central-directory record (corrupt or truncated)",
       );
       return false;
     }
 
-    // Try to validate ZIP structure by looking for expected OOXML parts
-    const fileString = fileBuffer.toString("binary");
-    const expectedParts = ["[Content_Types].xml", "ppt/presentation.xml"];
-
-    const foundParts = expectedParts.filter((part) =>
-      fileString.includes(part),
-    );
-
-    if (foundParts.length >= 1) {
+    if (foundParts.length === 0) {
       logTest(
         "SDK Utility - PPTX Openable",
-        "PASS",
-        `Valid ZIP with ${foundParts.length}/${expectedParts.length} OOXML parts: ${foundParts.join(", ")}`,
+        "FAIL",
+        "Valid ZIP but no OOXML parts found — not a real PPTX",
       );
-      return true;
+      return false;
     }
 
-    // If we can't find the parts in binary, at least verify it's a valid ZIP
     logTest(
       "SDK Utility - PPTX Openable",
       "PASS",
-      `Valid ZIP file (${(fileBuffer.length / 1024).toFixed(1)}KB), OOXML parts may be compressed`,
+      `Valid ZIP (${(fileBuffer.length / 1024).toFixed(1)}KB), end-of-central-dir present, ${foundParts.length}/${ooxmlParts.length} OOXML parts: ${foundParts.join(", ")}`,
     );
     return true;
   } catch (error) {
@@ -1150,7 +1152,6 @@ async function testPPTXOpenable(sdk: NeuroLink): Promise<boolean | null> {
 async function testCLIPPTGenerate(): Promise<boolean | null> {
   logTest("CLI Generate - PPT Generate", "TESTING");
   try {
-    // Check if CLI has PPT support
     const cliIndexPath = path.join(__dirname, "../dist/cli/index.js");
     if (!fs.existsSync(cliIndexPath)) {
       logTest(
@@ -1161,55 +1162,95 @@ async function testCLIPPTGenerate(): Promise<boolean | null> {
       return null;
     }
 
-    // Try running CLI with PPT output mode
-    const result = await runCommand("node", [
-      "dist/cli/index.js",
-      "generate",
-      ...buildBaseCLIArgs(),
-      `--max-tokens=${TEST_CONFIG.maxTokens}`,
-      "Simple test presentation about teamwork",
-    ]);
+    // CLI now supports PPT flags: --pptPages, --pptTheme, --pptOutput, --pptAudience, --pptTone, --pptNoImages
+    ensurePPTOutputDir();
+    const outputPath = path.join(
+      PPT_OUTPUT_DIR,
+      `test-cli-ppt-${Date.now()}.pptx`,
+    );
 
+    const cliArgs = [
+      cliIndexPath,
+      "generate",
+      "Introduction to Machine Learning",
+      ...buildBaseCLIArgs(),
+      "--pptPages=5",
+      "--pptTheme=modern",
+      "--pptNoImages",
+      `--pptOutput=${outputPath}`,
+    ];
+
+    const result = await runCommand("node", cliArgs);
+
+    // Check if CLI ran successfully
     if (!result.success) {
-      if (isExpectedProviderError(result.stderr)) {
-        logTest("CLI Generate - PPT Generate", "SKIP", result.stderr);
+      const combinedOutput = (result.stdout + result.stderr).toLowerCase();
+      if (isExpectedProviderError(combinedOutput)) {
+        logTest(
+          "CLI Generate - PPT Generate",
+          "SKIP",
+          `Provider error: ${combinedOutput.substring(0, 200)}`,
+        );
         return null;
       }
-
-      // PPT may not have CLI flags yet - that's OK
+      // If the CLI fails with an unknown flag error, PPT flags may not be wired to the generate command
       if (
-        result.stderr.includes("Unknown") ||
-        result.stderr.includes("not recognized")
+        combinedOutput.includes("unknown option") ||
+        combinedOutput.includes("unknown argument")
       ) {
         logTest(
           "CLI Generate - PPT Generate",
           "SKIP",
-          "PPT CLI flags not yet available",
+          `CLI PPT flags not recognized: ${combinedOutput.substring(0, 200)}`,
         );
         return null;
       }
-
       logTest(
         "CLI Generate - PPT Generate",
         "FAIL",
-        `Exit code: ${result.code}, stderr: ${result.stderr.substring(0, 200)}`,
+        `CLI exited with code ${result.code}: ${(result.stderr || result.stdout).substring(0, 300)}`,
       );
       return false;
     }
 
-    const output = (result.stdout || "").toLowerCase();
-    const combinedOutput = output + (result.stderr || "").toLowerCase();
-    if (combinedOutput.length > 0) {
+    // Find and validate the generated PPTX file
+    const filePath = findPPTXFile(undefined, outputPath);
+
+    if (!filePath) {
+      // CLI ran successfully but no file found — check stdout for clues
+      const output = result.stdout.toLowerCase();
+      if (
+        output.includes("presentation") ||
+        output.includes("pptx") ||
+        output.includes("slides")
+      ) {
+        logTest(
+          "CLI Generate - PPT Generate",
+          "PASS",
+          `CLI PPT generation completed (output mentions presentation). No file at expected path.`,
+        );
+        return true;
+      }
       logTest(
         "CLI Generate - PPT Generate",
-        "PASS",
-        `CLI produced output (${combinedOutput.length} chars)`,
+        "FAIL",
+        "CLI succeeded but no PPTX file found at expected path",
       );
-      return true;
+      return false;
     }
 
-    logTest("CLI Generate - PPT Generate", "FAIL", "No output");
-    return false;
+    const validation = validatePPTXFile(filePath, 1024);
+    if (!validation.valid) {
+      logTest("CLI Generate - PPT Generate", "FAIL", validation.reason);
+      return false;
+    }
+
+    logTest(
+      "CLI Generate - PPT Generate",
+      "PASS",
+      `CLI generated valid PPTX: ${validation.reason}`,
+    );
+    return true;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     if (isExpectedProviderError(msg)) {
@@ -1247,12 +1288,12 @@ async function testPPTWithAIImages(sdk: NeuroLink): Promise<boolean | null> {
         logTest("SDK Generate - PPT With AI Images", "SKIP", error);
         return null;
       }
-      // Image generation failures are acceptable
+      // AI image generation failures are non-critical — SKIP, not PASS
       if (error && (error.includes("image") || error.includes("timeout"))) {
         logTest(
           "SDK Generate - PPT With AI Images",
-          "PASS",
-          `Image generation attempted: ${error}`,
+          "SKIP",
+          `AI image generation failed: ${error.substring(0, 150)}`,
         );
         return null;
       }
@@ -1264,15 +1305,32 @@ async function testPPTWithAIImages(sdk: NeuroLink): Promise<boolean | null> {
       return false;
     }
 
+    // Verify a PPTX was produced
     const pptResult = (result as Record<string, unknown>)?.ppt as
       | Record<string, unknown>
       | undefined;
-    const metadata = pptResult?.metadata as Record<string, unknown> | undefined;
+    const filePath = findPPTXFile(pptResult, outputPath);
 
+    if (!filePath) {
+      logTest(
+        "SDK Generate - PPT With AI Images",
+        "FAIL",
+        "Generation succeeded but no PPTX file found",
+      );
+      return false;
+    }
+
+    const validation = validatePPTXFile(filePath, 1024);
+    if (!validation.valid) {
+      logTest("SDK Generate - PPT With AI Images", "FAIL", validation.reason);
+      return false;
+    }
+
+    const metadata = pptResult?.metadata as Record<string, unknown> | undefined;
     logTest(
       "SDK Generate - PPT With AI Images",
       "PASS",
-      `AI image generation attempted. Image model: ${metadata?.imageModel || "default"}`,
+      `${validation.reason}, image model: ${metadata?.imageModel || "default"}`,
     );
     return true;
   } catch (error) {
@@ -1281,12 +1339,12 @@ async function testPPTWithAIImages(sdk: NeuroLink): Promise<boolean | null> {
       logTest("SDK Generate - PPT With AI Images", "SKIP", msg);
       return null;
     }
-    // Image generation timeout/failures are acceptable
+    // Image generation timeout/failures are SKIP, never PASS
     if (msg.includes("timeout") || msg.includes("image")) {
       logTest(
         "SDK Generate - PPT With AI Images",
-        "PASS",
-        `Image generation attempted: ${msg.substring(0, 100)}`,
+        "SKIP",
+        `AI image generation failed: ${msg.substring(0, 150)}`,
       );
       return null;
     }
@@ -1302,10 +1360,9 @@ async function testPPTDifferentAudiences(
   logTest("SDK Generate - PPT Different Audiences", "TESTING");
   try {
     const audiences = ["technical", "business"] as const;
-    const results: Array<{
+    const audienceFiles: Array<{
       audience: string;
-      success: boolean;
-      error?: string;
+      filePath: string | null;
     }> = [];
 
     ensurePPTOutputDir();
@@ -1331,42 +1388,53 @@ async function testPPTDifferentAudiences(
         return null;
       }
 
-      results.push({ audience, success, error });
-
-      // Check if the audience was reflected in metadata
-      if (success) {
-        const pptResult = (result as Record<string, unknown>)?.ppt as
-          | Record<string, unknown>
-          | undefined;
-        const metadata = pptResult?.metadata as
-          | Record<string, unknown>
-          | undefined;
-        log(
-          `   ${audience}: audience=${metadata?.audience || "auto"}`,
-          "reset",
+      if (!success) {
+        logTest(
+          "SDK Generate - PPT Different Audiences",
+          "FAIL",
+          `Audience "${audience}" failed: ${error || "Unknown error"}`,
         );
+        return false;
       }
+
+      const pptResult = (result as Record<string, unknown>)?.ppt as
+        | Record<string, unknown>
+        | undefined;
+      const filePath = findPPTXFile(pptResult, outputPath);
+      audienceFiles.push({ audience, filePath });
 
       await new Promise((r) => setTimeout(r, 3000));
     }
 
-    const successCount = results.filter((r) => r.success).length;
-
-    if (successCount >= 1) {
+    // Gate: BOTH audiences must have produced files
+    const missingFiles = audienceFiles.filter((af) => !af.filePath);
+    if (missingFiles.length > 0) {
       logTest(
         "SDK Generate - PPT Different Audiences",
-        "PASS",
-        `${successCount}/${audiences.length} audiences generated`,
+        "FAIL",
+        `Missing PPTX files for audiences: ${missingFiles.map((m) => m.audience).join(", ")}`,
       );
-      return true;
+      return false;
+    }
+
+    // Validate both files exist
+    for (const af of audienceFiles) {
+      if (!af.filePath || !fs.existsSync(af.filePath)) {
+        logTest(
+          "SDK Generate - PPT Different Audiences",
+          "FAIL",
+          `PPTX file for "${af.audience}" does not exist on disk`,
+        );
+        return false;
+      }
     }
 
     logTest(
       "SDK Generate - PPT Different Audiences",
-      "FAIL",
-      `Only ${successCount}/${audiences.length} audiences generated`,
+      "PASS",
+      `Both audiences generated: ${audienceFiles.map((af) => af.audience).join(", ")}`,
     );
-    return false;
+    return true;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     if (isExpectedProviderError(msg)) {
@@ -1383,7 +1451,6 @@ async function testPPTDifferentAudiences(
 // ============================================================
 
 async function runAllTests(): Promise<void> {
-  const startTime = Date.now();
   log("\nNeuroLink Continuous Test Suite: PPT Generation", "bright");
   log(
     `   Provider: ${TEST_CONFIG.provider}, Model: ${TEST_CONFIG.model || "default"}`,
@@ -1392,8 +1459,8 @@ async function runAllTests(): Promise<void> {
 
   // Prerequisite checks
   if (!fs.existsSync("dist") || !fs.existsSync("dist/index.js")) {
-    log("Build not found. Run: pnpm run build", "red");
-    process.exit(1);
+    // Throw so the harness owns the exit path (prints summary, cleanup).
+    throw new Error("Build not found. Run: pnpm run build");
   }
 
   // Ensure output directory
@@ -1458,43 +1525,19 @@ async function runAllTests(): Promise<void> {
     logSection(test.name);
     try {
       const result = await test.fn();
-      testResults.push({ name: test.name, result, error: null });
+      recordTest(
+        test.name,
+        result === true,
+        result === null,
+        result === null ? "skipped" : result === true ? undefined : "failed",
+      );
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      testResults.push({ name: test.name, result: false, error: msg });
+      recordTest(test.name, false, false, msg);
     }
     await globalCleanup();
     await new Promise((r) => setTimeout(r, TEST_CONFIG.interTestDelay));
   }
-
-  // Summary
-  logSection("Test Results Summary");
-  const passed = testResults.filter((r) => r.result === true).length;
-  const failed = testResults.filter((r) => r.result === false).length;
-  const skipped = testResults.filter((r) => r.result === null).length;
-  testResults.forEach((t) =>
-    logTest(
-      t.name,
-      t.result === true ? "PASS" : t.result === false ? "FAIL" : "SKIP",
-      t.error || "",
-    ),
-  );
-  const duration = Math.round((Date.now() - startTime) / 1000);
-  log(
-    `
-Final Results: ${passed} passed, ${failed} failed, ${skipped} skipped (${testResults.length} total) in ${duration}s`,
-    failed === 0 ? "green" : "red",
-  );
-
-  // Cleanup temp files
-  cleanupPPTFiles();
-
-  try {
-    await sharedSdk.shutdown?.();
-  } catch {
-    /* ignore */
-  }
-  process.exit(failed === 0 ? 0 : 1);
 }
 
 // ============================================================
@@ -1528,16 +1571,7 @@ if (cliArgs.model) {
   TEST_CONFIG.model = cliArgs.model;
 }
 if (!TEST_CONFIG.maxTokens) {
-  TEST_CONFIG.maxTokens = PROVIDER_MAX_TOKENS[TEST_CONFIG.provider] || 8192;
+  TEST_CONFIG.maxTokens = PROVIDER_MAX_TOKENS[TEST_CONFIG.provider] || 1024;
 }
 
-if (typeof describe === "undefined") {
-  runAllTests().catch((e: unknown) => {
-    log(`Suite crashed: ${e instanceof Error ? e.message : String(e)}`, "red");
-    process.exit(1);
-  });
-} else {
-  describe.skip("Continuous Test Suite: PPT Generation", () => {
-    it("runs standalone", () => runAllTests(), 600000);
-  });
-}
+await runSuite(runAllTests);

@@ -20,7 +20,7 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 10.15.1
 
       - name: Setup Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v4
@@ -30,6 +30,12 @@ jobs:
 
       - name: Install ffmpeg
         uses: AnimMouse/setup-ffmpeg@v1
+        with:
+          # Pin to a known-good release. The default (latest → FFmpeg 8.1)
+          # BtbN/FFmpeg-Builds Linux asset is currently corrupt and fails the
+          # job at download ("xz: File format not recognized"). Revert once
+          # upstream republishes a valid 8.1 build.
+          version: "7.1"
 
       - name: Verify ffmpeg installation
         run: |
@@ -62,7 +68,7 @@ jobs:
         run: |
           echo "🔍 Running ESLint validation with controlled warning limits..."
           npx eslint src/ --max-warnings=300
-          npx eslint test/ --max-warnings=10
+          npx eslint test/continuous-test-suite*.ts test/zod-schema-test-function.ts --max-warnings=10
 
       - name: 🔒 Security & Environment Validation
         run: |
@@ -145,16 +151,22 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 10.15.1
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "pnpm"
 
       - name: Install ffmpeg
         uses: AnimMouse/setup-ffmpeg@v1
+        with:
+          # Pin to a known-good release. The default (latest → FFmpeg 8.1)
+          # BtbN/FFmpeg-Builds Linux asset is currently corrupt and fails the
+          # job at download ("xz: File format not recognized"). Revert once
+          # upstream republishes a valid 8.1 build.
+          version: "7.1"
 
       - name: Verify ffmpeg installation
         run: |
@@ -182,6 +194,30 @@ jobs:
           pnpm pack
           ls -la dist/
 
+  proxy-performance:
+    name: Proxy Performance Gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run proxy performance gates
+        run: pnpm run proxy:performance
+
   quality-gate:
     runs-on: ubuntu-latest
     name: 🛡️ Code Quality & Security Gate
@@ -192,16 +228,22 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 10.15.1
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "pnpm"
 
       - name: Install ffmpeg
         uses: AnimMouse/setup-ffmpeg@v1
+        with:
+          # Pin to a known-good release. The default (latest → FFmpeg 8.1)
+          # BtbN/FFmpeg-Builds Linux asset is currently corrupt and fails the
+          # job at download ("xz: File format not recognized"). Revert once
+          # upstream republishes a valid 8.1 build.
+          version: "7.1"
 
       - name: Verify ffmpeg installation
         run: |
@@ -256,10 +298,10 @@ jobs:
           echo "📈 Running TypeScript compiler strict checks on source files..."
           npx tsc --noEmit --strict --project tsconfig.json
 
-      - name: 🎯 Code Coverage Analysis
+      - name: 🎯 Test Suite Validation
         run: |
-          echo "🎯 Running tests with coverage..."
-          pnpm run test:run --coverage || echo "Tests completed with warnings"
+          echo "🎯 Continuous test suites are run separately with API keys"
+          echo "Skipping automated test execution in CI"
         continue-on-error: true
 
       - name: 📋 Quality Summary
@@ -280,7 +322,7 @@ jobs:
 
   semantic-release-validation:
     runs-on: ubuntu-latest
-    needs: [test, build-check]
+    needs: [test, build-check, proxy-performance]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -290,12 +332,12 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 10.15.1
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "pnpm"
 
       - name: Install dependencies

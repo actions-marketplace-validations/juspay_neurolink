@@ -3,7 +3,7 @@
  */
 
 import { ErrorCategory, ErrorSeverity } from "../constants/enums.js";
-import type { UnifiedGenerationOptions } from "./generateTypes.js";
+import type { UnifiedGenerationOptions } from "./generate.js";
 import type { ExecutionContext } from "./tools.js";
 
 /**
@@ -280,4 +280,57 @@ export type ImageCacheStats = {
   totalBytes: number;
   /** Cache hit rate as percentage */
   hitRate: number;
+};
+
+// =============================================================================
+// RATE LIMITER (from utils/rateLimiter.ts)
+// =============================================================================
+
+/**
+ * Pending request held by TokenBucketRateLimiter's queue.
+ * Named RateLimiterPendingRequest to disambiguate from the MCP
+ * PendingRequest in mcp.ts (Rule 9).
+ */
+export type RateLimiterPendingRequest = {
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timestamp: number;
+  timeoutTimer?: ReturnType<typeof setTimeout>;
+};
+
+// =============================================================================
+// TOOL END EMITTER (from utils/toolEndEmitter.ts)
+// =============================================================================
+
+/**
+ * Shape of a completed tool result as returned by the AI SDK in
+ * `onStepFinish`. Both `output` (AI SDK v4) and `result` (older shape)
+ * are supported so the helper works across SDK versions.
+ */
+export type StepToolResult = {
+  toolName: string;
+  output?: unknown;
+  result?: unknown;
+  error?: string;
+};
+
+// =============================================================================
+// JSON COERCION (from utils/json/coerce.ts)
+// =============================================================================
+
+/**
+ * Result of coercing arbitrary model text into canonical, valid JSON.
+ * `content` is a JSON.stringify of the recovered object; `structuredData` is
+ * the parsed object itself.
+ */
+export type JsonCoercionResult = {
+  content: string;
+  structuredData: unknown;
+  /** True when jsonrepair altered the model text to make it parse. */
+  repaired: boolean;
+  /**
+   * True when the recovered object came from a truncated (unclosed) span —
+   * the response likely hit the output-token cap and data may be incomplete.
+   */
+  truncated: boolean;
 };

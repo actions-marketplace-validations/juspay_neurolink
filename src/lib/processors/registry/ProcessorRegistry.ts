@@ -47,16 +47,16 @@
 import type { BaseFileProcessor } from "../base/BaseFileProcessor.js";
 import type {
   FileInfo,
-  FileProcessingResult,
+  ProcessorFileProcessingResult,
   ProcessedFileBase,
   ProcessOptions,
   ProcessorMatch,
   RegistryOptions,
   RegistryProcessResult,
-} from "../base/types.js";
-
-import type { ProcessorRegistration } from "./types.js";
-
+  ProcessorRegistration,
+} from "../../types/index.js";
+import { withSpan } from "../../telemetry/withSpan.js";
+import { tracers } from "../../telemetry/tracers.js";
 // =============================================================================
 // UTILITY FUNCTIONS
 // =============================================================================
@@ -453,13 +453,26 @@ export class ProcessorRegistry {
   async processFile(
     fileInfo: FileInfo,
     options?: ProcessOptions,
-  ): Promise<FileProcessingResult<ProcessedFileBase> | null> {
-    const match = this.findProcessor(fileInfo.mimetype, fileInfo.name);
-    if (!match) {
-      return null;
-    }
-    const processor = match.processor as BaseFileProcessor<ProcessedFileBase>;
-    return processor.processFile(fileInfo, options);
+  ): Promise<ProcessorFileProcessingResult<ProcessedFileBase> | null> {
+    return withSpan(
+      {
+        name: "neurolink.processor.processFile",
+        tracer: tracers.processor,
+        attributes: {
+          "processor.filename": fileInfo.name ?? "unknown",
+          "processor.mimetype": fileInfo.mimetype ?? "unknown",
+        },
+      },
+      async () => {
+        const match = this.findProcessor(fileInfo.mimetype, fileInfo.name);
+        if (!match) {
+          return null;
+        }
+        const processor =
+          match.processor as BaseFileProcessor<ProcessedFileBase>;
+        return processor.processFile(fileInfo, options);
+      },
+    );
   }
 
   /**
@@ -704,7 +717,7 @@ async function initializeDefaultProcessors(
       import("../document/index.js"),
       import("../media/AudioProcessor.js"),
       import("../archive/ArchiveProcessor.js"),
-      import("../base/types.js"),
+      import("../../types/processor.js"),
     ]);
 
   // Also import video separately (same pattern as audio)

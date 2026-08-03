@@ -12,20 +12,15 @@
  * - Context summarization
  */
 
-import type { Chunk, VectorQueryResult } from "../types.js";
 import type {
+  Chunk,
+  VectorQueryResult,
+  CitationFormat,
   ContextAssemblyOptions,
   ContextWindow,
-} from "../../types/ragTypes.js";
+} from "../../types/index.js";
 import { logger } from "../../utils/logger.js";
-
-/**
- * Citation format options
- */
-export type CitationFormat = "inline" | "footnote" | "numbered" | "none";
-
-export type { ContextAssemblyOptions } from "../../types/ragTypes.js";
-export type { ContextWindow } from "../../types/ragTypes.js";
+import { estimateTokens } from "../../utils/tokenEstimation.js";
 
 /**
  * Assemble context from retrieved results
@@ -261,7 +256,7 @@ export function createContextWindow(
     text,
     chunkCount,
     charCount: text.length,
-    tokenCount: Math.ceil(text.length / 4),
+    tokenCount: estimateTokens(text),
     truncatedChunks,
     citations,
   };

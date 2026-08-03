@@ -11,15 +11,18 @@ import {
 } from "../config/conversationMemory.js";
 import { TokenUtils } from "../constants/tokens.js";
 import { SummarizationEngine } from "../context/summarizationEngine.js";
+import { runWithCurrentLangfuseContext } from "../services/server/ai/observability/instrumentation.js";
+import { tracers, withSpan } from "../telemetry/index.js";
 import type {
   ChatMessage,
   ConversationMemoryConfig,
   ConversationMemoryStats,
+  SessionListItem,
   SessionMemory,
   StoreConversationTurnOptions,
-} from "../types/conversation.js";
-import { ConversationMemoryError } from "../types/conversation.js";
-import type { IConversationMemoryManager } from "../types/conversationMemoryInterface.js";
+  IConversationMemoryManager,
+} from "../types/index.js";
+import { ConversationMemoryError } from "../types/index.js";
 import {
   buildContextFromPointer,
   getEffectiveTokenThreshold,
@@ -91,92 +94,121 @@ export class ConversationMemoryManager implements IConversationMemoryManager {
   async storeConversationTurn(
     options: StoreConversationTurnOptions,
   ): Promise<void> {
-    await this.ensureInitialized();
+    return withSpan(
+      {
+        name: "neurolink.memory.storeTurn",
+        tracer: tracers.memory,
+        attributes: {
+          "memory.type": "in-memory",
+          "session.id": options.sessionId,
+          "memory.operation": "store_turn",
+        },
+      },
+      async (span) => {
+        await this.ensureInitialized();
 
-    try {
-      // Get or create session
-      let session = this.sessions.get(options.sessionId);
-      if (!session) {
-        session = this.createNewSession(options.sessionId, options.userId);
-        this.sessions.set(options.sessionId, session);
-      }
+        try {
+          // Get or create session
+          let session = this.sessions.get(options.sessionId);
+          if (!session) {
+            session = this.createNewSession(options.sessionId, options.userId);
+            this.sessions.set(options.sessionId, session);
+          }
 
-      const tokenThreshold = options.providerDetails
-        ? getEffectiveTokenThreshold(
-            options.providerDetails.provider,
-            options.providerDetails.model,
-            this.config.tokenThreshold,
-            session.tokenThreshold,
-          )
-        : this.config.tokenThreshold || 50000;
+          const tokenThreshold = options.providerDetails
+            ? getEffectiveTokenThreshold(
+                options.providerDetails.provider,
+                options.providerDetails.model,
+                this.config.tokenThreshold,
+                session.tokenThreshold,
+              )
+            : this.config.tokenThreshold || 50000;
 
-      const userMsg = await this.validateAndPrepareMessage(
-        options.userMessage,
-        "user",
-        tokenThreshold,
-      );
-      const assistantMsg = await this.validateAndPrepareMessage(
-        options.aiResponse,
-        "assistant",
-        tokenThreshold,
-      );
+          const userMsg = await this.validateAndPrepareMessage(
+            options.userMessage,
+            "user",
+            tokenThreshold,
+          );
+          const assistantMsg = await this.validateAndPrepareMessage(
+            options.aiResponse,
+            "assistant",
+            tokenThreshold,
+          );
 
-      if (options.events && options.events.length > 0) {
-        assistantMsg.events = options.events;
-      }
+          if (options.events && options.events.length > 0) {
+            assistantMsg.events = options.events;
+          }
 
-      session.messages.push(userMsg, assistantMsg);
-      session.lastActivity = Date.now();
+          session.messages.push(userMsg);
+          // Pinned skill activations ride between ask and answer, mirroring
+          // the actual order (ask → skill loaded → answer). Stored verbatim —
+          // skill instructions are never truncated.
+          if (options.skillMessages && options.skillMessages.length > 0) {
+            session.messages.push(...options.skillMessages);
+          }
+          session.messages.push(assistantMsg);
+          session.lastActivity = Date.now();
 
-      // Store API-reported token counts if available
-      if (options.tokenUsage) {
-        session.lastApiTokenCount = options.tokenUsage;
-      }
+          // Store API-reported token counts if available
+          if (options.tokenUsage) {
+            session.lastApiTokenCount = options.tokenUsage;
+          }
 
-      const shouldSummarize =
-        options.enableSummarization !== undefined
-          ? options.enableSummarization
-          : this.config.enableSummarization;
+          span.setAttribute("memory.message_count", session.messages.length);
 
-      if (shouldSummarize) {
-        // Only trigger summarization if not already in progress for this session
-        if (!this.summarizationInProgress.has(options.sessionId)) {
-          setImmediate(async () => {
-            try {
-              await this.checkAndSummarize(
-                session,
-                tokenThreshold,
-                options.requestId,
+          const shouldSummarize =
+            options.enableSummarization !== undefined
+              ? options.enableSummarization
+              : this.config.enableSummarization;
+
+          if (shouldSummarize) {
+            // Only trigger summarization if not already in progress for this session
+            if (!this.summarizationInProgress.has(options.sessionId)) {
+              // Capture the current Langfuse ALS context before setImmediate,
+              // which breaks automatic AsyncLocalStorage propagation and would
+              // otherwise cause orphaned traces in Langfuse.
+              const summarizeWithContext = runWithCurrentLangfuseContext(
+                async () => {
+                  try {
+                    await this.checkAndSummarize(
+                      session,
+                      tokenThreshold,
+                      options.requestId,
+                    );
+                  } catch (error) {
+                    logger.error("Background summarization failed", {
+                      sessionId: session.sessionId,
+                      requestId: options.requestId,
+                      error:
+                        error instanceof Error ? error.message : String(error),
+                    });
+                  }
+                },
               );
-            } catch (error) {
-              logger.error("Background summarization failed", {
-                sessionId: session.sessionId,
-                requestId: options.requestId,
-                error: error instanceof Error ? error.message : String(error),
-              });
+              setImmediate(summarizeWithContext);
+            } else {
+              logger.debug(
+                "[ConversationMemoryManager] Summarization already in progress, skipping",
+                {
+                  sessionId: options.sessionId,
+                },
+              );
             }
-          });
-        } else {
-          logger.debug(
-            "[ConversationMemoryManager] Summarization already in progress, skipping",
+          }
+
+          this.enforceSessionLimit();
+        } catch (error) {
+          throw new ConversationMemoryError(
+            `Failed to store conversation turn for session ${options.sessionId}`,
+            "STORAGE_ERROR",
             {
               sessionId: options.sessionId,
+              error: error instanceof Error ? error.message : String(error),
             },
           );
         }
-      }
-
-      this.enforceSessionLimit();
-    } catch (error) {
-      throw new ConversationMemoryError(
-        `Failed to store conversation turn for session ${options.sessionId}`,
-        "STORAGE_ERROR",
-        {
-          sessionId: options.sessionId,
-          error: error instanceof Error ? error.message : String(error),
-        },
-      );
-    }
+      },
+    );
   }
 
   /**
@@ -290,8 +322,25 @@ export class ConversationMemoryManager implements IConversationMemoryManager {
     _enableSummarization?: boolean,
     requestId?: string,
   ): Promise<ChatMessage[]> {
-    const session = this.sessions.get(sessionId);
-    return session ? buildContextFromPointer(session, requestId) : [];
+    return withSpan(
+      {
+        name: "neurolink.memory.buildContext",
+        tracer: tracers.memory,
+        attributes: {
+          "memory.type": "in-memory",
+          "session.id": sessionId,
+          "memory.operation": "build_context",
+        },
+      },
+      async (span) => {
+        const session = this.sessions.get(sessionId);
+        const messages = session
+          ? buildContextFromPointer(session, requestId)
+          : [];
+        span.setAttribute("memory.message_count", messages.length);
+        return messages;
+      },
+    );
   }
 
   public getSession(
@@ -358,8 +407,13 @@ export class ConversationMemoryManager implements IConversationMemoryManager {
     await this.ensureInitialized();
 
     const sessions = Array.from(this.sessions.values());
+    // Pinned skill messages are extra rows inside a turn — exclude them so
+    // a skill-activating turn still counts as one turn.
     const totalTurns = sessions.reduce(
-      (sum, session) => sum + session.messages.length / MESSAGES_PER_TURN,
+      (sum, session) =>
+        sum +
+        session.messages.filter((msg) => !msg.metadata?.isSkill).length /
+          MESSAGES_PER_TURN,
       0,
     );
 
@@ -369,14 +423,81 @@ export class ConversationMemoryManager implements IConversationMemoryManager {
     };
   }
 
-  public async clearSession(sessionId: string): Promise<boolean> {
-    const session = this.sessions.get(sessionId);
-    if (!session) {
-      return false;
+  /**
+   * List all sessions with metadata
+   * @param userId - Optional user ID to filter sessions
+   * @returns Array of session list items with metadata
+   */
+  public async listSessions(userId?: string): Promise<SessionListItem[]> {
+    await this.ensureInitialized();
+
+    const sessions = Array.from(this.sessions.values());
+    const now = Date.now();
+
+    return sessions
+      .filter((session) => !userId || session.userId === userId)
+      .map((session) => {
+        const lastActive = this.formatTimeAgo(now - session.lastActivity);
+        return {
+          id: session.sessionId,
+          title: session.sessionId, // In-memory doesn't store title, use sessionId
+          createdAt: new Date(session.createdAt).toISOString(),
+          updatedAt: new Date(session.lastActivity).toISOString(),
+          userId: session.userId,
+          messageCount: session.messages.length,
+          lastActive,
+        };
+      })
+      .sort(
+        (a, b) =>
+          new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
+      );
+  }
+
+  /**
+   * Format milliseconds into human-readable time ago string
+   */
+  private formatTimeAgo(ms: number): string {
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    const days = Math.floor(hours / 24);
+
+    if (days > 0) {
+      return `${days} day${days > 1 ? "s" : ""} ago`;
     }
-    this.sessions.delete(sessionId);
-    logger.info("Session cleared", { sessionId });
-    return true;
+    if (hours > 0) {
+      return `${hours} hour${hours > 1 ? "s" : ""} ago`;
+    }
+    if (minutes > 0) {
+      return `${minutes} minute${minutes > 1 ? "s" : ""} ago`;
+    }
+    return "just now";
+  }
+
+  public async clearSession(sessionId: string): Promise<boolean> {
+    return withSpan(
+      {
+        name: "neurolink.memory.clear",
+        tracer: tracers.memory,
+        attributes: {
+          "memory.type": "in-memory",
+          "session.id": sessionId,
+          "memory.operation": "clear_session",
+        },
+      },
+      async (span) => {
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+          span.setAttribute("memory.session_found", false);
+          return false;
+        }
+        this.sessions.delete(sessionId);
+        span.setAttribute("memory.session_found", true);
+        logger.info("Session cleared", { sessionId });
+        return true;
+      },
+    );
   }
 
   public async clearAllSessions(): Promise<void> {
@@ -422,5 +543,10 @@ export class ConversationMemoryManager implements IConversationMemoryManager {
     session.lastTokenCount = undefined;
     session.lastCountedAt = undefined;
     session.lastActivity = Date.now();
+  }
+
+  /** Close/shutdown — no-op for in-memory manager (no external connections to release) */
+  async close(): Promise<void> {
+    // In-memory manager has nothing to close
   }
 }

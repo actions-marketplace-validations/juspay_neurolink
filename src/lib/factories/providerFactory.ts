@@ -1,38 +1,16 @@
+import type { NeuroLink } from "../neurolink.js";
 import type { AIProviderName } from "../constants/enums.js";
-import type { UnknownRecord } from "../types/common.js";
-import type { AIProvider } from "../types/index.js";
+import type {
+  AIProvider,
+  NeurolinkCredentials,
+  ProviderConstructor,
+  ProviderRegistration,
+} from "../types/index.js";
+
 import { logger } from "../utils/logger.js";
 
 // Pure factory pattern with no hardcoded imports
 // All providers loaded dynamically via registry to avoid circular dependencies
-
-/**
- * Provider constructor interface - supports both sync constructors and async factory functions
- */
-type ProviderConstructor =
-  | {
-      new (
-        modelName?: string,
-        providerName?: string,
-        sdk?: UnknownRecord,
-        region?: string,
-      ): AIProvider;
-    }
-  | ((
-      modelName?: string,
-      providerName?: string,
-      sdk?: UnknownRecord,
-      region?: string,
-    ) => Promise<AIProvider>);
-
-/**
- * Provider registration entry
- */
-type ProviderRegistration = {
-  constructor: ProviderConstructor;
-  defaultModel?: string; // Optional - provider can read from env
-  aliases?: string[];
-};
 
 /**
  * True Factory Pattern implementation for AI Providers
@@ -78,8 +56,9 @@ export class ProviderFactory {
   static async createProvider(
     providerName?: AIProviderName | string,
     modelName?: string,
-    sdk?: UnknownRecord,
+    sdk?: NeuroLink,
     region?: string,
+    credentials?: NeurolinkCredentials,
   ): Promise<AIProvider> {
     // Note: Providers are registered explicitly by ProviderRegistry to avoid circular dependencies
 
@@ -113,6 +92,29 @@ export class ProviderFactory {
       model = model || registration.defaultModel;
     }
 
+    // Map registered provider names to NeurolinkCredentials keys.
+    // Most names match (openai, anthropic, vertex, bedrock, etc.)
+    // but every kebab-case provider whose canonical credentials key is
+    // camelCase MUST be mapped here — otherwise per-call credential
+    // overrides silently get dropped (the factory looks up
+    // credentials["lm-studio"] which is undefined while the user wrote
+    // credentials.lmStudio).
+    const credentialKeyMap: Record<string, string> = {
+      "google-ai": "googleAiStudio",
+      "openai-compatible": "openaiCompatible",
+      huggingface: "huggingFace",
+      "lm-studio": "lmStudio",
+      "nvidia-nim": "nvidiaNim",
+    };
+    const credKey = credentialKeyMap[normalizedName] ?? normalizedName;
+
+    // Extract provider-scoped credential slice (e.g. credentials.openai for OpenAI)
+    const scopedCredentials = credentials
+      ? ((credentials as Record<string, unknown>)[credKey] as
+          | Record<string, unknown>
+          | undefined)
+      : undefined;
+
     try {
       if (typeof registration.constructor !== "function") {
         throw new Error(
@@ -127,10 +129,11 @@ export class ProviderFactory {
           registration.constructor as (
             modelName?: string,
             providerName?: string,
-            sdk?: UnknownRecord,
+            sdk?: NeuroLink,
             region?: string,
+            credentials?: Record<string, unknown>,
           ) => Promise<AIProvider> | AIProvider
-        )(model, resolvedProviderName, sdk, region);
+        )(model, resolvedProviderName, sdk, region, scopedCredentials);
 
         // Handle both sync and async results
         result =
@@ -147,12 +150,20 @@ export class ProviderFactory {
             result = new (registration.constructor as new (
               modelName?: string,
               providerName?: string,
-              sdk?: UnknownRecord,
+              sdk?: NeuroLink,
               region?: string,
-            ) => AIProvider)(model, resolvedProviderName, sdk, region);
+              credentials?: Record<string, unknown>,
+            ) => AIProvider)(
+              model,
+              resolvedProviderName,
+              sdk,
+              region,
+              scopedCredentials,
+            );
           } catch (constructorError) {
             throw new Error(
               `Both factory function and constructor failed. Factory error: ${factoryError}. Constructor error: ${constructorError}`,
+              { cause: constructorError },
             );
           }
         } else {
@@ -165,6 +176,7 @@ export class ProviderFactory {
       logger.error(`Failed to create provider ${resolvedProviderName}:`, error);
       throw new Error(
         `Failed to create provider ${resolvedProviderName}: ${error}`,
+        { cause: error },
       );
     }
   }
@@ -251,9 +263,16 @@ export class ProviderFactory {
     providerName: AIProviderName | string,
     modelName?: string,
     enableMCP?: boolean,
-    sdk?: UnknownRecord,
+    sdk?: NeuroLink,
+    credentials?: NeurolinkCredentials,
   ): Promise<AIProvider> {
-    return await ProviderFactory.createProvider(providerName, modelName, sdk);
+    return await ProviderFactory.createProvider(
+      providerName,
+      modelName,
+      sdk,
+      undefined,
+      credentials,
+    );
   }
 }
 
@@ -263,6 +282,13 @@ export class ProviderFactory {
 export async function createAIProvider(
   providerName: AIProviderName | string,
   modelName?: string,
+  credentials?: NeurolinkCredentials,
 ): Promise<AIProvider> {
-  return await ProviderFactory.createProvider(providerName, modelName);
+  return await ProviderFactory.createProvider(
+    providerName,
+    modelName,
+    undefined,
+    undefined,
+    credentials,
+  );
 }

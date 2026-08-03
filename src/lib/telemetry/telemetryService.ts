@@ -1,5 +1,5 @@
-import { NodeSDK } from "@opentelemetry/sdk-node";
 import {
+  context,
   metrics,
   trace,
   type Meter,
@@ -7,28 +7,25 @@ import {
   type Counter,
   type Histogram,
 } from "@opentelemetry/api";
-import { getNodeAutoInstrumentations } from "@opentelemetry/auto-instrumentations-node";
+import {
+  BasicTracerProvider,
+  BatchSpanProcessor,
+} from "@opentelemetry/sdk-trace-base";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import {
   ATTR_SERVICE_NAME,
   ATTR_SERVICE_VERSION,
 } from "@opentelemetry/semantic-conventions";
 import { logger } from "../utils/logger.js";
-
-export type HealthMetrics = {
-  timestamp: number;
-  memoryUsage: NodeJS.MemoryUsage;
-  uptime: number;
-  activeConnections: number;
-  errorRate: number;
-  averageResponseTime: number;
-};
+import type { HealthMetrics } from "../types/index.js";
 
 export class TelemetryService {
   private static instance: TelemetryService;
-  private sdk?: NodeSDK;
+  private tracerProvider?: BasicTracerProvider;
   private enabled: boolean = false;
   private initialized: boolean = false;
+  private usingExternalTracerProvider: boolean = false;
   private meter?: Meter;
   private tracer?: Tracer;
 
@@ -71,34 +68,108 @@ export class TelemetryService {
 
   private isTelemetryEnabled(): boolean {
     return (
+      this.hasExternalTracerProvider() ||
       process.env.NEUROLINK_TELEMETRY_ENABLED === "true" ||
       process.env.OTEL_EXPORTER_OTLP_ENDPOINT !== undefined
     );
   }
 
+  private hasExternalTracerProvider(): boolean {
+    try {
+      const provider = trace.getTracerProvider() as {
+        constructor?: { name?: string };
+        getDelegate?: () => { constructor?: { name?: string } } | null;
+        _delegate?: { constructor?: { name?: string } };
+      } | null;
+
+      if (!provider) {
+        return false;
+      }
+
+      const providerName = provider.constructor?.name || "";
+      if (
+        providerName &&
+        providerName !== "ProxyTracerProvider" &&
+        providerName !== "NoopTracerProvider"
+      ) {
+        return true;
+      }
+
+      const delegate =
+        typeof provider.getDelegate === "function"
+          ? provider.getDelegate()
+          : provider._delegate;
+      const delegateName = delegate?.constructor?.name || "";
+      return Boolean(delegateName && delegateName !== "NoopTracerProvider");
+    } catch (error) {
+      logger.warn("[Telemetry] Failed checking for external TracerProvider", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  private adoptExternalTracerProvider(reason: string): void {
+    this.usingExternalTracerProvider = true;
+    this.tracerProvider = undefined;
+    this.meter = metrics.getMeter("neurolink-ai");
+    this.tracer = trace.getTracer("neurolink-ai");
+    this.initializeMetrics();
+
+    logger.debug("[Telemetry] Reusing externally managed TracerProvider", {
+      reason,
+      endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+    });
+  }
+
   private initializeTelemetry(): void {
     try {
+      if (this.hasExternalTracerProvider()) {
+        this.adoptExternalTracerProvider(
+          "global tracer provider already registered",
+        );
+        return;
+      }
+
       const resource = resourceFromAttributes({
         [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME || "neurolink-ai",
         [ATTR_SERVICE_VERSION]: process.env.OTEL_SERVICE_VERSION || "3.0.1",
       });
 
-      this.sdk = new NodeSDK({
-        resource,
-        // Note: Metric reader configured separately
-        instrumentations: [getNodeAutoInstrumentations()],
+      const exporter = new OTLPTraceExporter({
+        url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT
+          ? `${process.env.OTEL_EXPORTER_OTLP_ENDPOINT}/v1/traces`
+          : undefined,
       });
 
+      this.tracerProvider = new BasicTracerProvider({
+        resource,
+        spanProcessors: [new BatchSpanProcessor(exporter)],
+      });
       this.meter = metrics.getMeter("neurolink-ai");
-      this.tracer = trace.getTracer("neurolink-ai");
+      this.tracer = this.tracerProvider.getTracer("neurolink-ai");
 
       this.initializeMetrics();
 
-      logger.debug(
-        "[Telemetry] Initialized with endpoint:",
-        process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
-      );
+      logger.debug("[Telemetry] Initialized local telemetry exporter", {
+        endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+        globalTracerProviderOwnedBy: "observability/instrumentation",
+      });
     } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+      const isDuplicateRegistration =
+        errorMessage.includes("duplicate registration") ||
+        errorMessage.includes("already registered") ||
+        errorMessage.includes("already set");
+
+      if (isDuplicateRegistration && this.hasExternalTracerProvider()) {
+        this.adoptExternalTracerProvider(
+          "duplicate global tracer registration detected",
+        );
+        return;
+      }
+
       logger.error("[Telemetry] Failed to initialize:", error);
       this.enabled = false;
     }
@@ -156,18 +227,52 @@ export class TelemetryService {
       return;
     }
 
-    try {
-      await this.sdk?.start();
+    if (this.usingExternalTracerProvider) {
       this.initialized = true;
-      logger.debug("[Telemetry] SDK started successfully");
+      logger.debug(
+        "[Telemetry] External TracerProvider already initialized by host",
+      );
+      return;
+    }
+
+    if (!this.tracerProvider) {
+      this.initialized = true;
+      logger.debug(
+        "[Telemetry] Tracer provider already prepared during constructor",
+      );
+      return;
+    }
+
+    try {
+      // Register AsyncLocalStorage context manager for proper parent-child
+      // span relationships across async boundaries (required for startActiveSpan)
+      try {
+        const { AsyncLocalStorageContextManager } =
+          await import("@opentelemetry/context-async-hooks");
+        context.setGlobalContextManager(
+          new AsyncLocalStorageContextManager().enable(),
+        );
+      } catch {
+        // context-async-hooks not installed — context propagation
+        // will use the default (noop) manager
+      }
+
+      this.initialized = true;
+      logger.debug("[Telemetry] Tracer provider started successfully");
     } catch (error) {
-      logger.error("[Telemetry] Failed to start SDK:", error);
+      logger.error("[Telemetry] Failed to start:", error);
       this.enabled = false;
       this.initialized = false;
     }
   }
 
   // AI Operation Tracing (NO-OP when disabled)
+  /**
+   * @deprecated Vercel AI SDK's experimental_telemetry creates ai.generateText/ai.streamText
+   * spans automatically via OpenTelemetry. Using this method would create duplicate spans.
+   * Kept for potential future use with non-Vercel providers (e.g., Amazon Bedrock).
+   * See: TelemetryHandler.getTelemetryConfig() for the active telemetry path.
+   */
   async traceAIRequest<T>(
     provider: string,
     operation: () => Promise<T>,
@@ -408,11 +513,15 @@ export class TelemetryService {
 
   // Cleanup
   async shutdown(): Promise<void> {
-    if (this.enabled && this.sdk) {
+    if (
+      this.enabled &&
+      this.tracerProvider &&
+      !this.usingExternalTracerProvider
+    ) {
       try {
-        await this.sdk.shutdown();
+        await this.tracerProvider.shutdown();
         this.initialized = false;
-        logger.debug("[Telemetry] SDK shutdown completed");
+        logger.debug("[Telemetry] Tracer provider shutdown completed");
       } catch (error) {
         logger.error("[Telemetry] Error during shutdown:", error);
       }

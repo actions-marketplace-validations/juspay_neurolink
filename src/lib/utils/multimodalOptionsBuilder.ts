@@ -1,4 +1,4 @@
-import type { StreamOptions } from "../types/streamTypes.js";
+import type { StreamOptions } from "../types/index.js";
 
 /**
  * Builds a normalized multimodal options payload for streaming providers.
@@ -13,6 +13,8 @@ import type { StreamOptions } from "../types/streamTypes.js";
  *   - input.files: Auto-detected file types
  *   - input.csvFiles: CSV files for tabular data
  *   - input.pdfFiles: PDF documents (Buffer | string paths)
+ *   - input.audioFiles: Audio files (Buffer | string paths)
+ *   - input.videoFiles: Video files (Buffer | string paths)
  *   - csvOptions: CSV parsing options
  *   - systemPrompt: System-level instructions
  *   - conversationMessages: Chat history
@@ -24,7 +26,7 @@ import type { StreamOptions } from "../types/streamTypes.js";
  * @param {string} providerName - Provider identifier (e.g., "vertex", "openai", "anthropic")
  * @param {string} modelName - Model identifier (e.g., "gemini-2.5-flash", "gpt-4o")
  * @returns {object} Normalized options object with:
- *   - input: { text, images, content, files, csvFiles, pdfFiles }
+ *   - input: { text, images, content, files, csvFiles, pdfFiles, audioFiles, videoFiles }
  *   - csvOptions: CSV processing options
  *   - systemPrompt: System prompt string
  *   - conversationHistory: Message history array
@@ -55,8 +57,14 @@ export function buildMultimodalOptions(
       files: options.input?.files,
       csvFiles: options.input?.csvFiles,
       pdfFiles: options.input?.pdfFiles,
+      // #1259: this is a whitelist — a field omitted here is dropped
+      // silently, and the model answers as though nothing were attached.
+      // audioFiles/videoFiles were missing, so Bedrock received neither.
+      audioFiles: options.input?.audioFiles,
+      videoFiles: options.input?.videoFiles,
     },
     csvOptions: options.csvOptions,
+    pdfOptions: options.pdfOptions,
     systemPrompt: options.systemPrompt,
     conversationHistory: options.conversationMessages,
     provider: providerName,

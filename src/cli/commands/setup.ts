@@ -22,31 +22,10 @@ import { handleBedrockSetup } from "./setup-bedrock.js";
 import { handleGCPSetup } from "./setup-gcp.js";
 import { handleHuggingFaceSetup } from "./setup-huggingface.js";
 import { handleMistralSetup } from "./setup-mistral.js";
-
-type SetupArgs = {
-  provider?: string;
-  list?: boolean;
-  status?: boolean;
-  interactive?: boolean;
-  help?: boolean;
-};
-
-type ProviderInfo = {
-  id: string;
-  name: string;
-  emoji: string;
-  description: string;
-  setupTime: string;
-  cost: string;
-  bestFor: string;
-  models: string;
-  strengths: string;
-  pricing: string;
-  setupCommand: string;
-};
+import type { SetupArgs, SetupProviderInfo } from "../../lib/types/index.js";
 
 // Provider information database
-const PROVIDERS: ProviderInfo[] = [
+const PROVIDERS: SetupProviderInfo[] = [
   {
     id: "google-ai",
     name: "Google AI Studio",
@@ -281,7 +260,7 @@ async function runSetupWizard(): Promise<void> {
   // Main menu
   const { action } = await inquirer.prompt([
     {
-      type: "list",
+      type: "select",
       name: "action",
       message: "What would you like to do?",
       choices: [
@@ -441,11 +420,12 @@ async function runProviderSelection(): Promise<void> {
   logger.always(chalk.blue("🎯 Perfect! Let's get you connected."));
   logger.always("");
 
-  const choices: Array<{ name: string; value: string } | inquirer.Separator> =
-    PROVIDERS.map((provider) => ({
-      name: `${provider.emoji} ${provider.name.padEnd(18)} - ${provider.description}`,
-      value: provider.id,
-    }));
+  const choices: Array<
+    { name: string; value: string } | InstanceType<typeof inquirer.Separator>
+  > = PROVIDERS.map((provider) => ({
+    name: `${provider.emoji} ${provider.name.padEnd(18)} - ${provider.description}`,
+    value: provider.id,
+  }));
 
   // Add a non-selectable separator row
   choices.push(new inquirer.Separator("─".repeat(60)));
@@ -458,7 +438,7 @@ async function runProviderSelection(): Promise<void> {
 
   const { selectedProvider } = await inquirer.prompt([
     {
-      type: "list",
+      type: "select",
       name: "selectedProvider",
       message: "Which AI provider would you like to configure?",
       choices,
@@ -634,7 +614,7 @@ async function showProviderList(): Promise<void> {
 
   const { action } = await inquirer.prompt([
     {
-      type: "list",
+      type: "select",
       name: "action",
       message: "Ready to set up a provider?",
       choices: [

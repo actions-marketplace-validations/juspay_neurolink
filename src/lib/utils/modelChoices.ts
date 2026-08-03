@@ -17,16 +17,23 @@ import {
   HuggingFaceModels,
   SageMakerModels,
   OpenRouterModels,
+  DeepSeekModels,
+  NvidiaNimModels,
+  XaiModels,
+  GroqModels,
+  CohereModels,
+  TogetherAIModels,
+  FireworksModels,
+  PerplexityModels,
+  CloudflareModels,
+  VoyageModels,
+  JinaModels,
+  StabilityModels,
+  IdeogramModels,
+  RecraftModels,
+  ReplicateModels,
 } from "../constants/enums.js";
-
-/**
- * Model choice for CLI prompts (inquirer format)
- */
-export type ModelChoice = {
-  name: string;
-  value: string;
-  description?: string;
-};
+import type { ModelChoice } from "../types/index.js";
 
 /**
  * Top models per provider with descriptions for CLI prompts
@@ -237,7 +244,7 @@ const TOP_MODELS_CONFIG: Record<
   ],
   [AIProviderName.OPENROUTER]: [
     {
-      model: OpenRouterModels.CLAUDE_3_5_SONNET,
+      model: OpenRouterModels.CLAUDE_SONNET_4_5,
       description: "Anthropic via OpenRouter",
     },
     { model: OpenRouterModels.GPT_4O, description: "OpenAI via OpenRouter" },
@@ -258,6 +265,254 @@ const TOP_MODELS_CONFIG: Record<
     { model: "gpt-4-turbo", description: "Turbo compatible model" },
     { model: "gpt-3.5-turbo", description: "Legacy compatible model" },
   ],
+  [AIProviderName.DEEPSEEK]: [
+    { model: "deepseek-chat", description: "DeepSeek-V3 general chat" },
+    {
+      model: "deepseek-reasoner",
+      description: "DeepSeek-R1 reasoning (slower, deeper)",
+    },
+  ],
+  [AIProviderName.NVIDIA_NIM]: [
+    {
+      model: "meta/llama-3.3-70b-instruct",
+      description: "Recommended - Llama 3.3 70B",
+    },
+    {
+      model: "nvidia/llama-3.3-nemotron-super-49b-v1",
+      description: "Nemotron Super (reasoning)",
+    },
+    {
+      model: "deepseek-ai/deepseek-r1",
+      description: "DeepSeek-R1 hosted on NIM",
+    },
+    {
+      model: "meta/llama-3.2-90b-vision-instruct",
+      description: "Llama 3.2 vision",
+    },
+    {
+      model: "mistralai/mixtral-8x22b-instruct-v0.1",
+      description: "Mixtral 8x22B",
+    },
+  ],
+  [AIProviderName.LM_STUDIO]: [
+    {
+      model: "",
+      description: "Auto-discover loaded model from /v1/models",
+    },
+  ],
+  [AIProviderName.LLAMACPP]: [
+    {
+      model: "",
+      description: "Use whatever model llama-server has loaded",
+    },
+  ],
+  [AIProviderName.XAI]: [
+    {
+      model: XaiModels.GROK_3,
+      description: "Recommended - Latest flagship Grok",
+    },
+    { model: XaiModels.GROK_3_MINI, description: "Faster + cheaper Grok 3" },
+    {
+      model: XaiModels.GROK_2_VISION_LATEST,
+      description: "Multimodal (text + images)",
+    },
+    { model: XaiModels.GROK_2_LATEST, description: "Previous flagship" },
+    { model: XaiModels.GROK_BETA, description: "Pre-release / experimental" },
+  ],
+  [AIProviderName.GROQ]: [
+    {
+      model: GroqModels.LLAMA_3_3_70B_VERSATILE,
+      description: "Recommended - Production default; sub-100ms",
+    },
+    {
+      model: GroqModels.LLAMA_3_1_8B_INSTANT,
+      description: "Lowest latency tier",
+    },
+    {
+      model: GroqModels.LLAMA_3_2_90B_VISION_PREVIEW,
+      description: "Multimodal (vision)",
+    },
+    { model: GroqModels.GEMMA_2_9B_IT, description: "Google Gemma 2 9B" },
+    {
+      model: GroqModels.MIXTRAL_8X7B_32768,
+      description: "Mistral 8x7B MoE, 32K context",
+    },
+  ],
+  [AIProviderName.COHERE]: [
+    {
+      model: CohereModels.COMMAND_R_PLUS,
+      description: "Recommended - Flagship RAG-tuned chat",
+    },
+    { model: CohereModels.COMMAND_R, description: "Smaller RAG-tuned chat" },
+    { model: CohereModels.COMMAND_R7B, description: "Most compact" },
+  ],
+  [AIProviderName.TOGETHER_AI]: [
+    {
+      model: TogetherAIModels.LLAMA_3_3_70B_INSTRUCT_TURBO,
+      description: "Recommended - Llama 3.3 70B Turbo",
+    },
+    {
+      model: TogetherAIModels.LLAMA_3_1_405B_INSTRUCT_TURBO,
+      description: "Flagship 405B",
+    },
+    {
+      model: TogetherAIModels.QWEN_2_5_72B_INSTRUCT_TURBO,
+      description: "Qwen 2.5 72B Turbo",
+    },
+    {
+      model: TogetherAIModels.DEEPSEEK_R1,
+      description: "DeepSeek R1 reasoning",
+    },
+    {
+      model: TogetherAIModels.MIXTRAL_8X22B_INSTRUCT,
+      description: "Mistral 8x22B MoE",
+    },
+  ],
+  [AIProviderName.FIREWORKS]: [
+    {
+      model: FireworksModels.DEEPSEEK_V4_PRO,
+      description: "Recommended - DeepSeek V4 Pro",
+    },
+    { model: FireworksModels.GLM_5P1, description: "GLM 5.1 (Zhipu)" },
+    { model: FireworksModels.KIMI_K2P6, description: "Kimi K2.6 (Moonshot)" },
+    { model: FireworksModels.GPT_OSS_120B, description: "GPT-OSS 120B" },
+  ],
+  [AIProviderName.PERPLEXITY]: [
+    {
+      model: PerplexityModels.SONAR,
+      description: "Recommended - Sonar with web grounding",
+    },
+    { model: PerplexityModels.SONAR_PRO, description: "Better reasoning" },
+    {
+      model: PerplexityModels.SONAR_REASONING,
+      description: "Explicit reasoning traces",
+    },
+    {
+      model: PerplexityModels.SONAR_REASONING_PRO,
+      description: "Flagship reasoning + web",
+    },
+    {
+      model: PerplexityModels.SONAR_DEEP_RESEARCH,
+      description: "Long-form research with citations",
+    },
+  ],
+  [AIProviderName.CLOUDFLARE]: [
+    {
+      model: CloudflareModels.LLAMA_3_3_70B_FAST,
+      description: "Recommended - Llama 3.3 70B FP8 fast",
+    },
+    {
+      model: CloudflareModels.LLAMA_3_1_70B_INSTRUCT,
+      description: "Llama 3.1 70B",
+    },
+    {
+      model: CloudflareModels.LLAMA_3_1_8B_FAST,
+      description: "Llama 3.1 8B fast",
+    },
+    {
+      model: CloudflareModels.LLAMA_3_2_11B_VISION,
+      description: "Multimodal (vision)",
+    },
+  ],
+  [AIProviderName.REPLICATE]: [
+    {
+      model: "meta/meta-llama-3-70b-instruct",
+      description: "Recommended - Llama 3 70B Instruct (stable)",
+    },
+    {
+      model: "meta/meta-llama-3.1-405b-instruct",
+      description: "Llama 3.1 405B (flagship)",
+    },
+    {
+      model: "mistralai/mixtral-8x7b-instruct-v0.1",
+      description: "Mixtral 8x7B v0.1",
+    },
+    {
+      model: "black-forest-labs/flux-1.1-pro",
+      description: "FLUX 1.1 Pro (image-gen)",
+    },
+    {
+      model: "stability-ai/stable-diffusion-3.5-large",
+      description: "SD 3.5 Large (image-gen)",
+    },
+  ],
+  [AIProviderName.VOYAGE]: [
+    {
+      model: VoyageModels.VOYAGE_3_5,
+      description: "Recommended - General-purpose embeddings",
+    },
+    {
+      model: VoyageModels.VOYAGE_3_LARGE,
+      description: "Flagship — highest accuracy",
+    },
+    {
+      model: VoyageModels.VOYAGE_CODE_3,
+      description: "Code-tuned embeddings",
+    },
+    {
+      model: VoyageModels.VOYAGE_MULTILINGUAL_2,
+      description: "Multilingual embeddings",
+    },
+    {
+      model: VoyageModels.VOYAGE_3_5_LITE,
+      description: "Smaller / cheaper",
+    },
+  ],
+  [AIProviderName.JINA]: [
+    {
+      model: JinaModels.JINA_EMBEDDINGS_V3,
+      description: "Recommended - Multilingual flagship",
+    },
+    {
+      model: JinaModels.JINA_EMBEDDINGS_V2_BASE_EN,
+      description: "v2 base English",
+    },
+    {
+      model: JinaModels.JINA_EMBEDDINGS_V2_BASE_CODE,
+      description: "v2 base code",
+    },
+    {
+      model: JinaModels.JINA_RERANKER_V2_BASE_MULTILINGUAL,
+      description: "Reranker (multilingual)",
+    },
+    {
+      model: JinaModels.JINA_COLBERT_V2,
+      description: "Late-interaction retrieval",
+    },
+  ],
+  [AIProviderName.STABILITY]: [
+    {
+      model: StabilityModels.STABLE_IMAGE_ULTRA,
+      description: "Recommended - Flagship quality",
+    },
+    {
+      model: StabilityModels.STABLE_IMAGE_CORE,
+      description: "Fast tier",
+    },
+    { model: StabilityModels.SD_3_5_LARGE, description: "SD 3.5 Large" },
+    {
+      model: StabilityModels.SD_3_5_LARGE_TURBO,
+      description: "SD 3.5 Large Turbo",
+    },
+    { model: StabilityModels.SD_3_5_MEDIUM, description: "SD 3.5 Medium" },
+  ],
+  [AIProviderName.IDEOGRAM]: [
+    { model: IdeogramModels.IDEOGRAM_V3, description: "Recommended - V3" },
+    { model: IdeogramModels.IDEOGRAM_V2, description: "V2" },
+    { model: IdeogramModels.IDEOGRAM_V2_TURBO, description: "V2 Turbo (fast)" },
+    { model: IdeogramModels.IDEOGRAM_V1, description: "V1" },
+  ],
+  [AIProviderName.RECRAFT]: [
+    {
+      model: RecraftModels.RECRAFT_V3,
+      description: "Recommended - Raster V3",
+    },
+    {
+      model: RecraftModels.RECRAFT_V3_SVG,
+      description: "Vector / SVG output",
+    },
+    { model: RecraftModels.RECRAFT_V2, description: "V2" },
+  ],
   [AIProviderName.AUTO]: [],
 };
 
@@ -276,8 +531,27 @@ export const DEFAULT_MODELS: Record<string, string> = {
   [AIProviderName.LITELLM]: LiteLLMModels.OPENAI_GPT_4O,
   [AIProviderName.HUGGINGFACE]: HuggingFaceModels.LLAMA_3_3_70B_INSTRUCT,
   [AIProviderName.SAGEMAKER]: SageMakerModels.LLAMA_4_MAVERICK_17B_128E,
-  [AIProviderName.OPENROUTER]: OpenRouterModels.CLAUDE_3_5_SONNET,
+  [AIProviderName.OPENROUTER]: OpenRouterModels.CLAUDE_SONNET_4_5,
   [AIProviderName.OPENAI_COMPATIBLE]: "gpt-4o",
+  [AIProviderName.DEEPSEEK]: DeepSeekModels.DEEPSEEK_CHAT,
+  [AIProviderName.NVIDIA_NIM]: NvidiaNimModels.LLAMA_3_3_70B_INSTRUCT,
+  // LM Studio + llama.cpp auto-discover their loaded model from /v1/models;
+  // an empty default is the documented signal to use that path.
+  [AIProviderName.LM_STUDIO]: "",
+  [AIProviderName.LLAMACPP]: "",
+  [AIProviderName.XAI]: XaiModels.GROK_3,
+  [AIProviderName.GROQ]: GroqModels.LLAMA_3_3_70B_VERSATILE,
+  [AIProviderName.COHERE]: CohereModels.COMMAND_R_PLUS,
+  [AIProviderName.TOGETHER_AI]: TogetherAIModels.LLAMA_3_3_70B_INSTRUCT_TURBO,
+  [AIProviderName.FIREWORKS]: FireworksModels.DEEPSEEK_V4_PRO,
+  [AIProviderName.PERPLEXITY]: PerplexityModels.SONAR,
+  [AIProviderName.CLOUDFLARE]: CloudflareModels.LLAMA_3_3_70B_FAST,
+  [AIProviderName.REPLICATE]: "meta/meta-llama-3-70b-instruct",
+  [AIProviderName.VOYAGE]: VoyageModels.VOYAGE_3_5,
+  [AIProviderName.JINA]: JinaModels.JINA_EMBEDDINGS_V3,
+  [AIProviderName.STABILITY]: StabilityModels.STABLE_IMAGE_ULTRA,
+  [AIProviderName.IDEOGRAM]: IdeogramModels.IDEOGRAM_V3,
+  [AIProviderName.RECRAFT]: RecraftModels.RECRAFT_V3,
 };
 
 /**
@@ -297,6 +571,23 @@ const MODEL_ENUMS: Record<AIProviderName, Record<string, string> | null> = {
   [AIProviderName.SAGEMAKER]: SageMakerModels,
   [AIProviderName.OPENROUTER]: OpenRouterModels,
   [AIProviderName.OPENAI_COMPATIBLE]: null,
+  [AIProviderName.DEEPSEEK]: DeepSeekModels,
+  [AIProviderName.NVIDIA_NIM]: NvidiaNimModels,
+  [AIProviderName.LM_STUDIO]: null,
+  [AIProviderName.LLAMACPP]: null,
+  [AIProviderName.XAI]: XaiModels,
+  [AIProviderName.GROQ]: GroqModels,
+  [AIProviderName.COHERE]: CohereModels,
+  [AIProviderName.TOGETHER_AI]: TogetherAIModels,
+  [AIProviderName.FIREWORKS]: FireworksModels,
+  [AIProviderName.PERPLEXITY]: PerplexityModels,
+  [AIProviderName.CLOUDFLARE]: CloudflareModels,
+  [AIProviderName.REPLICATE]: ReplicateModels,
+  [AIProviderName.VOYAGE]: VoyageModels,
+  [AIProviderName.JINA]: JinaModels,
+  [AIProviderName.STABILITY]: StabilityModels,
+  [AIProviderName.IDEOGRAM]: IdeogramModels,
+  [AIProviderName.RECRAFT]: RecraftModels,
   [AIProviderName.AUTO]: null,
 };
 
@@ -318,7 +609,15 @@ export function getTopModelChoices(
   }
 
   const choices = config.slice(0, limit).map((item) => ({
-    name: `${item.model} (${item.description})`,
+    // Empty-string entries are auto-discovery sentinels for LM Studio /
+    // llama.cpp. Surface them with a friendly label so the CLI doesn't show a
+    // blank row, but keep `value: ""` so it matches `DEFAULT_MODELS` (which
+    // also uses `""`) and any caller that preselects the active choice via
+    // the default model still resolves to this entry.
+    name:
+      item.model.length > 0
+        ? `${item.model} (${item.description})`
+        : `Auto-discover loaded model (${item.description})`,
     value: item.model,
     description: item.description,
   }));
@@ -445,14 +744,20 @@ export function getPopularModelsAcrossProviders(): {
 
   for (const [provider, config] of Object.entries(TOP_MODELS_CONFIG)) {
     if (config && config.length > 0) {
-      // Take top 2 from each provider
-      config.slice(0, 2).forEach((item) => {
-        popularModels.push({
-          provider: provider as AIProviderName,
-          model: item.model,
-          description: item.description,
+      // Take top 2 from each provider, ignoring blank auto-discovery sentinels.
+      // (Auto-discovery is surfaced separately by `getTopModelChoices` for
+      // LM Studio / llama.cpp; we don't want it to appear in the cross-
+      // provider popular-models list as an empty value.)
+      config
+        .filter((item) => item.model.length > 0)
+        .slice(0, 2)
+        .forEach((item) => {
+          popularModels.push({
+            provider: provider as AIProviderName,
+            model: item.model,
+            description: item.description,
+          });
         });
-      });
     }
   }
 

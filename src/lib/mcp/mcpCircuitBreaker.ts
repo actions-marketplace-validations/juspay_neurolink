@@ -5,6 +5,7 @@
  */
 
 import { EventEmitter } from "events";
+import { trace } from "@opentelemetry/api";
 import { mcpLogger } from "../utils/logger.js";
 import type {
   CallRecord,
@@ -12,7 +13,23 @@ import type {
   CircuitBreakerConfig,
   CircuitBreakerStats,
   CircuitBreakerEvents,
-} from "../types/mcpTypes.js";
+} from "../types/index.js";
+
+import { CircuitBreakerOpenError } from "../types/index.js";
+
+// Re-export CircuitBreakerOpenError from shared types to preserve public API
+export { CircuitBreakerOpenError } from "../types/index.js";
+
+/**
+ * Default operation timeout for circuit breaker protected operations.
+ * Configurable via MCP_OPERATION_TIMEOUT env var (in milliseconds).
+ * Increased from 30s to 60s to accommodate MCP server startup latency,
+ * especially when multiple servers start concurrently.
+ */
+const DEFAULT_OPERATION_TIMEOUT = Math.max(
+  10000,
+  Number(process.env.MCP_OPERATION_TIMEOUT) || 60000,
+);
 
 /**
  * MCPCircuitBreaker
@@ -39,7 +56,7 @@ export class MCPCircuitBreaker extends EventEmitter {
       failureThreshold: config.failureThreshold ?? 5,
       resetTimeout: config.resetTimeout ?? 60000,
       halfOpenMaxCalls: config.halfOpenMaxCalls ?? 3,
-      operationTimeout: config.operationTimeout ?? 30000,
+      operationTimeout: config.operationTimeout ?? DEFAULT_OPERATION_TIMEOUT,
       minimumCallsBeforeCalculation: config.minimumCallsBeforeCalculation ?? 10,
       statisticsWindowSize: config.statisticsWindowSize ?? 300000, // 5 minutes
     };
@@ -57,10 +74,18 @@ export class MCPCircuitBreaker extends EventEmitter {
     try {
       // Check if circuit is open
       if (this.state === "open") {
-        if (Date.now() - this.lastFailureTime < this.config.resetTimeout) {
-          throw new Error(
-            `Circuit breaker '${this.name}' is open. Next retry at ${new Date(this.lastFailureTime + this.config.resetTimeout)}`,
-          );
+        const retryAfterMs =
+          this.config.resetTimeout - (Date.now() - this.lastFailureTime);
+        if (retryAfterMs > 0) {
+          throw new CircuitBreakerOpenError({
+            breakerName: this.name,
+            retryAfter: new Date(
+              this.lastFailureTime + this.config.resetTimeout,
+            ),
+            retryAfterMs,
+            breakerState: "open",
+            failureCount: this.getStats().failedCalls,
+          });
         }
 
         // Transition to half-open
@@ -72,9 +97,32 @@ export class MCPCircuitBreaker extends EventEmitter {
         this.state === "half-open" &&
         this.halfOpenCalls >= this.config.halfOpenMaxCalls
       ) {
-        throw new Error(
-          `Circuit breaker '${this.name}' is half-open but call limit reached`,
+        // Half-open call limit exceeded — revert to open with fresh cooldown
+        this.lastFailureTime = Date.now();
+        this.changeState(
+          "open",
+          "Half-open call limit reached, reverting to open",
         );
+
+        throw new CircuitBreakerOpenError({
+          breakerName: this.name,
+          retryAfter: new Date(this.lastFailureTime + this.config.resetTimeout),
+          retryAfterMs: this.config.resetTimeout,
+          breakerState: "open",
+          failureCount: this.getStats().failedCalls,
+        });
+      }
+
+      // NLK-GAP-009: Record half-open test event when executing in half-open state
+      if (this.state === "half-open") {
+        const activeSpan = trace.getActiveSpan();
+        if (activeSpan) {
+          activeSpan.addEvent("circuit.half_open_test", {
+            "circuit.name": this.name,
+            "circuit.half_open_call": this.halfOpenCalls + 1,
+            "circuit.half_open_max_calls": this.config.halfOpenMaxCalls,
+          });
+        }
       }
 
       // Execute operation with timeout
@@ -194,6 +242,19 @@ export class MCPCircuitBreaker extends EventEmitter {
     const oldState = this.state;
     this.state = newState;
     this.lastStateChange = new Date();
+
+    // NLK-GAP-009: Record state transition on active OTel span
+    const activeSpan = trace.getActiveSpan();
+    if (activeSpan) {
+      activeSpan.addEvent("circuit.state_change", {
+        "circuit.name": this.name,
+        "circuit.from_state": oldState,
+        "circuit.to_state": newState,
+        "circuit.reason": reason.slice(0, 128),
+        "circuit.failure_count": this.callHistory.filter((c) => !c.success)
+          .length,
+      });
+    }
 
     // Reset counters based on state
     if (newState === "half-open") {

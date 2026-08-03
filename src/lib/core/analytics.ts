@@ -6,9 +6,14 @@
  */
 
 import { logger } from "../utils/logger.js";
-import type { JsonValue, UnknownRecord } from "../types/common.js";
+import type {
+  JsonValue,
+  UnknownRecord,
+  TokenUsage,
+  AnalyticsData,
+} from "../types/index.js";
 import { modelConfig } from "./modelConfiguration.js";
-import type { TokenUsage, AnalyticsData } from "../types/analytics.js";
+
 import { extractTokenUsage as extractTokenUsageUtil } from "../utils/tokenUtils.js";
 import { calculateCost, hasPricing } from "../utils/pricing.js";
 
@@ -31,6 +36,23 @@ export function createAnalytics(
     // Estimate cost based on provider and tokens
     const cost = estimateCost(provider, model, tokens);
 
+    // Turn-lifecycle telemetry from native agentic loops (Vertex
+    // Gemini/Claude): stopReason / rawFinishReason / stepsUsed ride the
+    // provider result; toolCallCount and elapsedMs derive from it.
+    const turnResult = result as {
+      stopReason?: string;
+      rawFinishReason?: string;
+      stepsUsed?: number;
+      responseTime?: number;
+      toolExecutions?: unknown[];
+      toolsUsed?: string[];
+    };
+    const toolCallCount = Array.isArray(turnResult.toolExecutions)
+      ? turnResult.toolExecutions.length
+      : Array.isArray(turnResult.toolsUsed)
+        ? turnResult.toolsUsed.length
+        : undefined;
+
     const analytics: AnalyticsData = {
       provider,
       model,
@@ -39,6 +61,19 @@ export function createAnalytics(
       requestDuration: responseTime,
       context: context as Record<string, JsonValue> | undefined,
       timestamp: new Date().toISOString(),
+      ...(typeof turnResult.stepsUsed === "number" && {
+        stepsUsed: turnResult.stepsUsed,
+      }),
+      ...(toolCallCount !== undefined && { toolCallCount }),
+      ...(typeof turnResult.stopReason === "string" && {
+        stopReason: turnResult.stopReason,
+      }),
+      ...(typeof turnResult.responseTime === "number" && {
+        elapsedMs: turnResult.responseTime,
+      }),
+      ...(typeof turnResult.rawFinishReason === "string" && {
+        rawFinishReason: turnResult.rawFinishReason,
+      }),
     };
 
     logger.debug(`[${functionTag}] Analytics created`, {
@@ -101,8 +136,15 @@ function estimateCost(
       return undefined;
     }
 
-    // Calculate cost using the configuration system (per-1K-token rates)
-    const inputCost = (tokens.input / 1000) * costInfo.input;
+    // Calculate cost using the configuration system (per-1K-token rates).
+    // costInfo has no cache tiers, so cache tokens are billed at the input
+    // rate — the pre-split total a cache-blind provider would report, never $0.
+    const inputCost =
+      ((tokens.input +
+        (tokens.cacheReadTokens ?? 0) +
+        (tokens.cacheCreationTokens ?? 0)) /
+        1000) *
+      costInfo.input;
     const outputCost = (tokens.output / 1000) * costInfo.output;
 
     return Math.round((inputCost + outputCost) * 1_000_000) / 1_000_000; // Round to 6 decimal places

@@ -3,9 +3,16 @@
  * Pre-built route definitions for common NeuroLink endpoints
  */
 
-import type { RouteDefinition, RouteGroup } from "../types.js";
+import type {
+  CreateRoutesOptions,
+  RouteDefinition,
+  RouteGroup,
+} from "../../types/index.js";
 import { createAgentRoutes } from "./agentRoutes.js";
+import { createClaudeProxyRoutes } from "./claudeProxyRoutes.js";
+// ClaudeProxyDeps removed
 import { createHealthRoutes } from "./healthRoutes.js";
+import { createOpenAIProxyRoutes } from "./openaiProxyRoutes.js";
 import { createMCPRoutes } from "./mcpRoutes.js";
 import { createMemoryRoutes } from "./memoryRoutes.js";
 import { createOpenApiRoutes } from "./openApiRoutes.js";
@@ -13,31 +20,14 @@ import { createToolRoutes } from "./toolRoutes.js";
 
 // Re-export route builders from individual files
 export { createAgentRoutes } from "./agentRoutes.js";
+export { createClaudeProxyRoutes } from "./claudeProxyRoutes.js";
+// ClaudeProxyDeps removed
 export { createHealthRoutes } from "./healthRoutes.js";
+export { createOpenAIProxyRoutes } from "./openaiProxyRoutes.js";
 export { createMCPRoutes } from "./mcpRoutes.js";
 export { createMemoryRoutes } from "./memoryRoutes.js";
 export { createOpenApiRoutes } from "./openApiRoutes.js";
 export { createToolRoutes } from "./toolRoutes.js";
-
-/**
- * Options for creating routes
- */
-export type CreateRoutesOptions = {
-  /** Enable OpenAPI/Swagger documentation endpoints (default: false) */
-  enableSwagger?: boolean;
-  /**
-   * Callback to get registered routes for OpenAPI spec generation.
-   * This callback is invoked at request time when the OpenAPI spec is accessed,
-   * allowing it to reflect all routes registered with the adapter.
-   *
-   * When using `registerAllRoutes`, this is automatically bound to `adapter.listRoutes()`
-   * if the adapter supports it and no custom callback is provided.
-   *
-   * If not provided (and adapter doesn't have listRoutes), the spec will use
-   * default endpoint definitions.
-   */
-  getRoutes?: () => RouteDefinition[];
-};
 
 /**
  * Create all standard routes
@@ -58,6 +48,19 @@ export function createAllRoutes(
   // Conditionally add OpenAPI/Swagger routes
   if (options?.enableSwagger) {
     routes.push(createOpenApiRoutes(basePath, options.getRoutes));
+  }
+
+  // Unified proxy flag enables both Claude and OpenAI endpoints.
+  // Legacy per-format flags are still supported for backward compatibility.
+  const enableClaudeProxy = options?.proxy || options?.claudeProxy;
+  const enableOpenAIProxy = options?.proxy || options?.openaiProxy;
+
+  if (enableClaudeProxy) {
+    routes.push(createClaudeProxyRoutes(undefined, basePath));
+  }
+
+  if (enableOpenAIProxy) {
+    routes.push(createOpenAIProxyRoutes(undefined, basePath));
   }
 
   return routes;

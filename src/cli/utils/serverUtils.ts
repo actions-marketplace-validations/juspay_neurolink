@@ -103,9 +103,10 @@ export class StateFileManager<T> {
   /**
    * Create a new state file manager
    * @param filename - Name of the state file (e.g., "serve-state.json")
+   * @param baseDir - Optional base directory (defaults to ~/.neurolink)
    */
-  constructor(filename: string) {
-    this.filePath = path.join(getNeuroLinkDir(), filename);
+  constructor(filename: string, baseDir?: string) {
+    this.filePath = path.join(baseDir ?? getNeuroLinkDir(), filename);
   }
 
   /**
@@ -120,8 +121,14 @@ export class StateFileManager<T> {
    * @param state - State object to save
    */
   save(state: T): void {
-    ensureStateDir();
-    fs.writeFileSync(this.filePath, JSON.stringify(state, null, 2));
+    const dir = path.dirname(this.filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
+    fs.writeFileSync(this.filePath, JSON.stringify(state, null, 2), {
+      mode: 0o600,
+    });
+    fs.chmodSync(this.filePath, 0o600);
   }
 
   /**

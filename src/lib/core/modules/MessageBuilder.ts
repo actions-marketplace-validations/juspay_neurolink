@@ -1,30 +1,81 @@
-/**
- * Message Builder Module
- *
- * Handles all message construction logic for AI providers.
- * Extracted from BaseProvider to follow Single Responsibility Principle.
- *
- * Responsibilities:
- * - Building messages from text generation options
- * - Building messages from stream options
- * - Multimodal input detection
- * - Message format conversion (to CoreMessage[])
- *
- * @module core/modules/MessageBuilder
- */
-
-import type { CoreMessage } from "ai";
+import { tracers, ATTR, withSpan } from "../../telemetry/index.js";
 import type {
   AIProviderName,
   TextGenerationOptions,
+  MultimodalInput,
+  MultimodalChatMessage,
+  StreamOptions,
 } from "../../types/index.js";
-import type { MultimodalInput } from "../../types/multimodal.js";
-import type { StreamOptions } from "../../types/streamTypes.js";
 import { logger } from "../../utils/logger.js";
 import {
   buildMessagesArray,
   buildMultimodalMessagesArray,
 } from "../../utils/messageBuilder.js";
+import type { ModelMessage } from "../../types/index.js";
+
+/**
+ * Compute total content length across all messages for span attributes.
+ */
+function computeTotalContentLength(messages: ModelMessage[]): number {
+  let total = 0;
+  for (const msg of messages) {
+    if (typeof msg.content === "string") {
+      total += msg.content.length;
+    } else if (Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if (
+          "text" in part &&
+          typeof (part as { text: unknown }).text === "string"
+        ) {
+          total += (part as { text: string }).text.length;
+        }
+      }
+    }
+  }
+  return total;
+}
+
+/**
+ * Check whether input contains multimodal content (images, files, PDFs, CSVs,
+ * audio, video). #284: audioFiles/videoFiles were previously ignored here, so a
+ * request carrying only audio or video was misrouted to the text-only path.
+ *
+ * Intentional (round-2 review): routing audio/video through `isMultimodal`
+ * does NOT mean vision is required. `buildMultimodalMessagesArray` folds
+ * `audioFiles`/`videoFiles` into `inp.files` for auto-detection, and
+ * `appendDetectedFileResult` injects their content as plain text markers
+ * (`## Audio File:` / `## Video File:`), not image/vision blocks — see
+ * `test/continuous-test-suite-bugfixes.ts` ("MessageBuilder #284: ...").
+ * "Multimodal" here means "needs the multimodal builder so the payload isn't
+ * dropped", not "needs a vision model".
+ */
+function detectMultimodal(opts: TextGenerationOptions | StreamOptions): {
+  isMultimodal: boolean;
+  hasImages: boolean;
+  hasFiles: boolean;
+} {
+  const input = opts.input as MultimodalInput | undefined;
+  const hasImages = !!input?.images?.length;
+  const hasContent = !!input?.content?.length;
+  const hasCSVFiles = !!input?.csvFiles?.length;
+  const hasPdfFiles = !!input?.pdfFiles?.length;
+  const hasFiles = !!input?.files?.length;
+  const hasAudioFiles = !!input?.audioFiles?.length;
+  const hasVideoFiles = !!input?.videoFiles?.length;
+  return {
+    isMultimodal:
+      hasImages ||
+      hasContent ||
+      hasCSVFiles ||
+      hasPdfFiles ||
+      hasFiles ||
+      hasAudioFiles ||
+      hasVideoFiles,
+    hasImages,
+    hasFiles:
+      hasCSVFiles || hasPdfFiles || hasFiles || hasAudioFiles || hasVideoFiles,
+  };
+}
 
 /**
  * MessageBuilder class - Handles message construction for AI providers
@@ -39,104 +90,142 @@ export class MessageBuilder {
    * Build messages array for generation
    * Detects multimodal input and routes to appropriate message builder
    */
-  async buildMessages(options: TextGenerationOptions): Promise<CoreMessage[]> {
-    const hasMultimodalInput = (opts: TextGenerationOptions): boolean => {
-      const input = opts.input as MultimodalInput | undefined;
-      const hasImages = !!input?.images?.length;
-      const hasContent = !!input?.content?.length;
-      const hasCSVFiles = !!input?.csvFiles?.length;
-      const hasPdfFiles = !!input?.pdfFiles?.length;
-      const hasFiles = !!input?.files?.length;
-      return hasImages || hasContent || hasCSVFiles || hasPdfFiles || hasFiles;
-    };
-
-    let messages;
-    if (hasMultimodalInput(options)) {
-      if (process.env.NEUROLINK_DEBUG === "true") {
-        logger.debug(
-          "Detected multimodal input, using multimodal message builder",
-        );
-      }
-
-      const input = options.input as MultimodalInput | undefined;
-      const multimodalOptions = {
-        input: {
-          text: options.prompt || options.input?.text || "",
-          images: input?.images,
-          content: input?.content,
-          csvFiles: input?.csvFiles,
-          pdfFiles: input?.pdfFiles,
-          files: input?.files,
+  async buildMessages(options: TextGenerationOptions): Promise<ModelMessage[]> {
+    return withSpan(
+      {
+        name: "neurolink.message.build",
+        tracer: tracers.sdk,
+        attributes: {
+          [ATTR.NL_PROVIDER]: this.providerName,
+          [ATTR.NL_MODEL]: this.modelName,
         },
-        csvOptions: options.csvOptions,
-        provider: options.provider,
-        model: options.model,
-        temperature: options.temperature,
-        maxTokens: options.maxTokens,
-        systemPrompt: options.systemPrompt,
-        enableAnalytics: options.enableAnalytics,
-        enableEvaluation: options.enableEvaluation,
-        context: options.context,
-        conversationHistory: options.conversationMessages,
-        schema: options.schema,
-        output: options.output,
-        fileRegistry: options.fileRegistry,
-      };
+      },
+      async (span) => {
+        const { isMultimodal, hasImages, hasFiles } = detectMultimodal(options);
+        span.setAttribute(ATTR.MSG_IS_MULTIMODAL, isMultimodal);
 
-      messages = await buildMultimodalMessagesArray(
-        multimodalOptions,
-        this.providerName,
-        this.modelName,
-      );
-    } else {
-      if (process.env.NEUROLINK_DEBUG === "true") {
-        logger.debug(
-          "No multimodal input detected, using standard message builder",
+        let messages: ModelMessage[] | MultimodalChatMessage[];
+        if (isMultimodal) {
+          if (process.env.NEUROLINK_DEBUG === "true") {
+            logger.debug(
+              "Detected multimodal input, using multimodal message builder",
+            );
+          }
+
+          const input = options.input as MultimodalInput | undefined;
+          const multimodalOptions = {
+            input: {
+              text: options.prompt || options.input?.text || "",
+              images: input?.images,
+              content: input?.content,
+              csvFiles: input?.csvFiles,
+              pdfFiles: input?.pdfFiles,
+              // #284: audioFiles/videoFiles must be forwarded too, or the
+              // multimodal builder receives an empty payload despite
+              // detectMultimodal() correctly routing audio/video-only
+              // requests here.
+              audioFiles: input?.audioFiles,
+              videoFiles: input?.videoFiles,
+              files: input?.files,
+            },
+            csvOptions: options.csvOptions,
+            pdfOptions: options.pdfOptions,
+            provider: options.provider,
+            model: options.model,
+            temperature: options.temperature,
+            maxTokens: options.maxTokens,
+            systemPrompt: options.systemPrompt,
+            enableAnalytics: options.enableAnalytics,
+            enableEvaluation: options.enableEvaluation,
+            context: options.context,
+            conversationHistory: options.conversationMessages,
+            schema: options.schema,
+            output: options.output,
+            fileRegistry: options.fileRegistry,
+          };
+
+          messages = await buildMultimodalMessagesArray(
+            multimodalOptions,
+            this.providerName,
+            this.modelName,
+          );
+          // Propagate any systemPrompt augmentation (e.g. inline-file
+          // handling guidance from processUnifiedFilesArray) back to the
+          // caller's options. Providers like GoogleVertex's native
+          // @google/genai stream path read `options.systemPrompt` directly
+          // — without this propagation the augmentation lives only on the
+          // local `multimodalOptions` clone and never reaches the model.
+          if (
+            multimodalOptions.systemPrompt &&
+            multimodalOptions.systemPrompt !== options.systemPrompt
+          ) {
+            options.systemPrompt = multimodalOptions.systemPrompt;
+          }
+        } else {
+          if (process.env.NEUROLINK_DEBUG === "true") {
+            logger.debug(
+              "No multimodal input detected, using standard message builder",
+            );
+          }
+          messages = await buildMessagesArray(options);
+        }
+
+        // Convert messages to Vercel AI SDK format
+        // Preserve providerOptions (e.g. Anthropic cache_control) through conversion
+        const coreMessages = messages.map((msg) => {
+          const providerOptions = (msg as Record<string, unknown>)
+            .providerOptions as Record<string, unknown> | undefined;
+          if (typeof msg.content === "string") {
+            return {
+              role: msg.role as "user" | "assistant" | "system",
+              content: msg.content,
+              ...(providerOptions && { providerOptions }),
+            } as ModelMessage;
+          } else {
+            return {
+              role: msg.role as "user" | "assistant" | "system",
+              content: (msg.content as Array<Record<string, unknown>>).map(
+                (item) => {
+                  const itemProviderOptions = item.providerOptions as
+                    | Record<string, unknown>
+                    | undefined;
+                  if (item.type === "text") {
+                    return {
+                      type: "text" as const,
+                      text: (item.text as string) || "",
+                      ...(itemProviderOptions && {
+                        providerOptions: itemProviderOptions,
+                      }),
+                    };
+                  } else if (item.type === "image") {
+                    return {
+                      type: "image" as const,
+                      image: (item.image as string) || "",
+                      ...(itemProviderOptions && {
+                        providerOptions: itemProviderOptions,
+                      }),
+                    };
+                  }
+                  return item;
+                },
+              ),
+              ...(providerOptions && { providerOptions }),
+            } as ModelMessage;
+          }
+        });
+
+        span.setAttribute(ATTR.MSG_COUNT, coreMessages.length);
+        span.setAttribute(ATTR.MSG_HAS_IMAGES, hasImages);
+        span.setAttribute(ATTR.MSG_HAS_FILES, hasFiles);
+        span.setAttribute(ATTR.MSG_HAS_SYSTEM_PROMPT, !!options.systemPrompt);
+        span.setAttribute(
+          ATTR.MSG_TOTAL_CONTENT_LENGTH,
+          computeTotalContentLength(coreMessages),
         );
-      }
-      messages = await buildMessagesArray(options);
-    }
 
-    // Convert messages to Vercel AI SDK format
-    // Preserve providerOptions (e.g. Anthropic cache_control) through conversion
-    return messages.map((msg) => {
-      const providerOptions = (msg as Record<string, unknown>)
-        .providerOptions as Record<string, unknown> | undefined;
-      if (typeof msg.content === "string") {
-        return {
-          role: msg.role as "user" | "assistant" | "system",
-          content: msg.content,
-          ...(providerOptions && { providerOptions }),
-        } as CoreMessage;
-      } else {
-        return {
-          role: msg.role as "user" | "assistant" | "system",
-          content: msg.content.map((item) => {
-            const itemProviderOptions = (item as Record<string, unknown>)
-              .providerOptions as Record<string, unknown> | undefined;
-            if (item.type === "text") {
-              return {
-                type: "text",
-                text: item.text || "",
-                ...(itemProviderOptions && {
-                  providerOptions: itemProviderOptions,
-                }),
-              };
-            } else if (item.type === "image") {
-              return {
-                type: "image",
-                image: item.image || "",
-                ...(itemProviderOptions && {
-                  providerOptions: itemProviderOptions,
-                }),
-              };
-            }
-            return item;
-          }),
-          ...(providerOptions && { providerOptions }),
-        } as CoreMessage;
-      }
-    });
+        return coreMessages;
+      },
+    );
   }
 
   /**
@@ -145,114 +234,147 @@ export class MessageBuilder {
    * with automatic multimodal detection, eliminating code duplication
    *
    * @param options - Stream options or text generation options
-   * @returns Promise resolving to CoreMessage array ready for AI SDK
+   * @returns Promise resolving to ModelMessage array ready for AI SDK
    */
   async buildMessagesForStream(
     options: StreamOptions | TextGenerationOptions,
-  ): Promise<CoreMessage[]> {
-    // Detect multimodal input
-    const hasMultimodalInput = (
-      opts: StreamOptions | TextGenerationOptions,
-    ): boolean => {
-      const input = opts.input as MultimodalInput | undefined;
-      const hasImages = !!input?.images?.length;
-      const hasContent = !!input?.content?.length;
-      const hasCSVFiles = !!input?.csvFiles?.length;
-      const hasPdfFiles = !!input?.pdfFiles?.length;
-      const hasFiles = !!input?.files?.length;
-      return hasImages || hasContent || hasCSVFiles || hasPdfFiles || hasFiles;
-    };
-
-    let messages;
-    if (hasMultimodalInput(options)) {
-      if (process.env.NEUROLINK_DEBUG === "true") {
-        logger.debug(
-          `${this.providerName}: Detected multimodal input, using multimodal message builder`,
-        );
-      }
-
-      const input = options.input as MultimodalInput | undefined;
-      const multimodalOptions = {
-        input: {
-          text:
-            (options as TextGenerationOptions).prompt ||
-            options.input?.text ||
-            "",
-          images: input?.images,
-          content: input?.content,
-          csvFiles: input?.csvFiles,
-          pdfFiles: input?.pdfFiles,
-          files: input?.files,
+  ): Promise<ModelMessage[]> {
+    return withSpan(
+      {
+        name: "neurolink.message.build_for_stream",
+        tracer: tracers.sdk,
+        attributes: {
+          [ATTR.NL_PROVIDER]: this.providerName,
+          [ATTR.NL_MODEL]: this.modelName,
         },
-        csvOptions: options.csvOptions,
-        provider: options.provider,
-        model: options.model,
-        temperature: options.temperature,
-        maxTokens: options.maxTokens,
-        systemPrompt: options.systemPrompt,
-        enableAnalytics: options.enableAnalytics,
-        enableEvaluation: options.enableEvaluation,
-        context: options.context,
-        conversationHistory: (options as TextGenerationOptions)
-          .conversationMessages,
-        schema: options.schema,
-        output: options.output,
-        fileRegistry: (options as Record<string, unknown>).fileRegistry,
-      };
+      },
+      async (span) => {
+        const { isMultimodal, hasImages, hasFiles } = detectMultimodal(options);
+        span.setAttribute(ATTR.MSG_IS_MULTIMODAL, isMultimodal);
 
-      messages = await buildMultimodalMessagesArray(
-        multimodalOptions,
-        this.providerName,
-        this.modelName,
-      );
-    } else {
-      if (process.env.NEUROLINK_DEBUG === "true") {
-        logger.debug(
-          `${this.providerName}: No multimodal input detected, using standard message builder`,
+        let messages: ModelMessage[] | MultimodalChatMessage[];
+        if (isMultimodal) {
+          if (process.env.NEUROLINK_DEBUG === "true") {
+            logger.debug(
+              `${this.providerName}: Detected multimodal input, using multimodal message builder`,
+            );
+          }
+
+          const input = options.input as MultimodalInput | undefined;
+          const multimodalOptions = {
+            input: {
+              text:
+                (options as TextGenerationOptions).prompt ||
+                options.input?.text ||
+                "",
+              images: input?.images,
+              content: input?.content,
+              csvFiles: input?.csvFiles,
+              pdfFiles: input?.pdfFiles,
+              // #284: forward audioFiles/videoFiles here too — see the
+              // matching comment in buildMessages() above.
+              audioFiles: input?.audioFiles,
+              videoFiles: input?.videoFiles,
+              files: input?.files,
+            },
+            csvOptions: options.csvOptions,
+            pdfOptions: options.pdfOptions,
+            provider: options.provider,
+            model: options.model,
+            temperature: options.temperature,
+            maxTokens: options.maxTokens,
+            systemPrompt: options.systemPrompt,
+            enableAnalytics: options.enableAnalytics,
+            enableEvaluation: options.enableEvaluation,
+            context: options.context,
+            conversationHistory: (options as TextGenerationOptions)
+              .conversationMessages,
+            schema: options.schema,
+            output: options.output,
+            fileRegistry: (options as Record<string, unknown>).fileRegistry,
+          };
+
+          messages = await buildMultimodalMessagesArray(
+            multimodalOptions,
+            this.providerName,
+            this.modelName,
+          );
+          // Propagate any systemPrompt augmentation (e.g. inline-file
+          // handling guidance from processUnifiedFilesArray) back to the
+          // caller's options. Providers like GoogleVertex's native
+          // @google/genai stream path read `options.systemPrompt` directly
+          // — without this propagation the augmentation lives only on the
+          // local `multimodalOptions` clone and never reaches the model.
+          if (
+            multimodalOptions.systemPrompt &&
+            multimodalOptions.systemPrompt !== options.systemPrompt
+          ) {
+            options.systemPrompt = multimodalOptions.systemPrompt;
+          }
+        } else {
+          if (process.env.NEUROLINK_DEBUG === "true") {
+            logger.debug(
+              `${this.providerName}: No multimodal input detected, using standard message builder`,
+            );
+          }
+          messages = await buildMessagesArray(options);
+        }
+
+        // Convert messages to Vercel AI SDK format
+        // Preserve providerOptions (e.g. Anthropic cache_control) through conversion
+        const coreMessages = messages.map((msg) => {
+          const providerOptions = (msg as Record<string, unknown>)
+            .providerOptions as Record<string, unknown> | undefined;
+          if (typeof msg.content === "string") {
+            return {
+              role: msg.role as "user" | "assistant" | "system",
+              content: msg.content,
+              ...(providerOptions && { providerOptions }),
+            } as ModelMessage;
+          } else {
+            return {
+              role: msg.role as "user" | "assistant" | "system",
+              content: (msg.content as Array<Record<string, unknown>>).map(
+                (item) => {
+                  const itemProviderOptions = item.providerOptions as
+                    | Record<string, unknown>
+                    | undefined;
+                  if (item.type === "text") {
+                    return {
+                      type: "text" as const,
+                      text: (item.text as string) || "",
+                      ...(itemProviderOptions && {
+                        providerOptions: itemProviderOptions,
+                      }),
+                    };
+                  } else if (item.type === "image") {
+                    return {
+                      type: "image" as const,
+                      image: (item.image as string) || "",
+                      ...(itemProviderOptions && {
+                        providerOptions: itemProviderOptions,
+                      }),
+                    };
+                  }
+                  return item;
+                },
+              ),
+              ...(providerOptions && { providerOptions }),
+            } as ModelMessage;
+          }
+        });
+
+        span.setAttribute(ATTR.MSG_COUNT, coreMessages.length);
+        span.setAttribute(ATTR.MSG_HAS_IMAGES, hasImages);
+        span.setAttribute(ATTR.MSG_HAS_FILES, hasFiles);
+        span.setAttribute(ATTR.MSG_HAS_SYSTEM_PROMPT, !!options.systemPrompt);
+        span.setAttribute(
+          ATTR.MSG_TOTAL_CONTENT_LENGTH,
+          computeTotalContentLength(coreMessages),
         );
-      }
-      messages = await buildMessagesArray(options);
-    }
 
-    // Convert messages to Vercel AI SDK format
-    // Preserve providerOptions (e.g. Anthropic cache_control) through conversion
-    return messages.map((msg) => {
-      const providerOptions = (msg as Record<string, unknown>)
-        .providerOptions as Record<string, unknown> | undefined;
-      if (typeof msg.content === "string") {
-        return {
-          role: msg.role as "user" | "assistant" | "system",
-          content: msg.content,
-          ...(providerOptions && { providerOptions }),
-        } as CoreMessage;
-      } else {
-        return {
-          role: msg.role as "user" | "assistant" | "system",
-          content: msg.content.map((item) => {
-            const itemProviderOptions = (item as Record<string, unknown>)
-              .providerOptions as Record<string, unknown> | undefined;
-            if (item.type === "text") {
-              return {
-                type: "text",
-                text: item.text || "",
-                ...(itemProviderOptions && {
-                  providerOptions: itemProviderOptions,
-                }),
-              };
-            } else if (item.type === "image") {
-              return {
-                type: "image",
-                image: item.image || "",
-                ...(itemProviderOptions && {
-                  providerOptions: itemProviderOptions,
-                }),
-              };
-            }
-            return item;
-          }),
-          ...(providerOptions && { providerOptions }),
-        } as CoreMessage;
-      }
-    });
+        return coreMessages;
+      },
+    );
   }
 }

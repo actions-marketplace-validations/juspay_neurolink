@@ -1,3 +1,18 @@
+---
+title: "Observability Guide"
+description: Enterprise-grade observability for AI operations with Langfuse and OpenTelemetry integration
+keywords:
+  [
+    observability,
+    langfuse,
+    opentelemetry,
+    tracing,
+    monitoring,
+    telemetry,
+    distributed-tracing,
+  ]
+---
+
 # Observability Guide
 
 Enterprise-grade observability for AI operations with Langfuse and OpenTelemetry integration.
@@ -10,6 +25,8 @@ NeuroLink provides comprehensive observability features for monitoring AI operat
 - **OpenTelemetry Support**: Standard distributed tracing compatible with Jaeger, Zipkin, and other backends
 - **External Provider Mode**: Integrate with existing OpenTelemetry instrumentation without conflicts
 - **Context Propagation**: Automatic context enrichment with user, session, and custom metadata
+
+For the Claude proxy's local OpenObserve stack and maintained dashboard, use [Claude Proxy](/docs/features/claude-proxy) and [Claude Proxy Observability](/docs/features/claude-proxy-observability). Those guides cover `neurolink proxy telemetry setup`, dashboard import, stream names, and how to interpret proxy-specific logs, metrics, and traces.
 
 ## Quick Start
 
@@ -69,7 +86,7 @@ const result = await setLangfuseContext(
     },
   },
   async () => {
-    return await neurolink.generate({ prompt: "Hello" });
+    return await neurolink.generate("Hello");
   },
 );
 
@@ -201,7 +218,7 @@ await setLangfuseContext(
     operationName: "custom-rag-pipeline",
   },
   async () => {
-    return await neurolink.generate({ prompt: "Hello" });
+    return await neurolink.generate("Hello");
   },
 );
 // Trace name: "user-123:custom-rag-pipeline"
@@ -213,7 +230,7 @@ await setLangfuseContext(
     autoDetectOperationName: false, // Override global setting
   },
   async () => {
-    return await neurolink.generate({ prompt: "Hello" });
+    return await neurolink.generate("Hello");
   },
 );
 // Trace name: "user-123" (legacy behavior)
@@ -225,7 +242,7 @@ await setLangfuseContext(
     autoDetectOperationName: true, // Enable for this context
   },
   async () => {
-    return await neurolink.generate({ prompt: "Hello" });
+    return await neurolink.generate("Hello");
   },
 );
 // Trace name: "user-123:ai.generateText"
@@ -245,7 +262,7 @@ Operation name support is fully backward compatible:
        operationName: "ignored-operation",
      },
      async () => {
-       return await neurolink.generate({ prompt: "Hello" });
+       return await neurolink.generate("Hello");
      },
    );
    // Trace name: "my-custom-trace"
@@ -278,7 +295,7 @@ Operation name support is fully backward compatible:
        traceName: "customer-support-chat",
      },
      async () => {
-       return await neurolink.generate({ prompt: "Hello" });
+       return await neurolink.generate("Hello");
      },
    );
    // Trace name: "customer-support-chat"
@@ -302,7 +319,7 @@ When host applications create wrapper spans (trace-root spans) before AI operati
 ```typescript
 // Host app creates wrapper span first
 const span = tracer.startSpan("my-operation"); // onStart() runs here - no AI span yet
-await neurolink.generate({ prompt: "Hello" }); // AI SDK creates "ai.generateText" span later
+await neurolink.generate("Hello"); // AI SDK creates "ai.generateText" span later
 span.end();
 ```
 
@@ -334,7 +351,7 @@ await setLangfuseContext({ userId: "user-123" }, async () => {
     span.setAttribute("request.type", "chat");
     span.setAttribute("model", "gpt-4");
 
-    const result = await neurolink.generate({ prompt: "Hello" });
+    const result = await neurolink.generate("Hello");
 
     span.setAttribute("tokens.total", result.usage?.totalTokens ?? 0);
     return result;
@@ -347,9 +364,13 @@ await setLangfuseContext({ userId: "user-123" }, async () => {
 });
 ```
 
+## Proxy Observability
+
+The NeuroLink proxy automatically initializes OpenTelemetry and exports three signal types (traces, metrics, logs) via OTLP HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Each proxy request creates an OTel span with token usage, model, cost, and rate-limit attributes. Request log entries include `traceId` and `spanId` for cross-signal correlation. See the [Telemetry Guide](../telemetry-guide.md#-proxy-telemetry-otlp-triple-signal-export) for details.
+
 ## External TracerProvider Mode
 
-If your application already has OpenTelemetry instrumentation (e.g., for HTTP, database tracing), use external provider mode to avoid "duplicate registration" errors:
+If your application already has OpenTelemetry instrumentation (e.g., for HTTP, database tracing), use external provider mode to avoid "duplicate registration" errors. Note: `TelemetryService` now automatically detects and reuses an existing global `TracerProvider`, so in many cases you no longer need explicit external provider configuration.
 
 ### Configuration
 
@@ -541,7 +562,7 @@ try {
 ```typescript
 const span = tracer.startSpan("ai-generation");
 try {
-  return await neurolink.generate({ prompt });
+  return await neurolink.generate({ input: { text: prompt } });
 } catch (error) {
   span.recordException(error as Error);
   span.setStatus({ code: 2, message: (error as Error).message });
@@ -580,11 +601,11 @@ const processors = getSpanProcessors(); // Returns [ContextEnricher, LangfuseSpa
 // Wrong - context set outside the request handler
 await setLangfuseContext({ userId: "user-123" });
 // ... later in different async context
-await neurolink.generate({ prompt: "Hello" }); // Context lost!
+await neurolink.generate("Hello"); // Context lost!
 
 // Correct - use callback to scope context
 await setLangfuseContext({ userId: "user-123" }, async () => {
-  await neurolink.generate({ prompt: "Hello" }); // Context attached!
+  await neurolink.generate("Hello"); // Context attached!
 });
 ```
 

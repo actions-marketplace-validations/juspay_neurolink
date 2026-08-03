@@ -12,7 +12,7 @@ NeuroLink provides comprehensive multimodal support, allowing you to combine tex
 
 **Supported Input Types:**
 
-- **Images** - JPEG, PNG, GIF, WebP, HEIC (vision-capable models)
+- **Images** - JPEG, PNG, GIF, WebP, AVIF, HEIC (vision-capable models)
 - **PDFs** - Document analysis and content extraction
 - **CSV/Spreadsheets** - Data analysis and tabular content processing
 - **Audio** - Transcription, analysis, and real-time voice input ([Audio Input Guide](audio-input.md))
@@ -153,7 +153,11 @@ const result = await neurolink.generate({
 - PNG (`.png`)
 - GIF (`.gif`)
 - WebP (`.webp`)
-- HEIC (`.heic`, `.heif`) - iOS photos
+- AVIF (`.avif`) - detected from content (`avif`/`avis`/`avio` brands) as well as extension
+- BMP (`.bmp`), TIFF (`.tif`, `.tiff`) - detected from content
+- HEIC (`.heic`, `.heif`) - detected from HEIC/HEIF content brands as well as extension; unsupported provider formats still require PNG/JPEG conversion
+
+The MIME type is sniffed from the buffer's magic bytes, not assumed from the filename. A buffer whose bytes match no known image format is labeled `application/octet-stream` (with a warning) rather than silently mislabeled as JPEG.
 
 **Input methods:**
 
@@ -420,6 +424,25 @@ for await (const chunk of stream) {
 }
 ```
 
+### Batch with Multimodal (CLI)
+
+The `batch` command supports `--image`, `--csv`, `--pdf`, and `--video`. The file(s) are attached **identically to every prompt** in the batch (a one-line notice is printed to **stderr**, unconditionally — it is not suppressed by `--quiet`, so it never corrupts `--format json` output written to stdout):
+
+```bash
+neurolink batch questions.txt --csv sales.csv --format json
+```
+
+> `--file` (auto-detect) is **not** available in `batch`, because it collides with the `<file>` positional (the prompts-list path). Use the explicit `--image` / `--csv` / `--pdf` / `--video` flags instead.
+
+### File validation & troubleshooting (CLI)
+
+Before any provider call, the CLI validates local file inputs across `generate`, `stream`, and `batch`:
+
+- A path that points at a **directory**, doesn't exist, or can't be read (e.g. a permissions error) is rejected up front with a clear error and troubleshooting hints — no cryptic `EISDIR`/`EACCES` deep in processing. This also applies to the `batch` `<file>` prompts-list positional itself.
+- A **large** file (images > 10 MB, CSV/PDF > 50 MB) prints a non-blocking warning to **stderr**. Like the batch attachment notice, this is unconditional — visible without `--debug` and regardless of `--quiet` — and never mixes into stdout, so `--format json` output stays valid JSON even when large-file warnings fire.
+
+This runs even under `--dry-run` and without API keys configured.
+
 ---
 
 ## Configuration & Fine-tuning
@@ -562,6 +585,7 @@ const result = await neurolink.generate({
 - [Audio Input](audio-input.md) - Transcription, analysis, and real-time voice
 - [TTS Integration](tts.md) - Text-to-Speech audio output
 - [Video Generation](video-generation.md) - AI-powered video creation
+- [PPT Generation](ppt-generation.md) - AI-powered PowerPoint presentations
 
 **Documentation:**
 

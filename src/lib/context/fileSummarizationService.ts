@@ -15,26 +15,15 @@
 import { estimateTokens } from "../utils/tokenEstimation.js";
 import {
   buildFileSummarizationPrompt,
-  type FileForSummarization,
-  type FileSummarizationCheckParams,
   planFileSummarization,
-  type SummarizedFile,
 } from "./fileSummarizer.js";
-import type { RawFileInput } from "../types/contextTypes.js";
-
-export type { RawFileInput } from "../types/contextTypes.js";
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-/** Constructor options. */
-type FileSummarizationServiceOptions = {
-  /** Provider used for the summarization LLM call (default: "vertex") */
-  provider?: string;
-  /** Model used for the summarization LLM call (default: "gemini-2.5-flash") */
-  model?: string;
-};
+import type {
+  FileForSummarization,
+  FileSummarizationCheckParams,
+  FileSummarizationServiceOptions,
+  RawFileInput,
+  SummarizedFile,
+} from "../types/index.js";
 
 // ---------------------------------------------------------------------------
 // MIME → human label mapping
@@ -307,9 +296,8 @@ export class FileSummarizationService {
         });
       } catch {
         // Fallback: naive truncation
-        const { truncateToTokenBudget } = await import(
-          "../utils/tokenEstimation.js"
-        );
+        const { truncateToTokenBudget } =
+          await import("../utils/tokenEstimation.js");
         const { text: truncated } = truncateToTokenBudget(
           entry.file.content,
           targetTokens,

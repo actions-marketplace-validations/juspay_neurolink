@@ -1,7 +1,8 @@
 import { AIProviderName } from "../../lib/constants/enums.js";
-import type { OptionSchema } from "../../lib/types/cli.js";
-import type { TextGenerationOptions } from "../../lib/types/generateTypes.js";
-
+import type {
+  OptionSchema,
+  TextGenerationOptions,
+} from "../../lib/types/index.js";
 /**
  * Master schema for all text generation options.
  * This object provides metadata for validation and help text in the CLI loop.
@@ -25,7 +26,9 @@ export const textGenerationOptionsSchema: Record<
     | "evaluationCriteria"
     | "region"
     | "csvOptions"
+    | "pdfOptions"
     | "tts"
+    | "stt" // Complex object, set via --stt* flags
     | "thinkingConfig" // Complex object, use thinking/thinkingBudget instead
     | "requestId" // Observability ID, not CLI-settable
     | "fileRegistry" // Internal: set by SDK, not by CLI
@@ -34,6 +37,15 @@ export const textGenerationOptionsSchema: Record<
     | "excludeTools" // Array type, not simple CLI option
     | "toolChoice" // Complex type, not suitable for simple CLI input
     | "prepareStep" // Callback function, only usable via SDK
+    | "credentials" // Complex per-provider object, only usable via SDK
+    | "onFinish" // Lifecycle callback, only usable via SDK
+    | "onError" // Lifecycle callback, only usable via SDK
+    | "processors" // Complex I/O processor config, only usable via SDK
+    | "piiDetection" // Complex config, wired via CLI flags instead
+    | "responseValidation" // Complex config, wired via CLI flags instead
+    | "inputValidation" // Complex config, wired via CLI flags instead
+    | "toolExecutionCapture" // Complex config object, only usable via SDK
+    | "toolExecutionRecorder" // Internal: set by BaseProvider, not by CLI
   >,
   OptionSchema
 > = {
@@ -56,6 +68,21 @@ export const textGenerationOptionsSchema: Record<
     type: "number",
     description: "The maximum number of tokens to generate.",
   },
+  topP: {
+    type: "number",
+    description:
+      "Top-p (nucleus) sampling parameter. Controls diversity of generated tokens (0.0-1.0).",
+  },
+  topK: {
+    type: "number",
+    description:
+      "Top-k sampling parameter. Limits the number of tokens considered (Google/Gemini models only).",
+  },
+  stopSequences: {
+    type: "string",
+    description:
+      "Stop sequences that will halt generation when encountered (comma-separated).",
+  },
   output: {
     type: "string",
     description:
@@ -70,9 +97,34 @@ export const textGenerationOptionsSchema: Record<
     type: "number",
     description: "Timeout for the generation request in milliseconds.",
   },
+  turnTimeoutMs: {
+    type: "number",
+    description:
+      "Wall-clock cap for the whole agentic turn in milliseconds (all steps + tool executions).",
+  },
+  stallTimeoutMs: {
+    type: "number",
+    description:
+      "Maximum time with no progress (no chunk, no tool activity) before the turn ends as stalled, in milliseconds.",
+  },
+  wrapupTimeLeadMs: {
+    type: "number",
+    description:
+      "Remaining-turn-time threshold that triggers a wrap-up nudge to the model, in milliseconds.",
+  },
+  toolTimeoutMs: {
+    type: "number",
+    description:
+      "Per-tool-execution timeout in milliseconds (default 300000). A timed-out tool fails that step; the turn continues.",
+  },
   disableTools: {
     type: "boolean",
     description: "Disable all tool usage for the AI.",
+  },
+  enabledToolNames: {
+    type: "string",
+    description:
+      'Comma-separated list of tool names to enable (e.g., "read,write,search").',
   },
   maxSteps: {
     type: "number",
@@ -118,5 +170,15 @@ export const textGenerationOptionsSchema: Record<
     type: "boolean",
     description:
       "Skip injecting tool descriptions into the system prompt. Useful when tool info is already provided.",
+  },
+  disableToolCache: {
+    type: "boolean",
+    description:
+      "Disable tool result caching for this request (overrides global mcp.cache.enabled).",
+  },
+  disableToolCallRepair: {
+    type: "boolean",
+    description:
+      "Disable the schema-driven tool call repair mechanism (near-miss tool names, mis-typed arguments). Repair is enabled by default.",
   },
 };

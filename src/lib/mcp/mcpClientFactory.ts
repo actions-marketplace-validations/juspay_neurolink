@@ -18,20 +18,40 @@ import type {
 import { spawn, type ChildProcess } from "child_process";
 import { mcpLogger } from "../utils/logger.js";
 import { globalCircuitBreakerManager } from "./mcpCircuitBreaker.js";
+import { CircuitBreakerOpenError } from "../types/index.js";
 import {
   withHTTPRetry,
   DEFAULT_HTTP_RETRY_CONFIG,
 } from "./httpRetryHandler.js";
 import { globalRateLimiterManager } from "./httpRateLimiter.js";
 import { NeuroLinkOAuthProvider, InMemoryTokenStorage } from "./auth/index.js";
-import type { MCPOAuthConfig } from "../types/mcpTypes.js";
-import type { MCPTransportType } from "../types/externalMcp.js";
-import type { MCPServerInfo, MCPClientResult } from "../types/mcpTypes.js";
 import type {
+  MCPOAuthConfig,
+  MCPTransportType,
+  MCPServerInfo,
+  MCPClientResult,
   TransportResult,
   TransportWithProcessResult,
   NetworkTransportResult,
-} from "../types/typeAliases.js";
+} from "../types/index.js";
+import {
+  SpanSerializer,
+  SpanType,
+  SpanStatus,
+  getMetricsAggregator,
+} from "../observability/index.js";
+import { getActiveTraceContext } from "../telemetry/traceContext.js";
+/**
+ * Default timeout for MCP client creation in milliseconds.
+ * Configurable via MCP_CLIENT_TIMEOUT env var.
+ * Covers process spawn, transport setup, connection, and handshake.
+ * Set to 60s to accommodate stdio servers that may be slow to start,
+ * especially when multiple MCP servers are started concurrently.
+ */
+const DEFAULT_CLIENT_TIMEOUT = Math.max(
+  5000,
+  Number(process.env.MCP_CLIENT_TIMEOUT) || 60000,
+);
 
 /**
  * MCPClientFactory
@@ -56,9 +76,21 @@ export class MCPClientFactory {
    */
   static async createClient(
     config: MCPServerInfo,
-    timeout = 10000,
+    timeout = DEFAULT_CLIENT_TIMEOUT,
   ): Promise<MCPClientResult> {
     const startTime = Date.now();
+    const { traceId, parentSpanId } = getActiveTraceContext();
+    const obsSpan = SpanSerializer.createSpan(
+      SpanType.MCP_TRANSPORT,
+      "mcp.connect",
+      {
+        "mcp.transport": config.transport,
+        "mcp.operation": "connect",
+        "mcp.server_id": config.id,
+      },
+      parentSpanId,
+      traceId,
+    );
 
     try {
       mcpLogger.info(`[MCPClientFactory] Creating client for ${config.id}`, {
@@ -148,6 +180,10 @@ export class MCPClientFactory {
         },
       );
 
+      obsSpan.durationMs = Date.now() - startTime;
+      const endedObsSpan = SpanSerializer.endSpan(obsSpan, SpanStatus.OK);
+      getMetricsAggregator().recordSpan(endedObsSpan);
+
       return {
         ...result,
         success: true,
@@ -157,10 +193,45 @@ export class MCPClientFactory {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
 
-      mcpLogger.error(
+      // Circuit breaker open: log at warn (not error) since this is expected
+      // protection behavior, and preserve the structured metadata.
+      if (error instanceof CircuitBreakerOpenError) {
+        mcpLogger.warn(
+          `[MCPClientFactory] Client creation blocked by circuit breaker for ${config.id}`,
+          {
+            serverId: config.id,
+            breakerState: error.breakerState,
+            retryAfter: error.retryAfter,
+            retryAfterMs: error.retryAfterMs,
+            failureCount: error.failureCount,
+          },
+        );
+
+        obsSpan.durationMs = Date.now() - startTime;
+        const endedObsSpan = SpanSerializer.endSpan(obsSpan, SpanStatus.ERROR);
+        endedObsSpan.statusMessage = `Circuit breaker open: ${errorMessage}`;
+        getMetricsAggregator().recordSpan(endedObsSpan);
+
+        return {
+          success: false,
+          error: errorMessage,
+          duration: Date.now() - startTime,
+        };
+      }
+
+      // debug, not error: this failure propagates up through
+      // ExternalServerManager to NeuroLink.addExternalMCPServer, which emits
+      // the single ERROR record. Logging at every layer turned one failed
+      // server registration into 5 ERROR lines in production.
+      mcpLogger.debug(
         `[MCPClientFactory] Failed to create client for ${config.id}:`,
         error,
       );
+
+      obsSpan.durationMs = Date.now() - startTime;
+      const endedObsSpan = SpanSerializer.endSpan(obsSpan, SpanStatus.ERROR);
+      endedObsSpan.statusMessage = errorMessage;
+      getMetricsAggregator().recordSpan(endedObsSpan);
 
       return {
         success: false,
@@ -387,6 +458,7 @@ export class MCPClientFactory {
     } catch (error) {
       throw new Error(
         `Invalid SSE URL: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
       );
     }
   }
@@ -416,6 +488,7 @@ export class MCPClientFactory {
     } catch (error) {
       throw new Error(
         `Invalid WebSocket URL: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
       );
     }
   }
@@ -493,6 +566,7 @@ export class MCPClientFactory {
     } catch (error) {
       throw new Error(
         `Invalid HTTP URL: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
       );
     }
   }

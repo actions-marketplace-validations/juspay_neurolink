@@ -4,23 +4,55 @@
  * Uses multi-strategy approach for reliable type identification
  */
 
-import { readFile, stat } from "fs/promises";
+import { open, readFile, realpath } from "fs/promises";
+import {
+  basename,
+  isAbsolute as isAbsolutePath,
+  relative as relativePath,
+  resolve as resolvePath,
+  sep,
+} from "path";
 import { getGlobalDispatcher, interceptors, request } from "undici";
-import { archiveProcessor } from "../processors/archive/ArchiveProcessor.js";
-import { audioProcessor } from "../processors/media/AudioProcessor.js";
-import { videoProcessor } from "../processors/media/VideoProcessor.js";
+// Lazy-loaded processor singletons — avoids loading heavy media deps
+// (mediabunny, fluent-ffmpeg, music-metadata, adm-zip) on every generate() call.
+async function getVideoProcessor() {
+  const mod = await import("../processors/media/VideoProcessor.js");
+  return mod.videoProcessor;
+}
+async function getAudioProcessor() {
+  const mod = await import("../processors/media/AudioProcessor.js");
+  return mod.audioProcessor;
+}
+async function getArchiveProcessor() {
+  const mod = await import("../processors/archive/ArchiveProcessor.js");
+  return mod.archiveProcessor;
+}
 import type {
   CSVProcessorOptions,
+  DetectionStrategy,
   FileDetectionResult,
   FileDetectorOptions,
   FileInput,
   FileProcessingResult,
   FileSource,
   FileType,
-} from "../types/fileTypes.js";
+} from "../types/index.js";
+import { tracers, ATTR, withSpan } from "../telemetry/index.js";
 import { CSVProcessor } from "./csvProcessor.js";
 import { ImageProcessor } from "./imageProcessor.js";
+import { detectIsoBmffImageMimeType, hasFtypBoxSignature } from "./isoBmff.js";
 import { logger } from "./logger.js";
+import { withTimeout } from "./errorHandling.js";
+import {
+  normalizeUrlForCache,
+  redactUrlForError,
+  sanitizeErrorCause,
+} from "./logSanitize.js";
+import {
+  mimeHintToExtension,
+  mimeHintToFileType,
+  normalizeMimeHint,
+} from "./mimeTypeHints.js";
 import { PDFProcessor } from "./pdfProcessor.js";
 
 /**
@@ -28,6 +60,111 @@ import { PDFProcessor } from "./pdfProcessor.js";
  */
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_DELAY = 1000; // milliseconds
+
+/**
+ * Short-TTL cache of URL → Content-Type (#323). A URL is commonly detected more
+ * than once (repeated multimodal prompts reuse the same asset URL); caching the
+ * HEAD's content-type avoids re-issuing the HEAD each time. `loadFromURL` also
+ * populates it from its GET response, so once a URL's body has been fetched a
+ * subsequent detection needs no network round-trip at all.
+ *
+ * Trade-off (round-2 review): this is a module-level cache shared by every
+ * request in the process, and correctness relies solely on the 60s TTL — a
+ * signed URL whose response changes at the same path within that window would
+ * read stale. That is an intentional, bounded trade-off (60s of possible
+ * staleness for far fewer HEAD round-trips), not a freshness guarantee.
+ * Expired entries are removed lazily on their next `get()` (see
+ * `getCachedUrlContentType`); `setCachedUrlContentType` additionally sweeps
+ * expired entries opportunistically once the cache hits its size cap, so a
+ * URL that is cached once and never looked up again doesn't linger until the
+ * FIFO eviction below forces it out.
+ */
+const URL_CONTENT_TYPE_TTL_MS = 60_000;
+const URL_CONTENT_TYPE_CACHE_MAX_SIZE = 512;
+const urlContentTypeCache = new Map<
+  string,
+  { contentType: string; expiresAt: number }
+>();
+
+/**
+ * Build the Map key for `urlContentTypeCache`. Delegates to the shared
+ * {@link normalizeUrlForCache} — this is a module-level, process-lifetime
+ * cache, so it must strip presigned-URL auth/signature query params (see
+ * `SENSITIVE_URL_QUERY_PARAM_DENYLIST`) the same way `ImageCache.normalizeUrl`
+ * does, folding a short hash of the stripped params into the key whenever any
+ * were present so two different presigned URLs for the same path don't
+ * collide and serve each other's cached content-type across auth contexts.
+ * Also strips tracking/analytics params first, so two URLs differing only by
+ * tracking noise (e.g. `utm_source`) still hit the same cache entry instead
+ * of missing each other. Falls back to the raw URL if it isn't a parseable
+ * absolute URL. Shared by both `getCachedUrlContentType` and
+ * `setCachedUrlContentType` so lookups and writes always agree on the key.
+ */
+function cacheKeyForUrl(url: string): string {
+  return normalizeUrlForCache(url);
+}
+
+function getCachedUrlContentType(url: string, now: number): string | undefined {
+  const key = cacheKeyForUrl(url);
+  const hit = urlContentTypeCache.get(key);
+  if (hit && hit.expiresAt > now) {
+    // Bump recency: Map iteration order follows insertion order, and the
+    // eviction below deletes the *first* key, so a plain `get` on a hot
+    // entry would leave it first in line for eviction despite being the
+    // most recently used. Re-inserting turns the size-bounded FIFO below
+    // into an actual LRU.
+    urlContentTypeCache.delete(key);
+    urlContentTypeCache.set(key, hit);
+    return hit.contentType;
+  }
+  if (hit) {
+    // Entry exists but its TTL has passed — treat as a miss and evict it
+    // immediately rather than serving (or retaining) stale data.
+    urlContentTypeCache.delete(key);
+  }
+  return undefined;
+}
+
+/**
+ * Opportunistically remove already-expired entries. Only called once the
+ * cache is at its size cap (see `setCachedUrlContentType`) so it doesn't add
+ * an O(n) scan to the common-case hot path.
+ */
+function pruneExpiredUrlContentTypeEntries(now: number): void {
+  for (const [key, entry] of urlContentTypeCache) {
+    if (entry.expiresAt <= now) {
+      urlContentTypeCache.delete(key);
+    }
+  }
+}
+
+function setCachedUrlContentType(
+  url: string,
+  contentType: string,
+  now: number,
+): void {
+  if (!contentType) {
+    return;
+  }
+  const key = cacheKeyForUrl(url);
+  urlContentTypeCache.set(key, {
+    contentType,
+    expiresAt: now + URL_CONTENT_TYPE_TTL_MS,
+  });
+  // Bound the cache so a long-lived process can't grow it unbounded. Prefer
+  // reclaiming already-expired entries first; only fall back to evicting the
+  // oldest still-live entry (FIFO/LRU-ish, see getCachedUrlContentType) if
+  // the cache is still over the cap after pruning.
+  if (urlContentTypeCache.size > URL_CONTENT_TYPE_CACHE_MAX_SIZE) {
+    pruneExpiredUrlContentTypeEntries(now);
+  }
+  if (urlContentTypeCache.size > URL_CONTENT_TYPE_CACHE_MAX_SIZE) {
+    const oldest = urlContentTypeCache.keys().next().value;
+    if (oldest !== undefined) {
+      urlContentTypeCache.delete(oldest);
+    }
+  }
+}
 
 /**
  * Retryable network error codes (Node.js/undici network errors)
@@ -198,20 +335,13 @@ function formatFileSize(bytes: number): string {
 }
 
 /**
- * Detection strategy interface
- */
-type DetectionStrategy = {
-  detect(input: FileInput): Promise<FileDetectionResult>;
-};
-
-/**
  * Centralized file type detection and processing
  *
  * @example
  * ```typescript
  * // Auto-detect and process any file
  * const result = await FileDetector.detectAndProcess("data.csv");
- * console.log(result.type); // 'csv'
+ * logger.info(result.type); // 'csv'
  * ```
  */
 export class FileDetector {
@@ -236,71 +366,217 @@ export class FileDetector {
     input: FileInput,
     options?: FileDetectorOptions,
   ): Promise<FileProcessingResult> {
-    const detection = await FileDetector.detect(input, options);
+    // Derive filename and size for tracing before detection runs
+    const inputFilename = FileDetector.deriveInputFilename(input);
+    const inputSizeBytes = FileDetector.deriveInputSize(input);
 
-    // FD-018: Comprehensive fallback parsing for extension-less files
-    // When file detection returns "unknown" or doesn't match allowedTypes,
-    // attempt parsing for each allowed type before failing. This handles cases like Slack
-    // files named "file-1", "file-2" without extensions that could be CSV, JSON, or text.
-    if (
-      options?.allowedTypes &&
-      !options.allowedTypes.includes(detection.type)
-    ) {
-      // Try fallback parsing for both "unknown" types and when detection doesn't match allowed types
-      const content = await FileDetector.loadContent(input, detection, options);
-      const errors: string[] = [];
+    return withSpan(
+      {
+        name: "neurolink.file.detect_and_process",
+        tracer: tracers.file,
+        attributes: {
+          [ATTR.FILE_NAME]: inputFilename,
+          [ATTR.FILE_SIZE_BYTES]: inputSizeBytes,
+        },
+      },
+      async (span) => {
+        const detection = await FileDetector.detect(input, options);
 
-      // Try each allowed type in order of specificity
-      for (const allowedType of options.allowedTypes) {
-        try {
-          const result = await FileDetector.tryFallbackParsing(
-            content,
-            allowedType,
+        span.setAttribute(ATTR.FILE_CATEGORY, detection.type);
+        span.setAttribute(ATTR.FILE_MIMETYPE, detection.mimeType || "unknown");
+        span.setAttribute(ATTR.FILE_CONFIDENCE, detection.metadata.confidence);
+
+        logger.info(
+          `[NEUROLINK] File detected: ${inputFilename} (${detection.mimeType || "unknown"}, ${formatFileSize(inputSizeBytes)}) → category: ${detection.type}`,
+        );
+
+        // FD-018: Comprehensive fallback parsing for extension-less files
+        if (
+          options?.allowedTypes &&
+          !options.allowedTypes.includes(detection.type)
+        ) {
+          const content = await FileDetector.loadContent(
+            input,
+            detection,
             options,
           );
-          if (result) {
-            logger.info(
-              `[FileDetector] ✅ ${allowedType.toUpperCase()} fallback successful`,
-            );
-            return result;
+          const errors: string[] = [];
+
+          for (const allowedType of options.allowedTypes) {
+            try {
+              const result = await FileDetector.tryFallbackParsing(
+                content,
+                allowedType,
+                options,
+              );
+              if (result) {
+                logger.info(
+                  `[FileDetector] ✅ ${allowedType.toUpperCase()} fallback successful`,
+                );
+                const outputLength =
+                  typeof result.content === "string"
+                    ? result.content.length
+                    : result.content?.length || 0;
+                span.setAttribute(ATTR.FILE_OUTPUT_LENGTH, outputLength);
+                span.setAttribute(ATTR.FILE_SUCCESS, true);
+                span.setAttribute(
+                  ATTR.FILE_PROCESSOR_USED,
+                  `fallback:${allowedType}`,
+                );
+                logger.info(
+                  `[NEUROLINK] File processed: ${inputFilename} → ${outputLength} bytes output (fallback: ${allowedType})`,
+                );
+                return result;
+              }
+            } catch (error) {
+              const errorMsg =
+                error instanceof Error ? error.message : String(error);
+              errors.push(`${allowedType}: ${errorMsg}`);
+              logger.debug(
+                `[FileDetector] ${allowedType} fallback failed: ${errorMsg}`,
+              );
+            }
           }
-        } catch (error) {
-          const errorMsg =
-            error instanceof Error ? error.message : String(error);
-          errors.push(`${allowedType}: ${errorMsg}`);
-          logger.debug(
-            `[FileDetector] ${allowedType} fallback failed: ${errorMsg}`,
+
+          logger.warn(
+            `[FileDetector] All fallback parsing failed for type "${detection.type}". ` +
+              `Attempted: ${options.allowedTypes.join(", ")}. Falling through to universal handler.`,
           );
+          const csvOptions: CSVProcessorOptions | undefined =
+            options?.csvOptions;
+          const result = await FileDetector.processFile(
+            content,
+            detection,
+            csvOptions,
+            options?.provider,
+          );
+          FileDetector.setFileResultSpanAttributes(
+            span,
+            result,
+            inputFilename,
+            detection.type,
+          );
+          return result;
+        }
+
+        const content = await FileDetector.loadContent(
+          input,
+          detection,
+          options,
+        );
+        const csvOptions: CSVProcessorOptions | undefined = options?.csvOptions;
+        const result = await FileDetector.processFile(
+          content,
+          detection,
+          csvOptions,
+          options?.provider,
+        );
+        FileDetector.setFileResultSpanAttributes(
+          span,
+          result,
+          inputFilename,
+          detection.type,
+        );
+        return result;
+      },
+    );
+  }
+
+  /**
+   * Set span attributes and log after file processing completes.
+   */
+  private static setFileResultSpanAttributes(
+    span: Parameters<Parameters<typeof withSpan>[1]>[0],
+    result: FileProcessingResult,
+    filename: string,
+    processorType: string,
+  ): void {
+    const outputLength =
+      typeof result.content === "string"
+        ? result.content.length
+        : result.content?.length || 0;
+    const hasImages = Array.isArray((result as { images?: unknown[] }).images)
+      ? (result as { images: unknown[] }).images.length > 0
+      : false;
+    const imageCount = Array.isArray((result as { images?: unknown[] }).images)
+      ? (result as { images: unknown[] }).images.length
+      : 0;
+
+    span.setAttribute(ATTR.FILE_OUTPUT_LENGTH, outputLength);
+    span.setAttribute(ATTR.FILE_SUCCESS, true);
+    span.setAttribute(ATTR.FILE_PROCESSOR_USED, processorType);
+    span.setAttribute(ATTR.FILE_HAS_IMAGES, hasImages);
+    span.setAttribute(ATTR.FILE_IMAGE_COUNT, imageCount);
+
+    logger.info(
+      `[NEUROLINK] File processed: ${filename} → ${outputLength} bytes output` +
+        (imageCount > 0 ? ` + ${imageCount} image(s)` : "") +
+        ` (processor: ${processorType})`,
+    );
+  }
+
+  /**
+   * Derive a human-readable filename from FileInput for tracing.
+   */
+  private static deriveInputFilename(input: FileInput): string {
+    if (typeof input === "string") {
+      if (input.startsWith("data:")) {
+        return "data-uri";
+      }
+      if (input.startsWith("http")) {
+        try {
+          return new URL(input).pathname.split("/").pop() || "url-file";
+        } catch {
+          return "url-file";
         }
       }
-
-      // All fallbacks failed — fall through to processFile() which handles
-      // "unknown" types gracefully by extracting binary metadata and printable
-      // strings instead of throwing.
-      logger.warn(
-        `[FileDetector] All fallback parsing failed for type "${detection.type}". ` +
-          `Attempted: ${options.allowedTypes.join(", ")}. Falling through to universal handler.`,
-      );
-      const csvOptions: CSVProcessorOptions | undefined = options?.csvOptions;
-      return await FileDetector.processFile(
-        content,
-        detection,
-        csvOptions,
-        options?.provider,
-      );
+      // File path
+      return input.split("/").pop() || input.split("\\").pop() || "file";
     }
+    if (Buffer.isBuffer(input)) {
+      return "buffer";
+    }
+    return "unknown-input";
+  }
 
-    const content = await FileDetector.loadContent(input, detection, options);
+  /**
+   * Derive byte size from FileInput for tracing.
+   */
+  private static deriveInputSize(input: FileInput): number {
+    if (Buffer.isBuffer(input)) {
+      return input.length;
+    }
+    if (typeof input === "string") {
+      if (input.startsWith("data:")) {
+        // Rough estimate: base64 is ~4/3 of raw
+        const base64Part = input.split(",")[1];
+        return base64Part ? Math.floor((base64Part.length * 3) / 4) : 0;
+      }
+      return input.length; // path or URL string length (not file size)
+    }
+    return 0;
+  }
 
-    // Extract CSV-specific options from FileDetectorOptions
-    const csvOptions: CSVProcessorOptions | undefined = options?.csvOptions;
-
-    return await FileDetector.processFile(
-      content,
-      detection,
-      csvOptions,
-      options?.provider,
-    );
+  /**
+   * Classify a FileInput into the FileSource enum used by downstream
+   * loaders. Keeps the mimetype-hint short-circuit in detect() able to
+   * produce a valid FileDetectionResult without re-implementing the
+   * source-inference rules scattered across loadContent().
+   */
+  private static deriveInputSource(input: FileInput): FileSource {
+    if (Buffer.isBuffer(input)) {
+      return "buffer";
+    }
+    if (typeof input === "string") {
+      if (input.startsWith("data:")) {
+        return "datauri";
+      }
+      if (input.startsWith("http://") || input.startsWith("https://")) {
+        return "url";
+      }
+      return "path";
+    }
+    return "buffer";
   }
 
   /**
@@ -572,6 +848,34 @@ export class FileDetector {
     input: FileInput,
     options?: FileDetectorOptions,
   ): Promise<FileDetectionResult> {
+    // Short-circuit on a trustworthy caller-provided mimetype hint. This is
+    // the eager-path counterpart to FileReferenceRegistry.register()'s hint
+    // handling — necessary for tiny files (<= TINY_MAX) that skip the lazy
+    // registry path. normalizeMimeHint drops "application/octet-stream" so a
+    // caller cannot hide real content behind the opaque sentinel.
+    const hintMime = normalizeMimeHint(options?.mimetypeHint);
+    if (hintMime) {
+      const type = mimeHintToFileType(hintMime);
+      if (type) {
+        const ext = mimeHintToExtension(hintMime);
+        const result: FileDetectionResult = {
+          type,
+          mimeType: hintMime,
+          extension: ext || null,
+          source: FileDetector.deriveInputSource(input),
+          metadata: {
+            confidence: 95,
+            filename: FileDetector.deriveInputFilename(input),
+            size: FileDetector.deriveInputSize(input),
+          },
+        };
+        logger.info(
+          `[FileDetector] Type: ${type} (95%, from mimetype hint: ${hintMime})`,
+        );
+        return result;
+      }
+    }
+
     const confidenceThreshold = options?.confidenceThreshold ?? 80;
     const strategies: DetectionStrategy[] = [
       new MagicBytesStrategy(),
@@ -594,8 +898,10 @@ export class FileDetector {
       }
     }
 
-    logger.warn(
-      `[FileDetector] Low confidence: ${best?.type ?? "unknown"} (${best?.metadata.confidence ?? 0}%)`,
+    // Below-threshold detection is the common case for any file under the
+    // ContentHeuristic ceiling — a debug detail, not a warning-worthy anomaly.
+    logger.debug(
+      `[FileDetector] Best-effort type below threshold: ${best?.type ?? "unknown"} (${best?.metadata.confidence ?? 0}%, threshold ${confidenceThreshold}%)`,
     );
     return best as FileDetectionResult;
   }
@@ -1040,7 +1346,9 @@ export class FileDetector {
   ): Promise<FileProcessingResult> {
     const videoFilename = detection.metadata.filename || "video";
     try {
-      const videoResult = await videoProcessor.processFile({
+      const videoResult = await (
+        await getVideoProcessor()
+      ).processFile({
         id: videoFilename,
         name: videoFilename,
         mimetype: detection.mimeType || "video/mp4",
@@ -1111,7 +1419,9 @@ export class FileDetector {
   ): Promise<FileProcessingResult> {
     const audioFilename = detection.metadata.filename || "audio";
     try {
-      const audioResult = await audioProcessor.processFile({
+      const audioResult = await (
+        await getAudioProcessor()
+      ).processFile({
         id: audioFilename,
         name: audioFilename,
         mimetype: detection.mimeType || "audio/mpeg",
@@ -1178,7 +1488,9 @@ export class FileDetector {
   ): Promise<FileProcessingResult> {
     const archiveFilename = detection.metadata.filename || "archive";
     try {
-      const archiveResult = await archiveProcessor.processFile({
+      const archiveResult = await (
+        await getArchiveProcessor()
+      ).processFile({
         id: archiveFilename,
         name: archiveFilename,
         mimetype: detection.mimeType || "application/zip",
@@ -1245,9 +1557,8 @@ export class FileDetector {
     try {
       const ext = detection.extension?.toLowerCase();
       if (ext === "ods") {
-        const { openDocumentProcessor } = await import(
-          "../processors/document/OpenDocumentProcessor.js"
-        );
+        const { openDocumentProcessor } =
+          await import("../processors/document/OpenDocumentProcessor.js");
         const odsResult = await openDocumentProcessor.processFile({
           id: xlsxFilename,
           name: xlsxFilename,
@@ -1273,9 +1584,8 @@ export class FileDetector {
           };
         }
       } else {
-        const { excelProcessor } = await import(
-          "../processors/document/ExcelProcessor.js"
-        );
+        const { excelProcessor } =
+          await import("../processors/document/ExcelProcessor.js");
         const xlsxResult = await excelProcessor.processFile({
           id: xlsxFilename,
           name: xlsxFilename,
@@ -1358,9 +1668,8 @@ export class FileDetector {
     const ext = detection.extension?.toLowerCase();
     try {
       if (ext === "odt") {
-        const { openDocumentProcessor } = await import(
-          "../processors/document/OpenDocumentProcessor.js"
-        );
+        const { openDocumentProcessor } =
+          await import("../processors/document/OpenDocumentProcessor.js");
         const odtResult = await openDocumentProcessor.processFile({
           id: docxFilename,
           name: docxFilename,
@@ -1385,9 +1694,8 @@ export class FileDetector {
           };
         }
       } else if (ext === "rtf") {
-        const { rtfProcessor } = await import(
-          "../processors/document/RtfProcessor.js"
-        );
+        const { rtfProcessor } =
+          await import("../processors/document/RtfProcessor.js");
         const rtfResult = await rtfProcessor.processFile({
           id: docxFilename,
           name: docxFilename,
@@ -1411,9 +1719,8 @@ export class FileDetector {
           };
         }
       } else {
-        const { wordProcessor } = await import(
-          "../processors/document/WordProcessor.js"
-        );
+        const { wordProcessor } =
+          await import("../processors/document/WordProcessor.js");
         const docxResult = await wordProcessor.processFile({
           id: docxFilename,
           name: docxFilename,
@@ -1480,9 +1787,8 @@ export class FileDetector {
   ): Promise<FileProcessingResult> {
     const pptxFilename = detection.metadata.filename || "presentation";
     try {
-      const { PptxProcessor } = await import(
-        "../processors/document/PptxProcessor.js"
-      );
+      const { PptxProcessor } =
+        await import("../processors/document/PptxProcessor.js");
       const pptxResult = await PptxProcessor.extractText(content);
       if (pptxResult) {
         return {
@@ -1535,9 +1841,8 @@ export class FileDetector {
   ): Promise<FileProcessingResult> {
     try {
       // Dynamic import to avoid circular dependencies
-      const { processSvg } = await import(
-        "../processors/markup/SvgProcessor.js"
-      );
+      const { processSvg } =
+        await import("../processors/markup/SvgProcessor.js");
 
       const result = await processSvg({
         id: "svg-file",
@@ -1610,35 +1915,126 @@ export class FileDetector {
     const maxRetries = options?.maxRetries ?? DEFAULT_MAX_RETRIES;
     const retryDelay = options?.retryDelay ?? DEFAULT_RETRY_DELAY;
 
-    return withRetry(
-      async () => {
-        const response = await request(url, {
+    // #317: pre-flight HEAD to reject an oversized file BEFORE downloading any
+    // body. content-length is advisory (chunked responses omit it), so a
+    // missing/invalid header — or a server that refuses HEAD — falls through to
+    // the streaming byte guard below; only a genuine oversize rejection stops
+    // the GET from ever running.
+    //
+    // #323: skip the pre-flight entirely when this exact URL was recently seen
+    // (its Content-Type is still cached, whether from a prior loadFromURL GET
+    // or a MimeTypeStrategy HEAD) — issuing a fresh HEAD here would defeat the
+    // whole point of that cache. The streaming byte guard in the GET below
+    // still enforces maxSize even without a pre-flight, so this doesn't remove
+    // the oversize protection — it only skips the redundant round-trip for a
+    // URL we've already been talking to within the last 60s.
+    if (getCachedUrlContentType(url, Date.now()) === undefined) {
+      try {
+        const head = await request(url, {
           dispatcher: getGlobalDispatcher().compose(
             interceptors.redirect({ maxRedirections: 5 }),
           ),
-          method: "GET",
-          headersTimeout: timeout,
-          bodyTimeout: timeout,
+          method: "HEAD",
+          headersTimeout: FileDetector.DEFAULT_HEAD_TIMEOUT,
+          bodyTimeout: FileDetector.DEFAULT_HEAD_TIMEOUT,
         });
-
-        if (response.statusCode !== 200) {
-          throw new Error(`HTTP ${response.statusCode}`);
-        }
-
-        const chunks: Buffer[] = [];
-        let totalSize = 0;
-
-        for await (const chunk of response.body) {
-          totalSize += chunk.length;
-          if (totalSize > maxSize) {
+        // Drain/close the (empty) HEAD body so the connection can be reused.
+        await head.body.dump();
+        // Only trust `content-length` on a genuine 2xx response. A non-2xx
+        // HEAD (redirect the dispatcher didn't follow, 403/404/405 "HEAD not
+        // allowed", 5xx, …) can still carry a stale/irrelevant
+        // `content-length` header — enforcing size off of that would reject
+        // (or silently pass) based on the wrong body. Treat any non-2xx HEAD
+        // as if the header were missing and fall through to the streaming
+        // GET guard below, which enforces maxSize independently either way.
+        if (head.statusCode >= 200 && head.statusCode < 300) {
+          const declaredLength = Number(head.headers["content-length"]);
+          if (Number.isFinite(declaredLength) && declaredLength > maxSize) {
             throw new Error(
-              `File too large: ${formatFileSize(totalSize)} (max: ${formatFileSize(maxSize)})`,
+              `File too large: ${formatFileSize(declaredLength)} (max: ${formatFileSize(maxSize)})`,
             );
           }
-          chunks.push(chunk);
         }
+      } catch (error) {
+        if (error instanceof Error && /File too large/.test(error.message)) {
+          throw error;
+        }
+        logger.debug(
+          `[FileDetector] HEAD pre-flight skipped for ${redactUrlForError(url)}: ${
+            sanitizeErrorCause(error).message
+          }`,
+        );
+      }
+    }
 
-        return Buffer.concat(chunks);
+    return withRetry(
+      async () => {
+        try {
+          const response = await request(url, {
+            dispatcher: getGlobalDispatcher().compose(
+              interceptors.redirect({ maxRedirections: 5 }),
+            ),
+            method: "GET",
+            headersTimeout: timeout,
+            bodyTimeout: timeout,
+          });
+
+          if (response.statusCode !== 200) {
+            // Query string / fragment stripped — a presigned URL's token must
+            // not be echoed into a thrown error.
+            throw new Error(
+              `HTTP ${response.statusCode} fetching ${redactUrlForError(url)}`,
+            );
+          }
+
+          // #323: cache the Content-Type from this GET so a subsequent detection
+          // of the same URL needs no HEAD.
+          setCachedUrlContentType(
+            url,
+            (response.headers["content-type"] as string) || "",
+            Date.now(),
+          );
+
+          const chunks: Buffer[] = [];
+          let totalSize = 0;
+
+          for await (const chunk of response.body) {
+            totalSize += chunk.length;
+            if (totalSize > maxSize) {
+              throw new Error(
+                `File too large: ${formatFileSize(totalSize)} (max: ${formatFileSize(maxSize)})`,
+              );
+            }
+            chunks.push(chunk);
+          }
+
+          return Buffer.concat(chunks);
+        } catch (error) {
+          // Node/undici DNS, TLS, and connect-timeout errors embed the full
+          // request URL (including a presigned query token) in
+          // `error.message`. Redact into a NEW error instead of mutating the
+          // original in place, so anything that still holds a reference to
+          // the original — debug logs, telemetry spans, upstream callers —
+          // keeps seeing the real message. `.code` is copied onto the new
+          // error so `isRetryableNetworkError`'s retry check in the outer
+          // `withRetry` catch still classifies it correctly. The raw
+          // original error is NEVER attached as `cause` — that would leave
+          // the unredacted URL reachable via `error.cause.message` for
+          // anything that walks the cause chain (cause-aware logging,
+          // telemetry). `cause` instead gets its own sanitized copy.
+          // `sanitizeErrorCause` handles non-`Error` thrown values too (a raw
+          // string/object can just as easily carry the full URL), so there is
+          // no unconditional `throw error` fallback that would bypass
+          // redaction for that case.
+          const cause = sanitizeErrorCause(error);
+          const redacted = new Error(cause.message, { cause });
+          redacted.name = cause.name;
+          const code = (cause as NodeJS.ErrnoException).code;
+          if (code !== undefined) {
+            (redacted as NodeJS.ErrnoException).code = code;
+          }
+          throw redacted;
+        }
       },
       { maxRetries, retryDelay },
     );
@@ -1648,23 +2044,107 @@ export class FileDetector {
    * Load file from filesystem path
    */
   private static async loadFromPath(
-    path: string,
+    filePath: string,
     options?: FileDetectorOptions,
   ): Promise<Buffer> {
     const maxSize = options?.maxSize || 200 * 1024 * 1024; // 200MB default (matches Curator memory-safety cap)
-    const statInfo = await stat(path);
 
-    if (!statInfo.isFile()) {
-      throw new Error("Not a file");
+    // Reject NUL-byte injection outright (a classic path-truncation vector).
+    if (filePath.includes("\0")) {
+      throw new Error("Invalid file path: contains a null byte");
     }
 
-    if (statInfo.size > maxSize) {
-      throw new Error(
-        `File too large: ${formatFileSize(statInfo.size)} (max: ${formatFileSize(maxSize)})`,
-      );
+    // Optional sandbox: when a base dir is configured (servers accepting paths
+    // from untrusted callers), reject anything that resolves outside it. Real
+    // paths are resolved (symlinks followed) on BOTH sides so a symlink inside
+    // the base dir pointing outside cannot bypass containment. The
+    // path.relative check (not a string prefix) correctly handles the root dir
+    // ("/") and sibling-prefix ("/app" vs "/app-evil") edge cases.
+    //
+    // The actual open() below MUST target this validated `real` path, not the
+    // original `filePath` — otherwise a symlink swapped between the realpath()
+    // check and the open() call routes the read outside the sandbox even
+    // though validation passed (TOCTOU). With no sandbox configured there's no
+    // boundary to defend, so the original path is used as given.
+    let pathToOpen = filePath;
+    if (options?.allowedBaseDir) {
+      let base: string;
+      let real: string;
+      try {
+        base = await realpath(resolvePath(options.allowedBaseDir));
+        real = await realpath(filePath);
+      } catch (error) {
+        // Full path stays in the debug log; the thrown (potentially
+        // client-facing) error only gets the basename to avoid leaking the
+        // host's directory layout to an untrusted caller. The cause is
+        // sanitized too — Node's realpath ENOENT/EACCES messages embed the
+        // full path verbatim, which would otherwise survive on the cause
+        // chain (cause-aware logging, telemetry) even though the outer
+        // message is already redacted.
+        logger.debug("loadFromPath: realpath resolution failed", {
+          filePath,
+          error,
+        });
+        // Assigned to a variable before the throw (rather than an inline
+        // `{ cause: sanitizeErrorCause(...) }`) so the sanitized, path-redacted
+        // copy is unambiguously the attached cause — the raw `error`, whose
+        // message still embeds the full path, is never reachable from the
+        // thrown result.
+        const cause = sanitizeErrorCause(error, { filePath });
+        const denied = new Error(
+          `Access denied: "${basename(filePath)}" could not be resolved within the allowed base directory`,
+          { cause },
+        );
+        throw denied;
+      }
+      const rel = relativePath(base, real);
+      if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolutePath(rel)) {
+        logger.debug("loadFromPath: path resolves outside allowed base dir", {
+          filePath,
+          real,
+        });
+        throw new Error(
+          `Access denied: "${basename(filePath)}" resolves outside the allowed base directory`,
+        );
+      }
+      pathToOpen = real;
     }
 
-    return await readFile(path);
+    // Open a handle and stat/read through the SAME descriptor so a symlink
+    // swap between the size check and the read cannot occur (TOCTOU).
+    let handle: Awaited<ReturnType<typeof open>>;
+    try {
+      handle = await open(pathToOpen, "r");
+    } catch (error) {
+      // A failed open (ENOENT/EACCES/…) embeds the opened path verbatim in
+      // its message. When a sandbox is configured `pathToOpen` is the
+      // realpath-resolved target (`real`), which differs from both `filePath`
+      // and its resolved form — so redact `pathToOpen` specifically, or the
+      // full host path would survive on both the thrown message and the cause
+      // chain despite this PR's path-redaction hardening.
+      const cause = sanitizeErrorCause(error, { filePath: pathToOpen });
+      const failed = new Error(cause.message, { cause });
+      failed.name = cause.name;
+      const code = (cause as NodeJS.ErrnoException).code;
+      if (code !== undefined) {
+        (failed as NodeJS.ErrnoException).code = code;
+      }
+      throw failed;
+    }
+    try {
+      const statInfo = await handle.stat();
+      if (!statInfo.isFile()) {
+        throw new Error(`Not a file: ${basename(filePath)}`);
+      }
+      if (statInfo.size > maxSize) {
+        throw new Error(
+          `File too large: ${basename(filePath)} is ${formatFileSize(statInfo.size)} (max: ${formatFileSize(maxSize)})`,
+        );
+      }
+      return await handle.readFile();
+    } finally {
+      await handle.close();
+    }
   }
 
   /**
@@ -1673,7 +2153,9 @@ export class FileDetector {
   private static loadFromDataURI(dataUri: string): Buffer {
     const match = dataUri.match(/^data:([^;]+);base64,(.+)$/);
     if (!match) {
-      throw new Error("Invalid data URI format");
+      throw new Error(
+        `Invalid data URI format (expected "data:<mime>;base64,<data>"): "${dataUri.slice(0, 32)}…"`,
+      );
     }
     return Buffer.from(match[2], "base64");
   }
@@ -1701,21 +2183,61 @@ class MagicBytesStrategy implements DetectionStrategy {
     if (this.isWebP(input)) {
       return this.result("image", "image/webp", 95);
     }
+    if (input.length >= 2 && input[0] === 0x42 && input[1] === 0x4d) {
+      return this.result("image", "image/bmp", 95);
+    }
+    if (
+      input.length >= 4 &&
+      ((input[0] === 0x49 &&
+        input[1] === 0x49 &&
+        input[2] === 0x2a &&
+        input[3] === 0x00) ||
+        (input[0] === 0x4d &&
+          input[1] === 0x4d &&
+          input[2] === 0x00 &&
+          input[3] === 0x2a))
+    ) {
+      return this.result("image", "image/tiff", 95);
+    }
+    if (
+      input.length >= 4 &&
+      input[0] === 0x00 &&
+      input[1] === 0x00 &&
+      input[2] === 0x01 &&
+      input[3] === 0x00 &&
+      !hasFtypBoxSignature(input)
+    ) {
+      return this.result("image", "image/x-icon", 95);
+    }
     if (this.isPDF(input)) {
       return this.result("pdf", "application/pdf", 95);
     }
 
-    // MP4/MOV: "ftyp" at offset 4
-    if (
-      input.length >= 8 &&
-      input[4] === 0x66 &&
-      input[5] === 0x74 &&
-      input[6] === 0x79 &&
-      input[7] === 0x70
-    ) {
+    // ISO-BMFF ("ftyp" at offset 4): MP4 video, QuickTime MOV, or M4A/M4B/M4P
+    // audio all share this box — disambiguate by the major brand at offset 8-11,
+    // otherwise an .m4a audio file is misrouted to the video pipeline.
+    if (hasFtypBoxSignature(input)) {
+      const brand = input.length >= 12 ? input.toString("latin1", 8, 12) : "";
+      // AVIF images share the ISO-BMFF ftyp box with MP4/MOV; the major brand
+      // ('avif' still, 'avis' sequence, 'avio' intra-only AV1 image/sequence
+      // — spec-listed under compatible_brands but also emitted as
+      // major_brand by real encoders) distinguishes them. Detect before the
+      // audio/video branches so an AVIF buffer isn't misrouted to the video
+      // pipeline (#286).
+      const imageMimeType = detectIsoBmffImageMimeType(input);
+      if (imageMimeType) {
+        return this.result("image", imageMimeType, 95);
+      }
+      if (/^(M4A|M4B|M4P|F4A|F4B)/.test(brand)) {
+        return this.result("audio", "audio/mp4", 95);
+      }
+      if (brand.startsWith("qt")) {
+        return this.result("video", "video/quicktime", 95);
+      }
       return this.result("video", "video/mp4", 95);
     }
-    // MKV/WebM: EBML header
+    // EBML container (MKV/WebM) — both share the 0x1A45DFA3 header; the DocType
+    // string in the header disambiguates WebM from generic Matroska.
     if (
       input.length >= 4 &&
       input[0] === 0x1a &&
@@ -1723,6 +2245,10 @@ class MagicBytesStrategy implements DetectionStrategy {
       input[2] === 0xdf &&
       input[3] === 0xa3
     ) {
+      const head = input.toString("latin1", 0, Math.min(input.length, 64));
+      if (head.includes("webm")) {
+        return this.result("video", "video/webm", 92);
+      }
       return this.result("video", "video/x-matroska", 90);
     }
     // AVI: "RIFF" + "AVI "
@@ -1762,7 +2288,13 @@ class MagicBytesStrategy implements DetectionStrategy {
     ) {
       return this.result("audio", "audio/mpeg", 95);
     }
-    // MP3: sync word
+    // AAC (ADTS): 12-bit syncword 0xFFF with the 2 layer bits == 00. This must be
+    // checked before the MP3 sync word below, because an ADTS header also satisfies
+    // the looser 11-bit MPEG sync mask and would otherwise be mislabeled audio/mpeg.
+    if (input.length >= 2 && input[0] === 0xff && (input[1] & 0xf6) === 0xf0) {
+      return this.result("audio", "audio/aac", 85);
+    }
+    // MP3: sync word (MPEG audio — layer bits are non-zero, unlike ADTS AAC above)
     if (input.length >= 2 && input[0] === 0xff && (input[1] & 0xe0) === 0xe0) {
       return this.result("audio", "audio/mpeg", 80);
     }
@@ -1804,6 +2336,18 @@ class MagicBytesStrategy implements DetectionStrategy {
     // GZIP: 1F 8B
     if (input.length >= 2 && input[0] === 0x1f && input[1] === 0x8b) {
       return this.result("archive", "application/gzip", 90);
+    }
+    // 7z: 37 7A BC AF 27 1C
+    if (
+      input.length >= 6 &&
+      input[0] === 0x37 &&
+      input[1] === 0x7a &&
+      input[2] === 0xbc &&
+      input[3] === 0xaf &&
+      input[4] === 0x27 &&
+      input[5] === 0x1c
+    ) {
+      return this.result("archive", "application/x-7z-compressed", 95);
     }
     // RAR: "Rar!"
     if (
@@ -1893,15 +2437,30 @@ class MimeTypeStrategy implements DetectionStrategy {
     }
 
     try {
-      const response = await request(input, {
-        dispatcher: getGlobalDispatcher().compose(
-          interceptors.redirect({ maxRedirections: 5 }),
-        ),
-        method: "HEAD",
-        headersTimeout: FileDetector.DEFAULT_HEAD_TIMEOUT,
-        bodyTimeout: FileDetector.DEFAULT_HEAD_TIMEOUT,
-      });
-      const contentType = (response.headers["content-type"] as string) || "";
+      // #323: reuse a recently-seen Content-Type for this URL instead of
+      // re-issuing a HEAD (populated here and by loadFromURL's GET).
+      const now = Date.now();
+      let contentType = getCachedUrlContentType(input, now);
+      if (contentType === undefined) {
+        // Wrap the whole HEAD (request + body drain) in withTimeout so a stalled
+        // dump() can't hang detection, per the project's async-timeout guideline.
+        contentType = await withTimeout(
+          (async () => {
+            const response = await request(input, {
+              dispatcher: getGlobalDispatcher().compose(
+                interceptors.redirect({ maxRedirections: 5 }),
+              ),
+              method: "HEAD",
+              headersTimeout: FileDetector.DEFAULT_HEAD_TIMEOUT,
+              bodyTimeout: FileDetector.DEFAULT_HEAD_TIMEOUT,
+            });
+            await response.body.dump();
+            return (response.headers["content-type"] as string) || "";
+          })(),
+          FileDetector.DEFAULT_HEAD_TIMEOUT,
+        );
+        setCachedUrlContentType(input, contentType, now);
+      }
       const type = this.mimeToFileType(contentType);
 
       return {
@@ -2071,6 +2630,8 @@ class ExtensionStrategy implements DetectionStrategy {
       // AI providers don't support SVG format, so we process it as sanitized text
       svg: "svg",
       avif: "image",
+      heic: "image",
+      heif: "image",
       pdf: "pdf",
       // Video formats
       mp4: "video",
@@ -2189,25 +2750,51 @@ class ExtensionStrategy implements DetectionStrategy {
   }
 
   private getExtension(input: string): string | null {
-    if (this.isURL(input)) {
-      const url = new URL(input);
-      const match = url.pathname.match(/\.([^.]+)$/);
-      return match ? match[1] : null;
+    const normalizedInput = input.trim();
+    let extensionSource = normalizedInput;
+
+    if (this.isURL(normalizedInput)) {
+      try {
+        const url = new URL(normalizedInput);
+        extensionSource = url.pathname;
+        try {
+          extensionSource = decodeURIComponent(extensionSource);
+        } catch {
+          // Keep the original pathname if the URL contains malformed escapes.
+        }
+      } catch {
+        extensionSource = normalizedInput;
+      }
     }
-    const match = input.match(/\.([^.]+)$/);
-    return match ? match[1] : null;
+
+    const match = extensionSource.trim().match(/\.([^.]+)$/);
+    if (!match) {
+      return null;
+    }
+
+    const ext = match[1].split(/[?#]/)[0].toLowerCase();
+    return /^[a-z0-9]+$/.test(ext) ? ext : null;
   }
 
   private isURL(str: string): boolean {
-    return str.startsWith("http://") || str.startsWith("https://");
+    const normalized = str.trim();
+    return (
+      normalized.startsWith("http://") || normalized.startsWith("https://")
+    );
   }
 
   private detectSource(input: string): FileSource {
-    if (input.startsWith("data:")) {
+    const normalized = input.trim();
+    if (normalized.startsWith("data:")) {
       return "datauri";
     }
-    if (this.isURL(input)) {
-      return "url";
+    if (this.isURL(normalized)) {
+      try {
+        new URL(normalized);
+        return "url";
+      } catch {
+        return "path";
+      }
     }
     return "path";
   }
@@ -2226,6 +2813,8 @@ class ExtensionStrategy implements DetectionStrategy {
       tif: "image/tiff",
       svg: "image/svg+xml",
       avif: "image/avif",
+      heic: "image/heic",
+      heif: "image/heif",
       pdf: "application/pdf",
       // Video MIME types
       mp4: "video/mp4",
@@ -2478,13 +3067,43 @@ class ContentHeuristicStrategy implements DetectionStrategy {
       return hasReasonableLengths && noBinaryChars && hasUniformLengths;
     }
 
-    // Count delimiters per line and check consistency
-    const delimRegex = delimiter === "|" ? /\|/g : new RegExp(delimiter, "g");
-    const counts = lines.map((line) => (line.match(delimRegex) || []).length);
+    // Count delimiters per line and check consistency. Delimiters inside a
+    // double-quoted field are field content, not column separators (RFC 4180) —
+    // a naive count inflates rows with quoted delimiters (e.g. `"Smith, John"`),
+    // which used to make consistency collapse and reject a valid CSV.
+    const counts = lines.map((line) =>
+      ContentHeuristicStrategy.countDelimitersOutsideQuotes(line, delimiter),
+    );
     const firstCount = counts[0];
     const consistentLines = counts.filter((c) => c === firstCount).length;
 
     return consistentLines / lines.length >= 0.8;
+  }
+
+  /**
+   * Count occurrences of `delimiter` in `line` that fall OUTSIDE double-quoted
+   * fields, honoring RFC-4180 escaped quotes (`""`). Used by CSV detection so a
+   * delimiter embedded in a quoted value is not mistaken for a column break.
+   */
+  private static countDelimitersOutsideQuotes(
+    line: string,
+    delimiter: string,
+  ): number {
+    let count = 0;
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuotes && line[i + 1] === '"') {
+          i++; // escaped quote inside a quoted field — skip the pair
+          continue;
+        }
+        inQuotes = !inQuotes;
+      } else if (ch === delimiter && !inQuotes) {
+        count++;
+      }
+    }
+    return count;
   }
 
   private looksLikeJSON(text: string): boolean {

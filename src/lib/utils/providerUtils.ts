@@ -4,9 +4,11 @@
  */
 import { AIProviderFactory } from "../core/factory.js";
 import { logger } from "./logger.js";
-import type { UnknownRecord } from "../types/common.js";
-import type { ProviderError } from "../types/providers.js";
-import type { EnvVarValidationResult } from "../types/utilities.js";
+import type {
+  ProviderErrorLike,
+  EnvVarValidationResult,
+} from "../types/index.js";
+
 import { AIProviderName } from "../constants/enums.js";
 import { ProviderHealthChecker } from "./providerHealth.js";
 import {
@@ -14,6 +16,7 @@ import {
   API_KEY_LENGTHS,
   PROJECT_ID_FORMAT,
 } from "./providerConfig.js";
+import { DEFAULT_OLLAMA_MODEL } from "../providers/ollama/constants.js";
 
 /**
  * Get the best available provider based on real-time availability checks
@@ -87,7 +90,10 @@ export async function getBestProvider(
   }
 
   // Special case for Ollama - prioritize local when available
-  if (process.env.OLLAMA_BASE_URL && process.env.OLLAMA_MODEL) {
+  if (
+    (process.env.OLLAMA_BASE_URL || process.env.OLLAMA_API_BASE) &&
+    process.env.OLLAMA_MODEL
+  ) {
     try {
       if (await isProviderAvailable("ollama")) {
         logger.debug(`[getBestProvider] Prioritizing working local Ollama`);
@@ -100,15 +106,18 @@ export async function getBestProvider(
 
   /**
    * Provider priority order rationale:
-   * - Vertex (Google Cloud AI) is prioritized first for its enterprise-grade reliability and advanced model capabilities.
-   * - Google AI follows as second priority for comprehensive Google AI ecosystem support.
+   * - LiteLLM and Ollama are prioritized first for local/self-hosted deployments,
+   *   avoiding unnecessary dependence on external providers during fallback scenarios.
+   * - Vertex (Google Cloud AI) follows for enterprise-grade reliability.
+   * - Google AI follows as second cloud priority for comprehensive Google AI ecosystem support.
    * - OpenAI maintains high priority due to its consistent reliability and broad model support.
-   * - Other providers are ordered based on a combination of reliability, feature set, and historical performance in our use cases.
-   * - Ollama is kept as a fallback for local deployments when available.
+   * - Other providers are ordered based on a combination of reliability, feature set, and historical performance.
    * Please update this comment if the order is changed in the future, and document the rationale for maintainability.
    */
   const providers = [
-    "vertex", // Prioritize Google Cloud AI (Vertex) first
+    "litellm", // Prioritize self-hosted proxy deployments first
+    "ollama", // Local models when the configured runtime target is installed
+    "vertex", // Google Cloud AI (enterprise)
     "google-ai", // Google AI ecosystem support
     "openai", // Reliable with broad model support
     "anthropic",
@@ -116,7 +125,6 @@ export async function getBestProvider(
     "azure",
     "mistral",
     "huggingface",
-    "ollama", // Keep as fallback
   ];
 
   for (const provider of providers) {
@@ -142,21 +150,22 @@ async function isProviderAvailable(providerName: string): Promise<boolean> {
     return false;
   }
 
+  if (providerName === "litellm") {
+    const availability =
+      await ProviderHealthChecker.checkFallbackProviderAvailability(
+        AIProviderName.LITELLM,
+        process.env.LITELLM_MODEL || "openai/gpt-4o-mini",
+      );
+    return availability.available;
+  }
+
   if (providerName === "ollama") {
-    try {
-      const response = await fetch("http://localhost:11434/api/tags", {
-        method: "GET",
-        signal: AbortSignal.timeout(2000),
-      });
-      if (response.ok) {
-        const { models } = await response.json();
-        const defaultOllamaModel = "llama3.2:latest";
-        return models.some((m: UnknownRecord) => m.name === defaultOllamaModel);
-      }
-      return false;
-    } catch {
-      return false;
-    }
+    const availability =
+      await ProviderHealthChecker.checkFallbackProviderAvailability(
+        AIProviderName.OLLAMA,
+        process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL,
+      );
+    return availability.available;
   }
 
   try {
@@ -531,6 +540,7 @@ export function getAvailableProviders(): string[] {
     "anthropic",
     "azure",
     "google-ai",
+    "litellm",
     "huggingface",
     "ollama",
     "mistral",
@@ -549,6 +559,6 @@ export function isValidProvider(provider: string): boolean {
 /**
  * Type guard for provider error
  */
-export function isProviderError(error: unknown): error is ProviderError {
+export function isProviderError(error: unknown): error is ProviderErrorLike {
   return error instanceof Error && "provider" in error;
 }

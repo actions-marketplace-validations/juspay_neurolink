@@ -20,11 +20,13 @@ import {
   ServerStartError,
 } from "../../lib/server/errors.js";
 import type {
-  RouteDefinition,
-  RouteGroup,
+  ServeCommandArgs,
+  ServeState,
   ServerAdapterConfig,
+  ServerConfigFile,
   ServerFramework,
-} from "../../lib/server/types.js";
+  ServerInstance,
+} from "../../lib/types/index.js";
 import { withTimeout } from "../../lib/utils/errorHandling.js";
 import { logger } from "../../lib/utils/logger.js";
 import {
@@ -32,94 +34,6 @@ import {
   isProcessRunning,
   StateFileManager,
 } from "../utils/serverUtils.js";
-
-// ============================================
-// Types
-// ============================================
-
-/**
- * Serve command arguments
- */
-type ServeCommandArgs = {
-  port?: number;
-  host?: string;
-  framework?: ServerFramework;
-  basePath?: string;
-  cors?: boolean;
-  rateLimit?: number;
-  swagger?: boolean;
-  config?: string;
-  watch?: boolean;
-  quiet?: boolean;
-  debug?: boolean;
-  format?: "text" | "json";
-};
-
-/**
- * Server configuration file format
- */
-type ServerConfigFile = {
-  port?: number;
-  host?: string;
-  framework?: ServerFramework;
-  basePath?: string;
-  cors?: {
-    enabled?: boolean;
-    origins?: string[];
-    methods?: string[];
-    headers?: string[];
-    credentials?: boolean;
-    maxAge?: number;
-  };
-  rateLimit?: {
-    enabled?: boolean;
-    windowMs?: number;
-    maxRequests?: number;
-    message?: string;
-    skipPaths?: string[];
-  };
-  bodyParser?: {
-    enabled?: boolean;
-    maxSize?: string;
-    jsonLimit?: string;
-    urlEncoded?: boolean;
-  };
-  logging?: {
-    enabled?: boolean;
-    level?: "debug" | "info" | "warn" | "error";
-    includeBody?: boolean;
-    includeResponse?: boolean;
-  };
-  timeout?: number;
-  enableMetrics?: boolean;
-  enableSwagger?: boolean;
-};
-
-/**
- * Minimal interface for the server instance returned by createServer.
- * Avoids importing BaseServerAdapter (which is dynamically loaded).
- */
-type ServerInstance = {
-  initialize: () => Promise<void>;
-  start: () => Promise<void>;
-  stop: () => Promise<void>;
-  registerRouteGroup: (group: RouteGroup) => void;
-  listRoutes?: () => RouteDefinition[];
-};
-
-/**
- * Server state stored in state file
- */
-type ServeState = {
-  pid: number;
-  port: number;
-  host: string;
-  framework: string;
-  startTime: string;
-  basePath: string;
-  configFile?: string;
-};
-
 // ============================================
 // State Management
 // ============================================
@@ -282,6 +196,22 @@ export class ServeCommandFactory {
             (yargs) => ServeCommandFactory.buildStatusOptions(yargs),
             (argv) =>
               ServeCommandFactory.executeStatus(argv as ServeCommandArgs),
+          )
+          .command(
+            "voice",
+            "Start the real-time voice assistant server (OpenAI Realtime / Gemini Live)",
+            (yargs) =>
+              yargs.option("port", {
+                alias: "p",
+                type: "number",
+                default: 3000,
+                describe: "Port to listen on",
+              }),
+            async (argv) => {
+              const { startVoiceServer } =
+                await import("../../lib/server/voice/voiceServerApp.js");
+              await startVoiceServer(argv.port as number);
+            },
           )
           .option("port", {
             type: "number",
@@ -591,9 +521,8 @@ export class ServeCommandFactory {
     },
     spinner: ReturnType<typeof ora> | null,
   ): Promise<{ current: ServerInstance }> {
-    const { createServer, registerAllRoutes } = await import(
-      "../../lib/server/index.js"
-    );
+    const { createServer, registerAllRoutes } =
+      await import("../../lib/server/index.js");
 
     const neurolink = new NeuroLink();
 

@@ -1,15 +1,54 @@
-/**
- * Direct Tool Definitions for NeuroLink CLI Agent
- * Simple, reliable tools that work immediately with Vercel AI SDK
- */
-
-import { tool } from "ai";
 import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
+import { execFile } from "child_process";
 import { logger } from "../utils/logger.js";
-import { VertexAI } from "@google-cloud/vertexai";
 import { CSVProcessor } from "../utils/csvProcessor.js";
+import { shouldEnableBashTool } from "../utils/toolUtils.js";
+import type {
+  AllToolsMap,
+  BasicToolsMap,
+  FilesystemToolsMap,
+  Tool,
+  UtilityToolsMap,
+} from "../types/index.js";
+import { tool } from "../utils/tool.js";
+
+const MAX_OUTPUT_BYTES = 102400; // 100KB
+
+function truncateOutput(output: string): string {
+  if (output.length > MAX_OUTPUT_BYTES) {
+    return (
+      output.slice(0, MAX_OUTPUT_BYTES) + "\n... [output truncated at 100KB]"
+    );
+  }
+  return output;
+}
+
+/**
+ * Contain a built-in file tool to the process working directory.
+ *
+ * Returns the resolved absolute path when it lies inside `process.cwd()`, or an
+ * `error` string otherwise. This is the sandbox for the default-enabled
+ * `readFile` / `writeFile` / `listDirectory` / `analyzeCSV` tools: without it an
+ * agent can pass an absolute path (`/etc/passwd`) or `../` traversal and reach
+ * arbitrary files. The previous guard (`!resolvedPath.startsWith(cwd) &&
+ * !path.isAbsolute(filePath)`) was always false for absolute paths, so it never
+ * fired. The `cwd + path.sep` suffix prevents a sibling-prefix bypass
+ * (`/home/app` vs `/home/app-evil`).
+ */
+function resolveWithinCwd(
+  filePath: string,
+): { path: string } | { error: string } {
+  const resolvedPath = path.resolve(filePath);
+  const cwd = path.resolve(process.cwd());
+  if (resolvedPath !== cwd && !resolvedPath.startsWith(cwd + path.sep)) {
+    return {
+      error: `Access denied: "${filePath}" resolves outside the working directory`,
+    };
+  }
+  return { path: resolvedPath };
+}
 
 // Runtime Google Search tool creation - bypasses TypeScript strict typing
 function createGoogleSearchTools() {
@@ -29,7 +68,7 @@ function createGoogleSearchTools() {
 export const directAgentTools = {
   getCurrentTime: tool({
     description: "Get the current date and time",
-    parameters: z.object({
+    inputSchema: z.object({
       timezone: z
         .string()
         .optional()
@@ -65,21 +104,18 @@ export const directAgentTools = {
 
   readFile: tool({
     description: "Read the contents of a file from the filesystem",
-    parameters: z.object({
+    inputSchema: z.object({
       path: z.string().describe("File path to read (relative or absolute)"),
     }),
     execute: async ({ path: filePath }) => {
       try {
-        // Security check - prevent reading outside current directory for relative paths
-        const resolvedPath = path.resolve(filePath);
-        const cwd = process.cwd();
-
-        if (!resolvedPath.startsWith(cwd) && !path.isAbsolute(filePath)) {
-          return {
-            success: false,
-            error: `Access denied: Cannot read files outside current directory`,
-          };
+        // Sandbox: contain reads to the working directory (blocks absolute-path
+        // escape and ../ traversal).
+        const guard = resolveWithinCwd(filePath);
+        if ("error" in guard) {
+          return { success: false, error: guard.error };
         }
+        const resolvedPath = guard.path;
 
         const content = fs.readFileSync(resolvedPath, "utf-8");
         const stats = fs.statSync(resolvedPath);
@@ -103,7 +139,7 @@ export const directAgentTools = {
 
   listDirectory: tool({
     description: "List files and directories in a specified directory",
-    parameters: z.object({
+    inputSchema: z.object({
       path: z
         .string()
         .describe("Directory path to list (relative or absolute)"),
@@ -115,7 +151,12 @@ export const directAgentTools = {
     }),
     execute: async ({ path: dirPath, includeHidden }) => {
       try {
-        const resolvedPath = path.resolve(dirPath);
+        // Sandbox: contain directory listing to the working directory.
+        const guard = resolveWithinCwd(dirPath);
+        if ("error" in guard) {
+          return { success: false, error: guard.error };
+        }
+        const resolvedPath = guard.path;
         const items = fs.readdirSync(resolvedPath);
 
         const filteredItems = includeHidden
@@ -152,7 +193,7 @@ export const directAgentTools = {
 
   calculateMath: tool({
     description: "Perform mathematical calculations safely",
-    parameters: z.object({
+    inputSchema: z.object({
       expression: z
         .string()
         .describe(
@@ -202,7 +243,7 @@ export const directAgentTools = {
             !safeExpression
               .split("")
               .every(
-                (char) =>
+                (char: string) =>
                   mathSafe.test(char) ||
                   char === "(" ||
                   char === ")" ||
@@ -242,7 +283,7 @@ export const directAgentTools = {
 
   writeFile: tool({
     description: "Write content to a file (use with caution)",
-    parameters: z.object({
+    inputSchema: z.object({
       path: z.string().describe("File path to write to"),
       content: z.string().describe("Content to write to the file"),
       mode: z
@@ -252,16 +293,13 @@ export const directAgentTools = {
     }),
     execute: async ({ path: filePath, content, mode }) => {
       try {
-        const resolvedPath = path.resolve(filePath);
-        const cwd = process.cwd();
-
-        // Security check
-        if (!resolvedPath.startsWith(cwd) && !path.isAbsolute(filePath)) {
-          return {
-            success: false,
-            error: `Access denied: Cannot write files outside current directory`,
-          };
+        // Sandbox: contain writes to the working directory (blocks absolute-path
+        // escape and ../ traversal).
+        const guard = resolveWithinCwd(filePath);
+        if ("error" in guard) {
+          return { success: false, error: guard.error };
         }
+        const resolvedPath = guard.path;
 
         // Check if file exists for create mode
         if (mode === "create" && fs.existsSync(resolvedPath)) {
@@ -304,7 +342,7 @@ export const directAgentTools = {
   analyzeCSV: tool({
     description:
       "Analyze CSV file for accurate counting, aggregation, and statistical analysis. Use this for precise data operations like counting rows by column, calculating sums/averages, finding min/max values, etc. The tool reads the file directly - do NOT pass CSV content.",
-    parameters: z.object({
+    inputSchema: z.object({
       filePath: z
         .string()
         .refine(
@@ -371,12 +409,13 @@ export const directAgentTools = {
       try {
         // Resolve file path
         logger.debug(`[analyzeCSV] Resolving file: ${filePath}`);
-        const path = await import("path");
 
-        // Resolve path (support both relative and absolute)
-        const resolvedPath = path.isAbsolute(filePath)
-          ? filePath
-          : path.resolve(process.cwd(), filePath);
+        // Sandbox: contain CSV reads to the working directory.
+        const guard = resolveWithinCwd(filePath);
+        if ("error" in guard) {
+          return { success: false, error: guard.error };
+        }
+        const resolvedPath = guard.path;
 
         logger.debug(`[analyzeCSV] Resolved path: ${resolvedPath}`);
 
@@ -384,10 +423,9 @@ export const directAgentTools = {
         logger.info(
           `[analyzeCSV] Starting CSV parsing (max ${maxRows} rows)...`,
         );
-        const rows = (await CSVProcessor.parseCSVFile(
-          resolvedPath,
-          maxRows,
-        )) as Array<Record<string, string>>;
+        // #384: parseCSVFile now returns validated Record<string, string |
+        // undefined>[] rows, so the previous unchecked cast is unnecessary.
+        const rows = await CSVProcessor.parseCSVFile(resolvedPath, maxRows);
         logger.info(
           `[analyzeCSV] ✅ CSV parsing complete: ${rows.length} rows`,
         );
@@ -590,7 +628,7 @@ export const directAgentTools = {
 
             const values = rows
               .map((row) => row[column])
-              .filter((v) => v !== undefined && v !== "");
+              .filter((v): v is string => v !== undefined && v !== "");
 
             const numericValues = values
               .map((v) => parseFloat(v))
@@ -658,11 +696,23 @@ export const directAgentTools = {
     },
   }),
 
+  // NOTE: executeBashCommand was moved to a separate opt-in export (bashTool) for security.
+  // It is only included in directAgentTools when NEUROLINK_ENABLE_BASH_TOOL=true or
+  // toolConfig.enableBashTool is explicitly set to true. See shouldEnableBashTool() in toolUtils.ts.
+
   websearchGrounding: tool({
     description:
-      "Search the web for current information using Google Search grounding. Returns raw search data for AI processing.",
-    parameters: z.object({
-      query: z.string().describe("Search query to find information about"),
+      "Performs a Google Search and returns a summarized answer with source citations. Always check the current date before constructing the query. Use whenever the answer depends on time-sensitive facts or requires verification against real-world sources.",
+    inputSchema: z.object({
+      query: z
+        .string()
+        .trim()
+        .min(1, { message: "must be a non-empty search string" })
+        .refine((v) => v.toLowerCase() !== "undefined", {
+          message:
+            'must not be the literal string "undefined" — pass a real search query',
+        })
+        .describe("The search query string to look up on the web."),
       maxResults: z
         .number()
         .optional()
@@ -694,12 +744,15 @@ export const directAgentTools = {
         }
 
         const limitedResults = Math.min(Math.max(maxResults, 1), 5);
+        const { VertexAI } = await import("@google-cloud/vertexai");
         const vertex_ai = new VertexAI({
           project: hasProjectId,
           location: projectLocation,
         });
 
-        const websearchModel = "gemini-2.5-flash-lite";
+        const websearchModel =
+          process.env.NEUROLINK_WEBSEARCH_MODEL?.trim() ||
+          "gemini-2.5-flash-lite";
 
         const model = vertex_ai.getGenerativeModel({
           model: websearchModel,
@@ -803,26 +856,127 @@ export const directAgentTools = {
 };
 
 /**
- * Type aliases for specific tool categories
+ * Bash command execution tool - exported separately for opt-in use.
+ *
+ * SECURITY: This tool is NOT included in directAgentTools by default.
+ * It must be explicitly enabled via:
+ *   - Environment variable: NEUROLINK_ENABLE_BASH_TOOL=true
+ *   - Config: toolConfig.enableBashTool = true
+ *
+ * Import this directly when you need bash execution capabilities:
+ *   import { bashTool } from '../agent/directTools.js';
  */
-export type BasicToolsMap = {
-  getCurrentTime: typeof directAgentTools.getCurrentTime;
-  calculateMath: typeof directAgentTools.calculateMath;
-};
+export const bashTool: Tool = tool({
+  description:
+    "Execute a bash/shell command and return stdout, stderr, and exit code. Supports full shell syntax including pipes, redirects, and variable expansion. Requires HITL confirmation when enabled.",
+  inputSchema: z.object({
+    command: z
+      .string()
+      .describe(
+        "The shell command to execute (supports pipes, redirects, etc.)",
+      ),
+    timeout: z
+      .number()
+      .optional()
+      .default(30000)
+      .describe("Timeout in milliseconds (default: 30000, max: 120000)"),
+    cwd: z
+      .string()
+      .optional()
+      .describe("Working directory (defaults to process.cwd())"),
+  }),
+  execute: async ({ command, timeout = 30000, cwd }) => {
+    try {
+      const effectiveTimeout = Math.min(Math.max(timeout, 100), 120000);
+      const resolvedCwd = cwd ? path.resolve(cwd) : process.cwd();
+      const currentCwd = process.cwd();
 
-export type FilesystemToolsMap = {
-  readFile: typeof directAgentTools.readFile;
-  listDirectory: typeof directAgentTools.listDirectory;
-  writeFile: typeof directAgentTools.writeFile;
-};
+      // Verify cwd exists before resolving symlinks
+      if (
+        !fs.existsSync(resolvedCwd) ||
+        !fs.statSync(resolvedCwd).isDirectory()
+      ) {
+        return {
+          success: false,
+          code: -1,
+          stdout: "",
+          stderr: "",
+          error: `Directory does not exist: ${resolvedCwd}`,
+        };
+      }
 
-export type UtilityToolsMap = {
-  getCurrentTime: typeof directAgentTools.getCurrentTime;
-  calculateMath: typeof directAgentTools.calculateMath;
-  listDirectory: typeof directAgentTools.listDirectory;
-};
+      // Security: resolve symlinks and prevent execution outside current directory
+      try {
+        const realCwd = fs.realpathSync(currentCwd);
+        const realResolvedCwd = fs.realpathSync(resolvedCwd);
+        if (!realResolvedCwd.startsWith(realCwd)) {
+          return {
+            success: false,
+            code: -1,
+            stdout: "",
+            stderr: "",
+            error:
+              "Access denied: Cannot execute commands outside current directory",
+          };
+        }
+      } catch {
+        return {
+          success: false,
+          code: -1,
+          stdout: "",
+          stderr: "",
+          error: "Access denied: Cannot resolve directory path",
+        };
+      }
 
-export type AllToolsMap = typeof directAgentTools;
+      // Use /bin/bash -c to support full shell syntax (pipes, redirects, etc.)
+      return await new Promise((resolve) => {
+        execFile(
+          "/bin/bash",
+          ["-c", command],
+          {
+            timeout: effectiveTimeout,
+            cwd: resolvedCwd,
+            maxBuffer: MAX_OUTPUT_BYTES,
+          },
+          (error, stdout, stderr) => {
+            if (error) {
+              const exitCode = typeof error.code === "number" ? error.code : 1;
+              resolve({
+                success: false,
+                code: exitCode,
+                stdout: truncateOutput(stdout || ""),
+                stderr: truncateOutput(stderr || error.message),
+                error: error.killed ? "Command timed out" : error.message,
+              });
+            } else {
+              resolve({
+                success: true,
+                code: 0,
+                stdout: truncateOutput(stdout),
+                stderr: truncateOutput(stderr),
+              });
+            }
+          },
+        );
+      });
+    } catch (error) {
+      return {
+        success: false,
+        code: -1,
+        stdout: "",
+        stderr: "",
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  },
+});
+
+// Conditionally inject executeBashCommand into directAgentTools when opted in.
+// This ensures the tool is only available to SDK consumers who explicitly enable it.
+if (shouldEnableBashTool()) {
+  (directAgentTools as Record<string, unknown>).executeBashCommand = bashTool;
+}
 
 /**
  * Get a subset of tools for specific use cases with improved type safety
@@ -880,8 +1034,9 @@ export function validateToolStructure(): boolean {
         logger.error(`❌ Tool ${name} missing description`);
         return false;
       }
-      if (!tool.parameters) {
-        logger.error(`❌ Tool ${name} missing parameters`);
+      const toolRecord = tool as Record<string, unknown>;
+      if (!toolRecord.parameters && !toolRecord.inputSchema) {
+        logger.error(`Tool ${name} missing parameters/inputSchema`);
         return false;
       }
       if (!tool.execute || typeof tool.execute !== "function") {

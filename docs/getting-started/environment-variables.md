@@ -395,20 +395,23 @@ VERTEX_MODEL="gemini-2.5-pro"           # Default: gemini-2.5-pro
 
 ### 4. Anthropic (Direct)
 
-#### Required Variables
+Anthropic supports two authentication methods: **API key** (traditional) and **OAuth token** (for Claude subscription users).
+
+#### Method 1: API Key (Traditional)
+
+##### Required Variables
 
 ```bash
 ANTHROPIC_API_KEY="sk-ant-api03-your-anthropic-key"
 ```
 
-#### Optional Variables
+##### Optional Variables
 
 ```bash
 ANTHROPIC_MODEL="claude-3-5-sonnet-20241022"  # Default model
-ANTHROPIC_BASE_URL="https://api.anthropic.com" # Default endpoint
 ```
 
-#### How to Get Anthropic API Key
+##### How to Get Anthropic API Key
 
 1. Visit [Anthropic Console](https://console.anthropic.com)
 2. Sign up or log in
@@ -416,6 +419,65 @@ ANTHROPIC_BASE_URL="https://api.anthropic.com" # Default endpoint
 4. Click **Create Key**
 5. Copy the key (starts with `sk-ant-api03-`)
 6. Add billing information for usage
+
+#### Method 2: OAuth Token (Claude Subscription)
+
+Use OAuth authentication to access Claude models through a Claude Pro, Max, or Team subscription instead of pay-per-token API billing.
+
+##### Required Variables
+
+```bash
+# Either of these (ANTHROPIC_OAUTH_TOKEN takes precedence)
+ANTHROPIC_OAUTH_TOKEN="your-oauth-access-token"
+CLAUDE_OAUTH_TOKEN="your-oauth-access-token"
+```
+
+The OAuth token value can be a plain access token string or a JSON object with the following fields:
+
+```json
+{
+  "accessToken": "your-access-token",
+  "refreshToken": "your-refresh-token",
+  "expiresAt": 1735689600000
+}
+```
+
+Where `expiresAt` is the token expiry time in Unix milliseconds.
+
+##### Optional Variables
+
+```bash
+ANTHROPIC_MODEL="claude-3-5-sonnet-20241022"            # Default model
+ANTHROPIC_SUBSCRIPTION_TIER="pro"                        # Subscription tier override
+```
+
+`ANTHROPIC_SUBSCRIPTION_TIER` controls which models and rate limits are available. Valid values:
+
+| Tier     | Description                                     |
+| -------- | ----------------------------------------------- |
+| `free`   | Free tier with limited access                   |
+| `pro`    | Claude Pro subscription (default for OAuth)     |
+| `max`    | Claude Max subscription                         |
+| `max_5`  | Claude Max with 5x usage                        |
+| `max_20` | Claude Max with 20x usage                       |
+| `api`    | Standard API key access (default without OAuth) |
+
+If `ANTHROPIC_SUBSCRIPTION_TIER` is not set, the tier is auto-detected: `pro` when using OAuth, `api` when using an API key.
+
+#### Environment Variables Reference
+
+| Variable                         | Required | Default                            | Description                                                                |
+| -------------------------------- | -------- | ---------------------------------- | -------------------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY`              | \*       | -                                  | Anthropic API key (required if not using OAuth)                            |
+| `ANTHROPIC_OAUTH_TOKEN`          | \*       | -                                  | OAuth access token, plain string or JSON (required if not using API key)   |
+| `CLAUDE_OAUTH_TOKEN`             | \*       | -                                  | Alternative OAuth token env var (same format as `ANTHROPIC_OAUTH_TOKEN`)   |
+| `ANTHROPIC_MODEL`                | No       | `claude-3-5-sonnet-20241022`       | Default model to use                                                       |
+| `ANTHROPIC_SUBSCRIPTION_TIER`    | No       | Auto-detected (`pro` or `api`)     | Subscription tier override: `free`, `pro`, `max`, `max_5`, `max_20`, `api` |
+| `ANTHROPIC_ENABLE_BETA_FEATURES` | No       | `true` (OAuth) / `false` (API key) | Enable Anthropic beta headers (OAuth beta, extended thinking)              |
+| `ANTHROPIC_OAUTH_REFRESH_TOKEN`  | No       | -                                  | OAuth refresh token (used for automatic token renewal)                     |
+| `ANTHROPIC_AUTH_METHOD`          | No       | Auto-detected                      | Force auth method: `api_key` or `oauth`                                    |
+
+\* One of `ANTHROPIC_API_KEY`, `ANTHROPIC_OAUTH_TOKEN`, or `CLAUDE_OAUTH_TOKEN` must be set.
 
 #### Supported Models
 
@@ -799,12 +861,256 @@ npx @juspay/neurolink sagemaker setup
 
 ---
 
+### 12. DeepSeek
+
+#### Required Variables
+
+```bash
+DEEPSEEK_API_KEY="sk-your-deepseek-api-key"
+```
+
+#### Optional Variables
+
+```bash
+DEEPSEEK_MODEL="deepseek-chat"                    # Default: deepseek-chat (use deepseek-reasoner for R1)
+DEEPSEEK_BASE_URL="https://api.deepseek.com"      # Default: DeepSeek API
+```
+
+#### How to Get DeepSeek API Key
+
+1. Visit [DeepSeek Platform](https://platform.deepseek.com/api_keys)
+2. Sign up or log in to your account
+3. Navigate to **API Keys** section
+4. Click **Create API Key**
+5. Copy the key
+
+#### Supported Models
+
+- `deepseek-chat` (default) - DeepSeek V3, high-quality general chat
+- `deepseek-reasoner` - DeepSeek R1, extended chain-of-thought reasoning
+
+---
+
+### 13. NVIDIA NIM
+
+#### Required Variables
+
+```bash
+NVIDIA_NIM_API_KEY="nvapi-your-nvidia-api-key"
+```
+
+#### Optional Variables
+
+```bash
+NVIDIA_NIM_MODEL="meta/llama-3.3-70b-instruct"              # Default model
+NVIDIA_NIM_BASE_URL="https://integrate.api.nvidia.com/v1"   # Default: NVIDIA cloud API (override for self-hosted NIM)
+```
+
+#### NIM-Specific Extras (rarely needed)
+
+```bash
+# Sampling extras passed as request body extensions
+NVIDIA_NIM_TOP_K=                      # Integer, -1 = disabled (default)
+NVIDIA_NIM_MIN_P=                      # Float, 0 = disabled (default)
+NVIDIA_NIM_REPETITION_PENALTY=         # Float, 1.0 = disabled (default)
+NVIDIA_NIM_MIN_TOKENS=                 # Integer, 0 = disabled (default)
+NVIDIA_NIM_CHAT_TEMPLATE=              # Override model chat template string (advanced)
+```
+
+#### How to Get NVIDIA NIM API Key
+
+1. Visit [NVIDIA Build](https://build.nvidia.com/)
+2. Sign in with your NVIDIA developer account
+3. Open **Settings → API Keys**
+4. Generate a new API key (Bearer token)
+
+#### Supported Models
+
+- `meta/llama-3.3-70b-instruct` (default) - Llama 3.3 70B Instruct
+- Any model listed at [build.nvidia.com/models](https://build.nvidia.com/models)
+
+---
+
+### 14. LM Studio (Local)
+
+LM Studio is a local provider — no API key is required for standard installations.
+
+#### Optional Variables
+
+```bash
+LM_STUDIO_BASE_URL="http://localhost:1234/v1"    # Default: local LM Studio server
+LM_STUDIO_MODEL=""                               # Blank = auto-discover from /v1/models
+# LM_STUDIO_API_KEY=                             # Only set when running behind an auth-proxying reverse-proxy
+```
+
+#### How to Set Up LM Studio
+
+1. Install LM Studio from [lmstudio.ai](https://lmstudio.ai/)
+2. Open LM Studio and download a model (e.g., Llama 3.2 3B Instruct)
+3. Click **Local Server** → **Start Server**
+4. The server starts at `http://localhost:1234/v1` by default
+5. NeuroLink auto-discovers the loaded model; no `LM_STUDIO_MODEL` needed
+
+**Note:** `LM_STUDIO_API_KEY` is only needed if you run LM Studio behind an authenticating reverse-proxy. Vanilla local installs do not require an API key.
+
+---
+
+### 15. llama.cpp (Local)
+
+llama.cpp (llama-server) is a local provider — no API key is required for standard installations.
+
+#### Optional Variables
+
+```bash
+LLAMACPP_BASE_URL="http://localhost:8080/v1"     # Default: local llama-server
+LLAMACPP_MODEL=""                                # Blank = use whatever model llama-server has loaded
+# LLAMACPP_API_KEY=                              # Only set when running behind an auth-proxying reverse-proxy
+```
+
+#### How to Set Up llama.cpp
+
+1. Build llama.cpp from source: [github.com/ggerganov/llama.cpp](https://github.com/ggerganov/llama.cpp#build)
+2. Download a GGUF model file
+3. Start llama-server:
+
+   ```bash
+   # Basic usage
+   ./llama-server -m model.gguf --port 8080
+
+   # With tool/function-call support (required for MCP tools)
+   ./llama-server -m model.gguf --port 8080 --jinja
+   ```
+
+4. NeuroLink auto-discovers the loaded model; no `LLAMACPP_MODEL` needed
+
+**Note:** `LLAMACPP_API_KEY` is only needed if you run llama-server behind an authenticating reverse-proxy. Vanilla local installs do not require an API key.
+
+---
+
+### 16. OpenAI TTS
+
+OpenAI TTS uses the same `OPENAI_API_KEY` as the OpenAI LLM provider. No additional credentials are required.
+
+#### Required Variables
+
+```bash
+OPENAI_API_KEY="sk-proj-your-openai-api-key"  # Shared with the OpenAI LLM provider
+```
+
+#### How to Get the API Key
+
+See [OpenAI](#1-openai) above — the same key is used for both LLM and TTS.
+
+#### Supported Models
+
+- `tts-1` (default) - Optimized for speed
+- `tts-1-hd` - Optimized for audio quality
+
+---
+
+### 17. ElevenLabs TTS
+
+#### Required Variables
+
+```bash
+ELEVENLABS_API_KEY="your-elevenlabs-api-key"
+```
+
+#### How to Get ElevenLabs API Key
+
+1. Visit [ElevenLabs](https://elevenlabs.io)
+2. Sign up or log in to your account
+3. Navigate to **Profile → API Key**
+4. Copy the key
+
+#### Supported Models
+
+- `eleven_multilingual_v2` (default) - Best quality, 29 languages
+- `eleven_turbo_v2_5` - Low-latency streaming, 32 languages
+- `eleven_flash_v2_5` - Fastest, suitable for real-time use
+
+---
+
+### 18. Deepgram STT
+
+#### Required Variables
+
+```bash
+DEEPGRAM_API_KEY="your-deepgram-api-key"
+```
+
+#### How to Get Deepgram API Key
+
+1. Visit [Deepgram Console](https://console.deepgram.com)
+2. Sign up or log in to your account
+3. Navigate to **API Keys**
+4. Click **Create a New API Key**
+5. Copy the key
+
+#### Supported Models
+
+- `nova-3` (default) - Latest, highest accuracy
+- `nova-2` - High accuracy, broad language support
+- `base` - Balanced accuracy and speed
+
+---
+
+### 19. Azure Speech Services (TTS + STT)
+
+Azure Speech Services provides both text-to-speech and speech-to-text through Microsoft Azure Cognitive Services.
+
+#### Required Variables
+
+```bash
+AZURE_SPEECH_KEY="your-azure-speech-key"
+AZURE_SPEECH_REGION="eastus"              # Azure region where your Speech resource is deployed
+```
+
+#### Optional Variables
+
+If you also use Google STT or Gemini Live alongside Azure, set the canonical
+Google credentials:
+
+```bash
+GOOGLE_AI_API_KEY="AIza-your-google-ai-studio-key"   # canonical
+# GEMINI_API_KEY="AIza-your-key"                     # alias (also accepted)
+# GOOGLE_API_KEY="AIza-your-key"                     # legacy alias (also accepted)
+# GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json    # service account (Google STT)
+```
+
+#### How to Set Up Azure Speech Services
+
+1. Sign in to [Azure Portal](https://portal.azure.com)
+2. Create a **Speech** resource under **Azure AI services**
+3. Go to **Keys and Endpoint** in your Speech resource
+4. Copy **Key 1** and note the **Location/Region**
+5. Set `AZURE_SPEECH_KEY` and `AZURE_SPEECH_REGION`
+
+#### Supported Capabilities
+
+- **TTS**: Azure Neural TTS with 400+ voices across 140+ languages
+- **STT**: Azure Speech-to-Text with real-time and batch transcription
+
+#### Environment Variables Reference
+
+| Variable              | Required | Default | Description                                         |
+| --------------------- | -------- | ------- | --------------------------------------------------- |
+| `AZURE_SPEECH_KEY`    | ✅       | -       | Azure Speech Services API key                       |
+| `AZURE_SPEECH_REGION` | ✅       | -       | Azure region (e.g., `eastus`, `westeurope`)         |
+| `GOOGLE_AI_API_KEY`   | ❌       | -       | Canonical Google API key (Google STT / Gemini Live) |
+| `GEMINI_API_KEY`      | ❌       | -       | Accepted alias for `GOOGLE_AI_API_KEY`              |
+| `GOOGLE_API_KEY`      | ❌       | -       | Legacy alias for `GOOGLE_AI_API_KEY`                |
+| `ELEVENLABS_API_KEY`  | ❌       | -       | ElevenLabs key, if using ElevenLabs alongside       |
+| `DEEPGRAM_API_KEY`    | ❌       | -       | Deepgram key, if using Deepgram alongside           |
+
+---
+
 ## 🔧 Configuration Examples
 
 ### Complete .env File Example
 
 ```bash
-# NeuroLink Environment Configuration - All 11 Providers
+# NeuroLink Environment Configuration - All 15 Providers
 
 # OpenAI Configuration
 OPENAI_API_KEY="sk-proj-your-openai-key"
@@ -830,8 +1136,13 @@ GOOGLE_VERTEX_PROJECT="your-gcp-project"
 GOOGLE_VERTEX_LOCATION="us-central1"
 VERTEX_MODEL="gemini-2.5-pro"
 
-# Anthropic Configuration
+# Anthropic Configuration (API key or OAuth token)
 ANTHROPIC_API_KEY="sk-ant-api03-your-key"
+# ANTHROPIC_OAUTH_TOKEN="your-oauth-token"     # Alternative: OAuth token for Claude subscription
+# ANTHROPIC_SUBSCRIPTION_TIER="pro"            # Optional: free, pro, max, max_5, max_20, api
+# ANTHROPIC_ENABLE_BETA_FEATURES="true"        # Optional: enable beta headers (default: true for OAuth)
+# ANTHROPIC_OAUTH_REFRESH_TOKEN=""             # Optional: OAuth refresh token for auto-renewal
+# ANTHROPIC_AUTH_METHOD="oauth"                # Optional: force auth method (api_key or oauth)
 
 # Google AI Studio Configuration
 GOOGLE_AI_API_KEY="AIza-your-google-ai-key"
@@ -859,6 +1170,26 @@ MISTRAL_MODEL="mistral-small"
 LITELLM_BASE_URL="http://localhost:4000"
 LITELLM_API_KEY="sk-anything"
 LITELLM_MODEL="openai/gpt-4o-mini"
+
+# DeepSeek Configuration
+DEEPSEEK_API_KEY="sk-your-deepseek-key"
+DEEPSEEK_MODEL="deepseek-chat"
+# DEEPSEEK_BASE_URL=https://api.deepseek.com
+
+# NVIDIA NIM Configuration
+NVIDIA_NIM_API_KEY="nvapi-your-nvidia-key"
+NVIDIA_NIM_MODEL="meta/llama-3.3-70b-instruct"
+# NVIDIA_NIM_BASE_URL=https://integrate.api.nvidia.com/v1
+
+# LM Studio Configuration (local — no API key required)
+LM_STUDIO_BASE_URL="http://localhost:1234/v1"
+# LM_STUDIO_MODEL=                 # blank = auto-discover
+# LM_STUDIO_API_KEY=               # only for reverse-proxy setups
+
+# llama.cpp Configuration (local — no API key required)
+LLAMACPP_BASE_URL="http://localhost:8080/v1"
+# LLAMACPP_MODEL=                  # blank = auto-discover
+# LLAMACPP_API_KEY=                # only for reverse-proxy setups
 ```
 
 ### Docker/Container Configuration

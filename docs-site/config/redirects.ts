@@ -58,7 +58,8 @@ const sectionReorganizationRedirects: PluginOptions["redirects"] = [
   // Multimodal feature redirects
   { from: "/multimodal", to: "/docs/features/multimodal" },
   { from: "/docs/multimodal", to: "/docs/features/multimodal" },
-  { from: "/vision", to: "/docs/features/multimodal" },
+  { from: "/vision", to: "/docs/about/vision" },
+  { from: "/docs/vision", to: "/docs/about/vision" },
   { from: "/images", to: "/docs/features/multimodal" },
   { from: "/pdf", to: "/docs/features/pdf-support" },
   { from: "/docs/pdf", to: "/docs/features/pdf-support" },
@@ -86,7 +87,6 @@ const sectionReorganizationRedirects: PluginOptions["redirects"] = [
   { from: "/conversation", to: "/docs/features/conversation-history" },
   { from: "/conversation-history", to: "/docs/features/conversation-history" },
   { from: "/redis", to: "/docs/getting-started/redis-quickstart" },
-  { from: "/mem0", to: "/docs/memory/mem0" },
   { from: "/summarization", to: "/docs/memory/summarization" },
 
   // Streaming redirects
@@ -103,6 +103,9 @@ const sectionReorganizationRedirects: PluginOptions["redirects"] = [
   { from: "/image-generation", to: "/docs/features/image-generation" },
   { from: "/video-generation", to: "/docs/features/video-generation" },
   { from: "/video", to: "/docs/features/video-generation" },
+  { from: "/ppt-generation", to: "/docs/features/ppt-generation" },
+  { from: "/ppt", to: "/docs/features/ppt-generation" },
+  { from: "/powerpoint", to: "/docs/features/ppt-generation" },
 
   // Enterprise features redirects
   { from: "/hitl", to: "/docs/features/hitl" },
@@ -124,7 +127,6 @@ const sectionReorganizationRedirects: PluginOptions["redirects"] = [
   // Analytics/observability redirects (redirect to telemetry as main observability page)
   { from: "/analytics", to: "/docs/observability/telemetry" },
   { from: "/docs/analytics", to: "/docs/observability/telemetry" },
-  { from: "/docs/reference/analytics", to: "/docs/observability/telemetry" },
   { from: "/observability", to: "/docs/observability/telemetry" },
   { from: "/telemetry", to: "/docs/observability/telemetry" },
 

@@ -1,16 +1,33 @@
+import chalk from "chalk";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
-import chalk from "chalk";
 import packageJson from "../../package.json" with { type: "json" };
-import { CLICommandFactory } from "./factories/commandFactory.js";
 import { globalSession } from "../lib/session/globalSessionState.js";
-import { handleError } from "./errorHandler.js";
 import { logger } from "../lib/utils/logger.js";
+import { handleError } from "./errorHandler.js";
+import { CLICommandFactory } from "./factories/commandFactory.js";
 import { SetupCommandFactory } from "./factories/setupCommandFactory.js";
+import { AuthCommandFactory } from "./factories/authCommandFactory.js";
 import { ServerCommandFactory } from "./commands/server.js";
 import { ServeCommandFactory } from "./commands/serve.js";
 import { ragCommand } from "./commands/rag.js";
-import { DocsCommandFactory } from "./commands/docs.js";
+import { ObservabilityCommandFactory } from "./commands/observability.js";
+import { TelemetryCommandFactory } from "./commands/telemetry.js";
+import {
+  proxyStartCommand,
+  proxyStatusCommand,
+  proxyTelemetryCommand,
+  proxySetupCommand,
+  proxyGuardCommand,
+  proxyInstallCommand,
+  proxyUninstallCommand,
+} from "./commands/proxy.js";
+import { proxyAnalyzeCommand } from "./commands/proxyAnalyze.js";
+import { proxyReplayCommand } from "./commands/proxyReplay.js";
+import { EvaluateCommandFactory } from "./commands/evaluate.js";
+import { TaskCommandFactory } from "./commands/task.js";
+import { AutoresearchCommandFactory } from "./commands/autoresearch.js";
+import { voiceServerCommand } from "./commands/voiceServer.js";
 
 // Enhanced CLI with Professional UX
 export function initializeCliParser() {
@@ -26,7 +43,15 @@ export function initializeCliParser() {
       .strictCommands()
       .demandCommand(1, "")
       .recommendCommands()
-      .epilogue("For more info: https://github.com/juspay/neurolink")
+      .epilogue(
+        "For more info: https://github.com/juspay/neurolink\n\n" +
+          "Anthropic Subscription Tiers:\n" +
+          "  free  - Limited free tier access\n" +
+          "  pro   - Professional tier ($20/mo)\n" +
+          "  max   - Maximum tier with highest limits\n" +
+          "  api   - Direct API access (pay-per-use)\n\n" +
+          "Use 'neurolink auth login anthropic' to configure authentication",
+      )
       .showHelpOnFail(true, "Specify --help for available options")
       .middleware((argv: { noColor?: boolean; [key: string]: unknown }) => {
         // Handle no-color option globally
@@ -98,9 +123,7 @@ export function initializeCliParser() {
           if (!alreadyExitedByHandleError) {
             process.stderr.write(
               chalk.red(
-                `CLI Error: ${
-                  err.message || msg || "An unexpected error occurred."
-                }\n`,
+                `CLI Error: ${err.message || msg || "An unexpected error occurred."}\n`,
               ),
             );
             // If it's a yargs internal parsing error, show help.
@@ -178,6 +201,9 @@ export function initializeCliParser() {
       // Memory Command Group - Using CLICommandFactory
       .command(CLICommandFactory.createMemoryCommands())
 
+      // Skills Command Group - Using CLICommandFactory
+      .command(CLICommandFactory.createSkillsCommands())
+
       // Get Best Provider Command - Using CLICommandFactory
       .command(CLICommandFactory.createBestProviderCommand())
 
@@ -196,6 +222,12 @@ export function initializeCliParser() {
       // Loop Command - Using CLICommandFactory
       .command(CLICommandFactory.createLoopCommand())
 
+      // Agent Commands - Using CLICommandFactory (Multi-Agent Orchestration)
+      .command(CLICommandFactory.createAgentCommands())
+
+      // Network Commands - Using CLICommandFactory (Agent Network Orchestration)
+      .command(CLICommandFactory.createNetworkCommands())
+
       // Setup Commands - Using SetupCommandFactory
       .command(SetupCommandFactory.createSetupCommands())
 
@@ -208,7 +240,47 @@ export function initializeCliParser() {
       // RAG Document Processing Commands
       .command(ragCommand)
 
-      // Docs MCP Server Command
-      .command(DocsCommandFactory.createDocsCommand())
+      // Observability Commands
+      .command(ObservabilityCommandFactory.createObservabilityCommands())
+
+      // Telemetry Commands
+      .command(TelemetryCommandFactory.createTelemetryCommands())
+
+      // Auth Commands - Authentication management
+      .command(AuthCommandFactory.createAuthCommands())
+
+      // Proxy Commands - Claude multi-account proxy
+      .command({
+        command: "proxy",
+        describe: "Manage Claude multi-account proxy server",
+        builder: (yargs) =>
+          yargs
+            .command(proxyStartCommand)
+            .command(proxyStatusCommand)
+            .command(proxyAnalyzeCommand)
+            .command(proxyReplayCommand)
+            .command(proxyTelemetryCommand)
+            .command(proxySetupCommand)
+            .command(proxyGuardCommand)
+            .command(proxyInstallCommand)
+            .command(proxyUninstallCommand)
+            .demandCommand(
+              1,
+              "Please specify a proxy subcommand: start, status, analyze, replay <export|compare>, telemetry <setup|start|stop|status|logs|import-dashboard>, setup, guard, install, or uninstall",
+            ),
+        handler: () => {},
+      })
+
+      // Evaluate Command Group - Using EvaluateCommandFactory
+      .command(EvaluateCommandFactory.createEvaluateCommand())
+
+      // Task Command Group - Scheduled and self-running tasks
+      .command(TaskCommandFactory.createTaskCommands())
+
+      // AutoResearch Command Group - Automated AI-driven research experiments
+      .command(AutoresearchCommandFactory.createAutoresearchCommands())
+
+      // Real-time voice server (Soniox STT + Cartesia TTS + Cobra VAD)
+      .command(voiceServerCommand)
   ); // Close the main return statement
 }

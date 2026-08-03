@@ -8,12 +8,10 @@ import type {
   OptionSchema,
   RestorationToolContext,
   SessionRestoreResult,
-} from "../../lib/types/cli.js";
-import type {
   ConversationData,
   ConversationMemoryConfig,
   NeurolinkOptions,
-} from "../../lib/types/conversation.js";
+} from "../../lib/types/index.js";
 import { logger } from "../../lib/utils/logger.js";
 import {
   displayConversationPreview,
@@ -25,6 +23,8 @@ import {
   saveCommandToHistory,
   verifyConversationContext,
 } from "../../lib/utils/loopUtils.js";
+import { SpanStatusCode } from "@opentelemetry/api";
+import { tracers } from "../../lib/telemetry/tracers.js";
 import { handleError } from "../errorHandler.js";
 import { ConversationSelector } from "./conversationSelector.js";
 import { textGenerationOptionsSchema } from "./optionsSchema.js";
@@ -165,19 +165,42 @@ export class LoopSession {
           processedCommand = ["stream", command];
         }
 
-        // Execute the command
+        // Execute the command within an OTel span for per-turn visibility.
         // The .fail() handler in cli.ts is now session-aware and will
         // handle all parsing and validation errors without exiting the loop.
         // We create a fresh instance for each command to prevent state pollution.
-        const yargsInstance = this.initializeCliParser();
-        await yargsInstance
-          .scriptName("")
-          .fail((msg, err) => {
-            // Re-throw the error to be caught by the outer catch block
-            throw err || new Error(msg);
-          })
-          .exitProcess(false)
-          .parse(processedCommand);
+        await tracers.sdk.startActiveSpan(
+          "neurolink.cli.turn",
+          async (turnSpan) => {
+            try {
+              turnSpan.setAttribute(
+                "cli.command",
+                typeof processedCommand === "string"
+                  ? processedCommand.slice(0, 100)
+                  : (processedCommand[0] ?? "unknown"),
+              );
+              turnSpan.setAttribute("cli.session_id", this.sessionId ?? "none");
+              const yargsInstance = this.initializeCliParser();
+              await yargsInstance
+                .scriptName("")
+                .fail((msg, err) => {
+                  throw err || new Error(msg);
+                })
+                .exitProcess(false)
+                .parse(processedCommand);
+            } catch (e) {
+              const err = e instanceof Error ? e : new Error(String(e));
+              turnSpan.recordException(err);
+              turnSpan.setStatus({
+                code: SpanStatusCode.ERROR,
+                message: err.message,
+              });
+              throw e;
+            } finally {
+              turnSpan.end();
+            }
+          },
+        );
 
         // Check context budget after each generation command
         await this.checkContextBudgetWarning();
@@ -529,6 +552,27 @@ export class LoopSession {
       "\nAny other command will be executed as a standard neurolink CLI command.",
     );
 
+    // #315: multimodal file flags are buried in the raw yargs dump below — call
+    // them out explicitly so loop users know PDFs/images/CSVs/video are supported.
+    logger.always(chalk.cyan("\nMultimodal file inputs (per-command flags):"));
+    [
+      ["--image <path|url>", "Attach an image for analysis (repeatable)"],
+      ["--pdf <path|url>", "Attach a PDF document (repeatable)"],
+      [
+        "--csv <path|url>",
+        "Attach a CSV file (see --csv-format, --csv-max-rows)",
+      ],
+      ["--video <path|url>", "Attach a video for analysis"],
+      ["--file <path|url>", "Attach a file and auto-detect its type"],
+    ].forEach(([flag, desc]) => {
+      logger.always(chalk.yellow(`  ${flag.padEnd(20)}`) + `${desc}`);
+    });
+    logger.always(
+      chalk.gray(
+        '  e.g.  generate "Describe this" --image ./photo.jpg --pdf ./report.pdf',
+      ),
+    );
+
     // Also show the standard help output
     this.initializeCliParser().showHelp("log");
   }
@@ -546,6 +590,15 @@ export class LoopSession {
         logger.always(chalk.gray(`    Type: ${schema.type}`));
       }
     }
+    // #350: multimodal file inputs are per-command flags, not session variables,
+    // so they don't appear above — point users to them explicitly.
+    logger.always(
+      chalk.gray(
+        "\n  Note: file inputs (--image/--pdf/--csv/--video/--file) are per-command\n" +
+          "  flags, not session variables — pass them directly on a generate/stream line,\n" +
+          '  e.g.  generate "Summarize this" --pdf ./report.pdf',
+      ),
+    );
   }
 
   /**

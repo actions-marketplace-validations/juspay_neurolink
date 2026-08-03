@@ -28,10 +28,151 @@ export const DEFAULT_OUTPUT_RESERVE_RATIO = 0.35;
  * The "_default" key is the fallback for unknown models within a provider.
  */
 export const MODEL_CONTEXT_WINDOWS: Record<string, Record<string, number>> = {
+  deepseek: {
+    _default: 64_000,
+    "deepseek-chat": 64_000,
+    "deepseek-reasoner": 64_000,
+  },
+  "nvidia-nim": {
+    _default: 128_000,
+    "meta/llama-3.3-70b-instruct": 128_000,
+    "meta/llama-3.1-405b-instruct": 128_000,
+    "meta/llama-3.1-70b-instruct": 128_000,
+    "meta/llama-3.2-90b-vision-instruct": 128_000,
+    "meta/llama-3.2-11b-vision-instruct": 128_000,
+    "nvidia/llama-3.3-nemotron-super-49b-v1": 128_000,
+    "nvidia/llama-3.1-nemotron-nano-8b-v1": 128_000,
+    "nvidia/llama-3.1-nemotron-70b-instruct": 128_000,
+    "deepseek-ai/deepseek-r1": 128_000,
+    "deepseek-ai/deepseek-r1-distill-llama-70b": 128_000,
+    "mistralai/mixtral-8x22b-instruct-v0.1": 65_536,
+    "mistralai/mixtral-8x7b-instruct-v0.1": 32_768,
+    "microsoft/phi-4": 16_384,
+    "google/gemma-3-27b-it": 8_192,
+  },
+  "lm-studio": {
+    _default: 8_192,
+  },
+  llamacpp: {
+    _default: 8_192,
+  },
+  xai: {
+    _default: 131_072,
+    "grok-3": 131_072,
+    "grok-3-mini": 131_072,
+    "grok-2-latest": 131_072,
+    "grok-2-vision-latest": 32_768,
+    "grok-beta": 131_072,
+  },
+  groq: {
+    _default: 128_000,
+    "llama-3.3-70b-versatile": 131_072,
+    "llama-3.1-8b-instant": 128_000,
+    "llama-3.2-90b-vision-preview": 128_000,
+    "llama-3.2-11b-vision-preview": 128_000,
+    "llama-guard-3-8b": 8_192,
+    "gemma2-9b-it": 8_192,
+    "mixtral-8x7b-32768": 32_768,
+  },
+  cohere: {
+    _default: 128_000,
+    "command-r-plus": 128_000,
+    "command-r": 128_000,
+    "command-r7b-12-2024": 128_000,
+  },
+  "together-ai": {
+    _default: 128_000,
+    "meta-llama/Llama-3.3-70B-Instruct-Turbo": 128_000,
+    "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo": 128_000,
+    "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo": 128_000,
+    "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo": 128_000,
+    "mistralai/Mixtral-8x22B-Instruct-v0.1": 65_536,
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": 32_768,
+    "Qwen/Qwen2.5-72B-Instruct-Turbo": 32_768,
+    "Qwen/Qwen2.5-Coder-32B-Instruct": 32_768,
+    "deepseek-ai/DeepSeek-R1": 64_000,
+    "deepseek-ai/DeepSeek-V3": 64_000,
+    "google/gemma-2-27b-it": 8_192,
+    "microsoft/WizardLM-2-8x22B": 65_536,
+  },
+  fireworks: {
+    _default: 128_000,
+    "accounts/fireworks/models/llama-v3p1-70b-instruct": 131_072,
+    "accounts/fireworks/models/llama-v3p1-405b-instruct": 128_000,
+    "accounts/fireworks/models/llama-v3p1-8b-instruct": 128_000,
+    "accounts/fireworks/models/llama-v3p3-70b-instruct": 128_000,
+    "accounts/fireworks/models/mixtral-8x22b-instruct": 65_536,
+    "accounts/fireworks/models/qwen2p5-72b-instruct": 32_768,
+    "accounts/fireworks/models/qwen2p5-coder-32b-instruct": 32_768,
+    "accounts/fireworks/models/deepseek-v3": 64_000,
+  },
+  perplexity: {
+    _default: 127_000,
+    sonar: 127_000,
+    "sonar-pro": 200_000,
+    "sonar-reasoning": 127_000,
+    "sonar-reasoning-pro": 127_000,
+    "sonar-deep-research": 200_000,
+  },
+  cloudflare: {
+    _default: 8_192,
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast": 24_000,
+    "@cf/meta/llama-3.1-70b-instruct": 24_000,
+    "@cf/meta/llama-3.1-8b-instruct-fast": 24_000,
+    "@cf/meta/llama-3.2-11b-vision-instruct": 24_000,
+    "@cf/mistral/mistral-7b-instruct-v0.2": 32_768,
+    "@cf/qwen/qwen1.5-14b-chat-awq": 7_500,
+    "@cf/google/gemma-2b-it-lora": 4_096,
+  },
+  replicate: {
+    // Per-model — Replicate hosts arbitrary models; sensible default.
+    _default: 32_768,
+  },
+  voyage: {
+    // Voyage embeddings: max input tokens vary 16K-32K per model
+    _default: 32_000,
+    "voyage-3.5": 32_000,
+    "voyage-3.5-lite": 32_000,
+    "voyage-3-large": 32_000,
+    "voyage-code-3": 32_000,
+    "voyage-finance-2": 32_000,
+    "voyage-law-2": 16_000,
+    "voyage-multilingual-2": 32_000,
+  },
+  jina: {
+    // Jina embeddings: 8K input tokens for v3; 8K for v2; 32K for ColBERT-v2
+    _default: 8_192,
+    "jina-embeddings-v3": 8_192,
+    "jina-embeddings-v2-base-en": 8_192,
+    "jina-embeddings-v2-small-en": 8_192,
+    "jina-colbert-v2": 32_000,
+  },
+  stability: {
+    // Image-gen — context is prompt length only; ~2000 char limit
+    _default: 2_000,
+  },
+  ideogram: {
+    _default: 2_000,
+  },
+  recraft: {
+    _default: 2_000,
+  },
   anthropic: {
     _default: 200_000,
+    // Claude 5 (mid 2026) — 1M context window
+    "claude-sonnet-5": 1_000_000,
+    // Claude 4.6 (Feb 2026) — 1M context window
+    "claude-opus-4-6": 1_000_000,
+    "claude-sonnet-4-6": 1_000_000,
+    // Claude 4.5
+    "claude-opus-4-5-20251101": 200_000,
+    "claude-sonnet-4-5-20250929": 200_000,
+    "claude-haiku-4-5-20251001": 200_000,
+    // Claude 4.x
+    "claude-opus-4-1-20250805": 200_000,
     "claude-opus-4-20250514": 200_000,
     "claude-sonnet-4-20250514": 200_000,
+    // Claude 3.x
     "claude-3-7-sonnet-20250219": 200_000,
     "claude-3-5-sonnet-20241022": 200_000,
     "claude-3-5-haiku-20241022": 200_000,
@@ -41,67 +182,173 @@ export const MODEL_CONTEXT_WINDOWS: Record<string, Record<string, number>> = {
   },
   openai: {
     _default: 128_000,
+    // GPT-5.4 family — 1.05M context
+    "gpt-5.4": 1_050_000,
+    "gpt-5.4-mini": 400_000,
+    "gpt-5.4-nano": 400_000,
+    "gpt-5.4-pro": 1_050_000,
+    // GPT-5.x family — 400K context
+    "gpt-5.3-codex": 400_000,
+    "gpt-5.2": 400_000,
+    "gpt-5.2-pro": 400_000,
+    "gpt-5.2-codex": 400_000,
+    "gpt-5.2-chat-latest": 128_000,
+    "gpt-5.1": 400_000,
+    "gpt-5.1-codex": 400_000,
+    "gpt-5.1-codex-max": 400_000,
+    "gpt-5.1-codex-mini": 400_000,
+    "gpt-5.1-chat-latest": 128_000,
+    "gpt-5": 400_000,
+    "gpt-5-mini": 400_000,
+    "gpt-5-nano": 400_000,
+    "gpt-5-pro": 400_000,
+    "gpt-5-codex": 400_000,
+    "gpt-5-chat-latest": 128_000,
+    // GPT Open Source
+    "gpt-oss-120b": 128_000,
+    "gpt-oss-20b": 128_000,
+    // GPT-4.1 family — 1M context
+    "gpt-4.1": 1_047_576,
+    "gpt-4.1-mini": 1_047_576,
+    "gpt-4.1-nano": 1_047_576,
+    // GPT-4o
     "gpt-4o": 128_000,
     "gpt-4o-mini": 128_000,
-    "gpt-4-turbo": 128_000,
-    "gpt-4": 8_192,
-    "gpt-3.5-turbo": 16_385,
+    // O-series reasoning — 200K context
     o1: 200_000,
     "o1-mini": 128_000,
     "o1-pro": 200_000,
     o3: 200_000,
     "o3-mini": 200_000,
+    "o3-pro": 200_000,
     "o4-mini": 200_000,
-    "gpt-4.1": 1_047_576,
-    "gpt-4.1-mini": 1_047_576,
-    "gpt-4.1-nano": 1_047_576,
-    "gpt-5": 1_047_576,
+    // Legacy
+    "gpt-4-turbo": 128_000,
+    "gpt-4": 8_192,
+    "gpt-3.5-turbo": 16_385,
   },
   "google-ai": {
     _default: 1_048_576,
+    // Gemini 3.1 Series (all require -preview suffix)
+    "gemini-3.1-pro-preview": 1_048_576,
+    "gemini-3.1-flash-lite-preview": 1_048_576,
+    "gemini-3.1-flash-image-preview": 1_048_576,
+    "gemini-3.1-pro-preview-customtools": 1_048_576,
+    // Gemini 3 Series
+    "gemini-3-flash-preview": 1_048_576,
+    "gemini-3-pro-image-preview": 65_536,
+    /** @deprecated SHUT DOWN March 9, 2026. Migrate to gemini-3.1-pro-preview. */
+    "gemini-3-pro-preview": 1_048_576,
     "gemini-2.5-pro": 1_048_576,
     "gemini-2.5-flash": 1_048_576,
+    "gemini-2.5-flash-lite": 1_048_576,
+    "gemini-2.5-flash-image": 32_768,
     "gemini-2.0-flash": 1_048_576,
     "gemini-1.5-pro": 2_097_152,
     "gemini-1.5-flash": 1_048_576,
-    "gemini-3-flash-preview": 1_048_576,
-    "gemini-3-pro-preview": 1_048_576,
   },
   vertex: {
     _default: 1_048_576,
+    // Claude on Vertex
+    "claude-sonnet-5": 1_000_000,
+    "claude-opus-4-6": 1_000_000,
+    "claude-sonnet-4-6": 1_000_000,
+    "claude-sonnet-4-5": 200_000,
+    "claude-opus-4-5": 200_000,
+    "claude-haiku-4-5": 200_000,
+    "claude-sonnet-4": 200_000,
+    "claude-sonnet-4-20250514": 200_000,
+    "claude-opus-4-20250514": 200_000,
+    "claude-opus-4": 200_000,
+    // Catch-all for UNKNOWN Claude models on Vertex (prefix match runs after
+    // the specific keys above). Without this, an unlisted Claude model falls
+    // to the Gemini-shaped _default (1,048,576) — ABOVE Anthropic's real 1M
+    // API cap — so the pre-dispatch budget check and the in-loop context
+    // guard both under-guard it (the claude-sonnet-5 1,005,647-token 400s).
+    // 200K is the conservative Anthropic floor; list real models explicitly.
+    "claude-": 200_000,
+    // Gemini 3.1 on Vertex (all require -preview suffix)
+    "gemini-3.1-pro-preview": 1_048_576,
+    "gemini-3.1-flash-lite-preview": 1_048_576,
+    "gemini-3.1-flash-image-preview": 1_048_576,
+    "gemini-3.1-pro-preview-customtools": 1_048_576,
+    // Gemini 3 on Vertex
+    "gemini-3-flash-preview": 1_048_576,
+    "gemini-3-pro-image-preview": 65_536,
+    /** @deprecated SHUT DOWN March 9, 2026. Migrate to gemini-3.1-pro-preview. */
+    "gemini-3-pro-preview": 1_048_576,
+    // Gemini 2.x on Vertex
     "gemini-2.5-pro": 1_048_576,
     "gemini-2.5-flash": 1_048_576,
     "gemini-2.0-flash": 1_048_576,
     "gemini-1.5-pro": 2_097_152,
     "gemini-1.5-flash": 1_048_576,
-    "claude-sonnet-4-5": 200_000,
-    "claude-sonnet-4-20250514": 200_000,
-    "claude-opus-4": 200_000,
-    "claude-opus-4-20250514": 200_000,
   },
   bedrock: {
     _default: 200_000,
-    "anthropic.claude-3-5-sonnet-20241022-v2:0": 200_000,
+    // Claude 4.6
+    "anthropic.claude-opus-4-6-v1:0": 1_000_000,
+    "anthropic.claude-sonnet-4-6": 1_000_000,
+    // Claude 4.5
+    "anthropic.claude-opus-4-5-20251124-v1:0": 200_000,
+    "anthropic.claude-sonnet-4-5-20250929-v1:0": 200_000,
+    "anthropic.claude-haiku-4-5-20251001-v1:0": 200_000,
+    // Claude legacy
+    "anthropic.claude-3-5-sonnet-20241022-v1:0": 200_000,
     "anthropic.claude-3-5-haiku-20241022-v1:0": 200_000,
     "anthropic.claude-3-opus-20240229-v1:0": 200_000,
     "anthropic.claude-3-sonnet-20240229-v1:0": 200_000,
     "anthropic.claude-3-haiku-20240307-v1:0": 200_000,
+    // Amazon Nova
     "amazon.nova-pro-v1:0": 300_000,
     "amazon.nova-lite-v1:0": 300_000,
+    "amazon.nova-2-lite-v1:0": 1_000_000,
+    // Writer
+    "writer.palmyra-x5-v1:0": 1_000_000,
+    "writer.palmyra-x4-v1:0": 128_000,
+    // NVIDIA
+    "nvidia.nemotron-nano-3-30b": 256_000,
   },
   azure: {
     _default: 128_000,
+    // GPT-5.4
+    "gpt-5.4": 1_050_000,
+    "gpt-5.4-mini": 400_000,
+    "gpt-5.4-nano": 400_000,
+    "gpt-5.4-pro": 1_050_000,
+    // GPT-5.x
+    "gpt-5.2": 400_000,
+    "gpt-5.2-pro": 400_000,
+    "gpt-5.2-codex": 400_000,
+    "gpt-5.1": 400_000,
+    "gpt-5": 400_000,
+    "gpt-5-mini": 400_000,
+    // GPT-4.1
+    "gpt-4.1": 1_047_576,
+    "gpt-4.1-mini": 1_047_576,
+    // GPT-4o
     "gpt-4o": 128_000,
     "gpt-4o-mini": 128_000,
+    // O-series
+    o3: 200_000,
+    "o3-mini": 200_000,
+    "o4-mini": 200_000,
+    // Legacy
     "gpt-4-turbo": 128_000,
     "gpt-4": 8_192,
   },
   mistral: {
     _default: 128_000,
-    "mistral-large-latest": 128_000,
-    "mistral-medium-latest": 32_000,
+    "mistral-large-latest": 256_000,
+    "mistral-large-2512": 256_000,
+    "mistral-medium-latest": 128_000,
     "mistral-small-latest": 128_000,
     "codestral-latest": 256_000,
+    "codestral-2508": 256_000,
+    "devstral-2512": 256_000,
+    "devstral-small-2512": 256_000,
+    "magistral-medium-latest": 128_000,
+    "mistral-small-2603": 256_000,
   },
   ollama: {
     _default: 128_000,
@@ -114,8 +361,144 @@ export const MODEL_CONTEXT_WINDOWS: Record<string, Record<string, number>> = {
   },
   sagemaker: {
     _default: 128_000,
+    // NVIDIA Nemotron 3 Nano (February 2026) — 1M context
+    "nvidia-nemotron-3-nano-30b": 1_000_000,
+    // Qwen3 VL — 32K context
+    "qwen3-vl-8b-instruct": 32_768,
   },
 };
+
+/**
+ * Map of provider aliases to canonical MODEL_CONTEXT_WINDOWS keys.
+ *
+ * Callers reach `getContextWindowSize` via the unnormalized form on
+ * `options.provider` (e.g. CLI `--provider lmstudio`, alias `llama.cpp`),
+ * and `ProviderFactory.normalizeProviderName` runs only at instantiation —
+ * its output never reaches budget calculations. Without this normalization
+ * those alias forms miss the table and fall back to `DEFAULT_CONTEXT_WINDOW`,
+ * understating the budget for LM Studio / llama.cpp / NVIDIA NIM.
+ *
+ * The keys here are the result of stripping non-alpha characters, so
+ * `lm-studio` -> `lmstudio`, `nvidia-nim` -> `nvidianim`, `llama.cpp` -> `llamacpp`.
+ */
+const PROVIDER_ALIAS_MAP: Record<string, string> = {
+  googleaistudio: "google-ai-studio",
+  lmstudio: "lm-studio",
+  llamacpp: "llamacpp",
+  nvidianim: "nvidia-nim",
+  nim: "nvidia-nim",
+  nvidia: "nvidia-nim",
+  deepseek: "deepseek",
+};
+
+function normalizeProviderForLookup(provider: string): string {
+  const stripped = provider.toLowerCase().replace(/[^a-z]/g, "");
+  // On alias miss, return the *stripped* key — not the raw input — so case /
+  // separator variants ("OpenAI", "open-ai", "Vertex AI") still find their
+  // table entry under the lowercase canonical key instead of falling through
+  // to DEFAULT_CONTEXT_WINDOW.
+  return PROVIDER_ALIAS_MAP[stripped] ?? stripped;
+}
+
+/**
+ * Runtime-discovered context windows, keyed `${provider}:${model}`.
+ *
+ * Populated asynchronously by providers that can discover real per-model
+ * limits at runtime (e.g. the LiteLLM provider reads `max_input_tokens` from
+ * the proxy's `/model/info`), and read synchronously by
+ * {@link getContextWindowSize} — the same async-populate/sync-read contract as
+ * the DynamicModelProvider registry. Keys use the RAW provider string callers
+ * pass into budget calculations (see the alias-map comment above: normalized
+ * provider names never reach these lookups).
+ */
+const RUNTIME_CONTEXT_WINDOWS = new Map<string, number>();
+
+/**
+ * Register a runtime-discovered context window for a provider/model pair.
+ * Later registrations overwrite earlier ones (rediscovery refreshes values).
+ * Non-positive/non-finite windows are ignored so a malformed discovery source
+ * can never shrink a budget to zero.
+ */
+export function registerRuntimeContextWindow(
+  provider: string,
+  model: string,
+  contextWindow: number,
+): void {
+  if (!Number.isFinite(contextWindow) || contextWindow <= 0) {
+    return;
+  }
+  RUNTIME_CONTEXT_WINDOWS.set(`${provider}:${model}`, contextWindow);
+}
+
+/** Test hook: clear runtime-discovered windows (state is module-global). */
+export function clearRuntimeContextWindows(): void {
+  RUNTIME_CONTEXT_WINDOWS.clear();
+}
+
+/**
+ * Runtime-discovered window for an exact provider/model pair, or undefined.
+ *
+ * Unlike {@link getContextWindowSize} this NEVER falls back to static table
+ * values. Callers use it to distinguish "the serving infrastructure told us
+ * the real window" (safe to hard-enforce: clamp max_tokens, fail fast) from
+ * "static guess" (advisory only — hard-enforcing a guessed window would
+ * falsely reject requests that the real deployment accepts).
+ */
+export function getRuntimeContextWindow(
+  provider: string,
+  model?: string,
+): number | undefined {
+  if (!model) {
+    return undefined;
+  }
+  return RUNTIME_CONTEXT_WINDOWS.get(`${provider}:${model}`);
+}
+
+/**
+ * Runtime-discovered output-token ceilings, keyed `${provider}:${model}` —
+ * the `max_output_tokens` the serving infrastructure advertises for a model
+ * (e.g. LiteLLM `/model/info`). Same async-populate/sync-read contract as
+ * {@link registerRuntimeContextWindow}. Consumed by `getSafeMaxTokens` so
+ * requested maxTokens is clamped to the deployed model's real cap instead of
+ * a static per-provider table value.
+ */
+const RUNTIME_OUTPUT_CEILINGS = new Map<string, number>();
+
+/**
+ * Register a runtime-discovered output-token ceiling for a provider/model
+ * pair. Later registrations overwrite earlier ones (rediscovery refreshes
+ * values). Non-positive/non-finite ceilings are ignored so a malformed
+ * discovery source can never shrink an output budget to zero.
+ */
+export function registerRuntimeOutputCeiling(
+  provider: string,
+  model: string,
+  maxOutputTokens: number,
+): void {
+  if (!Number.isFinite(maxOutputTokens) || maxOutputTokens <= 0) {
+    return;
+  }
+  RUNTIME_OUTPUT_CEILINGS.set(`${provider}:${model}`, maxOutputTokens);
+}
+
+/**
+ * Runtime-discovered output ceiling for an exact provider/model pair, or
+ * undefined when the serving infrastructure has not advertised one.
+ */
+export function getRuntimeOutputCeiling(
+  provider: string,
+  model?: string,
+): number | undefined {
+  if (!model) {
+    return undefined;
+  }
+  return RUNTIME_OUTPUT_CEILINGS.get(`${provider}:${model}`);
+}
+
+/** Test hook: clear runtime-discovered output ceilings (state is module-global). */
+export function clearRuntimeOutputCeilings(): void {
+  RUNTIME_OUTPUT_CEILINGS.clear();
+}
 
 /**
  * Resolve context window size for a provider/model combination.
@@ -123,6 +506,9 @@ export const MODEL_CONTEXT_WINDOWS: Record<string, Record<string, number>> = {
  * Priority:
  *  0. Dynamic model registry (DynamicModelProvider) — resolves cross-provider
  *     models (e.g. Claude on Vertex) that the static table cannot handle
+ *  0.5 Runtime-discovered windows (registerRuntimeContextWindow) — real
+ *      per-model limits fetched from the serving infrastructure (LiteLLM
+ *      `/model/info`)
  *  1. Exact model match under provider in static registry
  *  2. Prefix match under provider in static registry
  *  3. Provider's _default in static registry
@@ -148,8 +534,19 @@ export function getContextWindowSize(provider: string, model?: string): number {
     }
   }
 
-  // Static fallback chain
-  const providerWindows = MODEL_CONTEXT_WINDOWS[provider];
+  // Step 0.5: Runtime-discovered window for this exact provider/model.
+  if (model) {
+    const discovered = RUNTIME_CONTEXT_WINDOWS.get(`${provider}:${model}`);
+    if (discovered !== undefined) {
+      return discovered;
+    }
+  }
+
+  // Static fallback chain — normalize aliases first so "lmstudio" / "llama.cpp" /
+  // "nvidianim" find their canonical entries instead of falling back to default.
+  const canonical = normalizeProviderForLookup(provider);
+  const providerWindows =
+    MODEL_CONTEXT_WINDOWS[canonical] ?? MODEL_CONTEXT_WINDOWS[provider];
   if (!providerWindows) {
     return DEFAULT_CONTEXT_WINDOW;
   }
@@ -170,9 +567,13 @@ export function getContextWindowSize(provider: string, model?: string): number {
 /**
  * Calculate output token reserve for a given context window.
  *
+ * Returns the *real* token count that will be reserved for output so callers
+ * (`getAvailableInputTokens`, `BudgetChecker`, conversation-memory pruning, file
+ * summarisation) compute input budget against the actual outgoing maxTokens.
+ *
  * @param contextWindow - Total context window size
  * @param maxTokens - Explicit maxTokens from user config (if set)
- * @returns Number of tokens reserved for output
+ * @returns Number of tokens reserved for output (matches what's sent upstream)
  */
 export function getOutputReserve(
   contextWindow: number,

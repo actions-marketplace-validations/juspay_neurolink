@@ -17,10 +17,9 @@ import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import { estimatePostProcessingTokens } from "../context/fileTokenBudget.js";
-import type { FileSource, FileType } from "../types/fileTypes.js";
-import { logger } from "../utils/logger.js";
-import { StreamingReader } from "./streamingReader.js";
 import type {
+  FileSource,
+  FileType,
   FileExtractionParams,
   FileExtractionResult,
   FileReadResult,
@@ -29,8 +28,15 @@ import type {
   FileRegistryOptions,
   FileSearchResult,
   SizeTier,
-} from "./types.js";
-import { SIZE_TIER_THRESHOLDS } from "./types.js";
+} from "../types/index.js";
+import { logger } from "../utils/logger.js";
+import {
+  mimeHintToExtension,
+  mimeHintToFileType,
+  normalizeMimeHint,
+} from "../utils/mimeTypeHints.js";
+import { StreamingReader } from "./streamingReader.js";
+import { SIZE_TIER_THRESHOLDS } from "../types/index.js";
 
 /** Default maximum files in registry before LRU eviction */
 const DEFAULT_MAX_FILES = 100;
@@ -116,20 +122,35 @@ export class FileReferenceRegistry {
       );
     }
 
+    // Normalize the caller-provided mimetype hint — shared helper drops
+    // `application/octet-stream` because that opaque sentinel would
+    // otherwise be trusted verbatim for the output mimeType and mask a
+    // better magic-byte-derived classification (e.g. PNG bytes hinted as
+    // octet-stream would record mimeType=octet-stream, not image/png).
+    const hintMime = normalizeMimeHint(options.mimetype);
+    const hintExt = hintMime ? mimeHintToExtension(hintMime) : "";
+
     // Detect file type from magic bytes and extension.
-    // If the provided filename has no extension, append one guessed from magic bytes
-    // so downstream processors (e.g., VideoProcessor) can validate by extension.
-    let filename =
-      options.filename || `file-${Date.now()}${this.guessExtension(buffer)}`;
-    if (!extname(filename)) {
-      const guessedExt = this.guessExtension(buffer);
-      if (guessedExt) {
-        filename = `${filename}${guessedExt}`;
-      }
+    // If the provided filename has no extension, append one guessed from the
+    // mimetype hint first (more reliable for text formats than magic bytes),
+    // then fall back to magic bytes — so downstream processors (e.g.,
+    // VideoProcessor) can validate by extension. Compute once, reuse.
+    const synthDefaultExt = hintExt
+      ? `.${hintExt}`
+      : this.guessExtension(buffer);
+    let filename = options.filename || `file-${Date.now()}${synthDefaultExt}`;
+    if (!extname(filename) && synthDefaultExt) {
+      filename = `${filename}${synthDefaultExt}`;
     }
     const ext = extname(filename).toLowerCase().replace(".", "");
-    const detectedType = options.fileType || this.detectType(buffer, ext);
-    const mimeType = this.guessMimeType(detectedType, ext);
+    const detectedType =
+      options.fileType ||
+      (hintMime && mimeHintToFileType(hintMime)) ||
+      this.detectType(buffer, ext);
+    // Prefer the caller's hint verbatim for the output mimeType, but only
+    // when normalizeMimeHint accepted it (i.e. it is not the opaque
+    // octet-stream sentinel). Otherwise derive from the detected type.
+    const mimeType = hintMime || this.guessMimeType(detectedType, ext);
     const sizeTier = FileReferenceRegistry.classifySizeTier(sizeBytes);
 
     // Generate preview (fast — only reads first N chars)
@@ -425,9 +446,8 @@ export class FileReferenceRegistry {
     ref: FileReference,
     params: FileExtractionParams,
   ): Promise<FileExtractionResult> {
-    const { videoProcessor } = await import(
-      "../processors/media/VideoProcessor.js"
-    );
+    const { videoProcessor } =
+      await import("../processors/media/VideoProcessor.js");
 
     // If time range specified, extract frames from that range
     if (params.start_time !== undefined && params.end_time !== undefined) {
@@ -539,9 +559,8 @@ export class FileReferenceRegistry {
     ref: FileReference,
     params: FileExtractionParams,
   ): Promise<FileExtractionResult> {
-    const { excelProcessor } = await import(
-      "../processors/document/ExcelProcessor.js"
-    );
+    const { excelProcessor } =
+      await import("../processors/document/ExcelProcessor.js");
 
     const text = await excelProcessor.extractSheetRange(
       buffer,
@@ -577,9 +596,8 @@ export class FileReferenceRegistry {
         : undefined);
 
     if (pages && pages.length > 0) {
-      const { PptxProcessor } = await import(
-        "../processors/document/PptxProcessor.js"
-      );
+      const { PptxProcessor } =
+        await import("../processors/document/PptxProcessor.js");
       const text = await PptxProcessor.extractSlides(buffer, pages);
       return {
         success: true,
@@ -604,9 +622,8 @@ export class FileReferenceRegistry {
     params: FileExtractionParams,
   ): Promise<FileExtractionResult> {
     if (params.entry_path) {
-      const { archiveProcessor } = await import(
-        "../processors/archive/ArchiveProcessor.js"
-      );
+      const { archiveProcessor } =
+        await import("../processors/archive/ArchiveProcessor.js");
       const text = await archiveProcessor.extractEntry(
         buffer,
         params.entry_path,
@@ -1188,9 +1205,8 @@ export class FileReferenceRegistry {
     ref: FileReference,
   ): Promise<string | null> {
     try {
-      const { processExcel } = await import(
-        "../processors/document/ExcelProcessor.js"
-      );
+      const { processExcel } =
+        await import("../processors/document/ExcelProcessor.js");
       const result = await processExcel({
         id: ref.id,
         name: ref.filename,
@@ -1236,9 +1252,8 @@ export class FileReferenceRegistry {
     ref: FileReference,
   ): Promise<string | null> {
     try {
-      const { processWord } = await import(
-        "../processors/document/WordProcessor.js"
-      );
+      const { processWord } =
+        await import("../processors/document/WordProcessor.js");
       const result = await processWord({
         id: ref.id,
         name: ref.filename,
@@ -1263,9 +1278,8 @@ export class FileReferenceRegistry {
    */
   private async extractPptxText(buffer: Buffer): Promise<string | null> {
     try {
-      const { PptxProcessor } = await import(
-        "../processors/document/PptxProcessor.js"
-      );
+      const { PptxProcessor } =
+        await import("../processors/document/PptxProcessor.js");
       return await PptxProcessor.extractText(buffer);
     } catch (err) {
       logger.warn(
@@ -1283,9 +1297,8 @@ export class FileReferenceRegistry {
     ref: FileReference,
   ): Promise<string | null> {
     try {
-      const { processVideo } = await import(
-        "../processors/media/VideoProcessor.js"
-      );
+      const { processVideo } =
+        await import("../processors/media/VideoProcessor.js");
       const result = await processVideo({
         id: ref.id,
         name: ref.filename,
@@ -1325,9 +1338,8 @@ export class FileReferenceRegistry {
     ref: FileReference,
   ): Promise<string | null> {
     try {
-      const { processAudio } = await import(
-        "../processors/media/AudioProcessor.js"
-      );
+      const { processAudio } =
+        await import("../processors/media/AudioProcessor.js");
       const result = await processAudio({
         id: ref.id,
         name: ref.filename,
@@ -1358,9 +1370,8 @@ export class FileReferenceRegistry {
     ref: FileReference,
   ): Promise<string | null> {
     try {
-      const { processArchive } = await import(
-        "../processors/archive/ArchiveProcessor.js"
-      );
+      const { processArchive } =
+        await import("../processors/archive/ArchiveProcessor.js");
       const result = await processArchive({
         id: ref.id,
         name: ref.filename,

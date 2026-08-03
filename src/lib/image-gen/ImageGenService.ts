@@ -31,15 +31,13 @@ import type {
   ImageGenConfig,
   ImageGenOptions,
   ImageGenResult,
-} from "./types.js";
-import { DEFAULT_IMAGE_GEN_CONFIG } from "./types.js";
+  NeuroLinkInstance,
+} from "../types/index.js";
+import { DEFAULT_IMAGE_GEN_CONFIG } from "../types/index.js";
 
 /**
  * NeuroLink instance type (avoiding circular dependencies)
  */
-type NeuroLinkInstance = {
-  generate: (options: Record<string, unknown>) => Promise<unknown>;
-};
 
 /**
  * Image generation service for AI-powered image creation
@@ -98,7 +96,7 @@ export class ImageGenService {
       this.neurolinkInstance = new NeuroLink({
         conversationMemory: { enabled: false },
         enableOrchestration: false,
-      }) as unknown as NeuroLinkInstance;
+      }) as NeuroLinkInstance;
     }
     return this.neurolinkInstance;
   }

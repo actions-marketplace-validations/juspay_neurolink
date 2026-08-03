@@ -33,9 +33,38 @@
  * - Current time (ISO): `new Date().toISOString()`
  */
 
-import type { Mem0Config } from "../memory/mem0Initializer.js";
-import type { Memory } from "../memory/hippocampusInitializer.js";
-export type { Memory };
+import type { HippocampusMemory, HippocampusStorageConfig } from "./memory.js";
+import type { ObservabilityConfig } from "./observability.js";
+
+// Message and content primitives. Today these resolve through the upstream
+// generation library; the layout is stable enough for consumers to import
+// from the package barrel without caring about the source module.
+export type {
+  ModelMessage,
+  SystemModelMessage,
+  UserModelMessage,
+  AssistantModelMessage,
+  ToolModelMessage,
+  TextPart,
+  ImagePart,
+  FilePart,
+  ToolCallPart,
+  ToolResultPart,
+  AssistantContent,
+  UserContent,
+  ToolContent,
+  DataContent,
+} from "ai";
+
+/**
+ * Legacy public alias for the Hippocampus storage configuration.
+ * The structural definition lives in `./memory.ts`; this re-export keeps
+ * the SDK surface stable for callers who imported `StorageConfig` from
+ * the package barrel. Defined as a `type` alias rather than a re-export
+ * so the canonical `HippocampusStorageConfig` name is the one ESLint
+ * uniqueness checks see.
+ */
+export type StorageConfig = HippocampusStorageConfig;
 
 /**
  * Configuration for conversation memory feature
@@ -59,14 +88,8 @@ export type ConversationMemoryConfig = {
   /** Model to use for summarization */
   summarizationModel?: string;
 
-  /** Enable mem0 integration for conversation memory */
-  mem0Enabled?: boolean;
-
-  /** Configuration for mem0 cloud API integration */
-  mem0Config?: Mem0Config;
-
   /** Memory SDK config (condensed key-value memory per user). Set enabled: true to activate. */
-  memory?: Memory;
+  memory?: HippocampusMemory;
 
   /** Redis configuration (optional) - overrides environment variables */
   redisConfig?: RedisStorageConfig;
@@ -264,6 +287,8 @@ export type ChatMessageMetadata = {
   thoughtHash?: string;
   /** Whether extended thinking was used for this message */
   thinkingExpanded?: boolean;
+  /** Step index for reconstructing parallel vs sequential tool calls */
+  stepIndex?: number;
 
   // --- Tool output management (SDK-2) ---
 
@@ -276,6 +301,30 @@ export type ChatMessageMetadata = {
   toolOutputPreview?: string;
   /** Original byte size of the full tool output before any truncation */
   originalSize?: number;
+  /**
+   * Artifact store ID for an externalized MCP tool output.
+   * Set when `mcp.outputLimits.strategy = "externalize"` and the tool output
+   * exceeded `maxBytes`. Use retrieve_context with this ID to fetch the full
+   * payload from the local artifact store.
+   */
+  artifactId?: string;
+
+  // --- Skill activation pinning (skills v2) ---
+
+  /**
+   * Marks a pinned skill-activation message: the full instructions of a
+   * skill loaded via use_skill, persisted into session history so later
+   * turns replay it verbatim instead of re-fetching the skill. Pinned
+   * skill messages are protected from sliding-window truncation and are
+   * re-included after memory summarization.
+   */
+  isSkill?: boolean;
+  /** Skill id of a pinned skill-activation message. */
+  skillId?: string;
+  /** Skill name of a pinned skill-activation message. */
+  skillName?: string;
+  /** Skill version captured at activation (sessions pin the activated version). */
+  skillVersion?: number;
 };
 
 /**
@@ -404,7 +453,7 @@ export type NeurolinkOptions = {
   sessionId?: string;
 
   /** Observability configuration */
-  observability?: import("./observability.js").ObservabilityConfig;
+  observability?: ObservabilityConfig;
 };
 
 /**
@@ -437,6 +486,21 @@ export type StoreConversationTurnOptions = {
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
   };
+  /** Gemini 3 thought signature for reasoning continuity across turns */
+  thoughtSignature?: string;
+  /**
+   * Pinned skill-activation messages (skills v2) recorded during this turn.
+   * Inserted between the user and assistant messages so replayed history
+   * mirrors the actual order: ask → skill loaded → answer. Stored verbatim —
+   * skill instructions are never truncated.
+   *
+   * Invariant for history consumers: a skill-bearing turn is a
+   * user → skill(user-role, metadata.isSkill) → assistant triplet, so
+   * stored history is NOT strictly pair-wise alternating. Pair-based
+   * logic must filter `metadata.isSkill` first (see slidingWindowTruncator
+   * for the canonical partition-and-reanchor pattern).
+   */
+  skillMessages?: ChatMessage[];
 };
 
 /**
@@ -448,6 +512,87 @@ export type SessionMetadata = {
   title: string;
   createdAt: string;
   updatedAt: string;
+  /** Additional metadata including agentic loop reports */
+  metadata?: {
+    agenticLoopReports?: AgenticLoopReportMetadata[];
+  };
+};
+
+/**
+ * Report type for agentic loop reports
+ * Identifies the platform or category of the report
+ */
+export type AgenticLoopReportType =
+  | "META"
+  | "GOOGLEADS"
+  | "GOOGLEGA4"
+  | "SHOPIFY"
+  | "BREEZE"
+  | "OTHER";
+
+/**
+ * Status of an agentic loop report
+ */
+export type AgenticLoopReportStatus =
+  | "INPROGRESS"
+  | "COMPLETED"
+  | "CANCELLED"
+  | "FAILED";
+
+/**
+ * Metadata for an individual agentic loop report
+ * A conversation session can have multiple reports tracked via this type
+ */
+export type AgenticLoopReportMetadata = {
+  /** Unique identifier for this report */
+  reportId: string;
+  /** Platform/category of the report */
+  reportType: AgenticLoopReportType;
+  /** Current status of the report */
+  reportStatus: AgenticLoopReportStatus;
+  /** Optional audit period date range for the report */
+  auditPeriod?: {
+    startDate: string;
+    endDate: string;
+  };
+};
+
+/**
+ * Session list item for CLI/API listing
+ * Extends SessionMetadata with additional display information
+ */
+export type SessionListItem = SessionMetadata & {
+  /** User identifier associated with this session */
+  userId?: string;
+  /** Total number of messages in this session */
+  messageCount: number;
+  /** Human-readable time since last activity (e.g., "2 hours ago") */
+  lastActive?: string;
+};
+
+/**
+ * Complete session export format for backup/analytics
+ * Contains full session data including all messages
+ */
+export type SessionExport = {
+  /** Session identifier */
+  sessionId: string;
+  /** Session title/description */
+  title?: string;
+  /** User identifier */
+  userId?: string;
+  /** When session was created (ISO 8601) */
+  createdAt: string;
+  /** When session was last updated (ISO 8601) */
+  updatedAt: string;
+  /** Complete message history */
+  messages: ChatMessage[];
+  /** Export metadata */
+  exportMetadata?: {
+    exportedAt: string;
+    exportFormat: "json" | "csv";
+    neuroLinkVersion?: string;
+  };
 };
 
 /**
@@ -495,6 +640,14 @@ export type ConversationBase = {
     totalTokens?: number;
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
+  };
+
+  /** Additional metadata for extensible conversation-level data */
+  additionalMetadata?: {
+    /** Agentic loop reports associated with this conversation */
+    agenticLoopReports?: AgenticLoopReportMetadata[];
+    /** Allow future extensibility */
+    [key: string]: unknown;
   };
 };
 
@@ -551,6 +704,12 @@ export type ConversationSummary = ConversationBase & {
  * Redis storage configuration
  */
 export type RedisStorageConfig = {
+  /** Redis connection URL (e.g., 'rediss://host:6379' for TLS) */
+  url?: string;
+
+  /** Redis username for ACL authentication (optional) */
+  username?: string;
+
   /** Redis host (default: 'localhost') */
   host?: string;
 
@@ -585,4 +744,21 @@ export type RedisStorageConfig = {
 export type ProviderDetails = {
   provider: string;
   model: string;
+};
+
+/**
+ * Reduced ChatMessage shape used by callers (typically tests and history
+ * reconstructors) that pass synthetic entries into the Gemini history
+ * reconstructor without filling every `ChatMessage` field. Mirrors the
+ * fields actually read by `prependConversationMessages`.
+ */
+export type MinimalChatMessage = {
+  role: ChatMessage["role"];
+  content: string;
+  tool?: string;
+  args?: Record<string, unknown>;
+  metadata?: {
+    stepIndex?: number;
+    thoughtSignature?: string;
+  };
 };

@@ -3,8 +3,13 @@
  * Generates OpenAPI documentation from NeuroLink server routes
  */
 
-import type { JsonObject } from "../../types/common.js";
-import type { RouteDefinition, ServerAdapterConfig } from "../types.js";
+import type {
+  JsonObject,
+  OpenAPIGeneratorConfig,
+  OpenAPISpec,
+  RouteDefinition,
+  ServerAdapterConfig,
+} from "../../types/index.js";
 import { OpenAPISchemas } from "./schemas.js";
 import {
   CommonParameters,
@@ -20,57 +25,6 @@ import {
   BearerSecurityScheme,
   ApiKeySecurityScheme,
 } from "./templates.js";
-
-// ============================================
-// Types
-// ============================================
-
-/**
- * OpenAPI generator configuration
- */
-export type OpenAPIGeneratorConfig = {
-  /** API info override */
-  info?: {
-    title?: string;
-    version?: string;
-    description?: string;
-  };
-  /** Server configuration */
-  servers?: Array<{
-    url: string;
-    description?: string;
-  }>;
-  /** Include security schemes */
-  includeSecurity?: boolean;
-  /** Base path for all routes */
-  basePath?: string;
-  /** Additional tags */
-  additionalTags?: Array<{
-    name: string;
-    description: string;
-  }>;
-  /** Custom schemas to add */
-  customSchemas?: Record<string, JsonObject>;
-  /** Routes to document in the OpenAPI spec */
-  routes?: RouteDefinition[];
-};
-
-/**
- * Generated OpenAPI specification
- */
-export type OpenAPISpec = {
-  openapi: "3.1.0";
-  info: JsonObject;
-  servers: JsonObject[];
-  tags: JsonObject[];
-  paths: Record<string, JsonObject>;
-  components: {
-    schemas: Record<string, JsonObject>;
-    securitySchemes?: Record<string, JsonObject>;
-    parameters?: Record<string, JsonObject>;
-  };
-  security?: JsonObject[];
-};
 
 // ============================================
 // OpenAPI Generator Class

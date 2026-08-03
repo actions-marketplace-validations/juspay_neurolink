@@ -11,68 +11,19 @@ import path from "path";
 import { logger } from "../../lib/utils/logger.js";
 import { NeuroLink } from "../../lib/neurolink.js";
 import { withTimeout } from "../../lib/utils/errorHandling.js";
-import type { ServerFramework } from "../../lib/server/types.js";
 import {
   isProcessRunning,
   formatUptime,
   ensureStateDir,
   getNeuroLinkDir,
 } from "../utils/serverUtils.js";
-
-// ============================================
-// Types
-// ============================================
-
-/**
- * Server command arguments
- */
-type ServerCommandArgs = {
-  port?: number;
-  host?: string;
-  framework?: "hono" | "express" | "fastify" | "koa";
-  basePath?: string;
-  cors?: boolean;
-  rateLimit?: boolean;
-  quiet?: boolean;
-  format?: "text" | "json" | "yaml";
-  output?: string;
-  debug?: boolean;
-};
-
-/**
- * Server status stored in state file
- */
-type ServerState = {
-  pid: number;
-  port: number;
-  host: string;
-  framework: ServerFramework;
-  startTime: string;
-  basePath: string;
-};
-
-/**
- * Server configuration stored in config file
- */
-type ServerConfig = {
-  defaultPort: number;
-  defaultHost: string;
-  defaultFramework: "hono" | "express" | "fastify" | "koa";
-  defaultBasePath: string;
-  cors: {
-    enabled: boolean;
-    origins?: string[];
-  };
-  rateLimit: {
-    enabled: boolean;
-    windowMs?: number;
-    maxRequests?: number;
-  };
-  swagger: {
-    enabled: boolean;
-    path?: string;
-  };
-};
+import type {
+  CliServeFlatRoute,
+  CliServeRouteGroup,
+  ServerCommandArgs,
+  ServerConfig,
+  ServerState,
+} from "../../lib/types/index.js";
 
 // ============================================
 // State Management
@@ -501,9 +452,8 @@ export class ServerCommandFactory {
       const neurolink = new NeuroLink();
 
       // Dynamically import server module
-      const { createServer, registerAllRoutes } = await import(
-        "../../lib/server/index.js"
-      );
+      const { createServer, registerAllRoutes } =
+        await import("../../lib/server/index.js");
 
       const framework = (argv.framework ?? "hono") as
         | "hono"
@@ -801,9 +751,8 @@ export class ServerCommandFactory {
 
     try {
       // Dynamically import OpenAPI generator
-      const { OpenAPIGenerator } = await import(
-        "../../lib/server/openapi/index.js"
-      );
+      const { OpenAPIGenerator } =
+        await import("../../lib/server/openapi/index.js");
 
       const generator = new OpenAPIGenerator({
         basePath: argv.basePath ?? "/api",
@@ -872,32 +821,15 @@ export class ServerCommandFactory {
   ): Promise<void> {
     try {
       // Dynamically import route definitions and types
-      const { createAllRoutes } = await import(
-        "../../lib/server/routes/index.js"
-      );
-
-      type RouteGroup = {
-        prefix: string;
-        routes: Array<{
-          method: string;
-          path: string;
-          description?: string;
-        }>;
-      };
-
-      type FlatRoute = {
-        method: string;
-        path: string;
-        description?: string;
-        group: string;
-      };
+      const { createAllRoutes } =
+        await import("../../lib/server/routes/index.js");
 
       const routeGroups = createAllRoutes(
         argv.basePath ?? "/api",
-      ) as RouteGroup[];
+      ) as CliServeRouteGroup[];
 
       // Flatten route groups into individual routes with group info
-      let flatRoutes: FlatRoute[] = [];
+      let flatRoutes: CliServeFlatRoute[] = [];
       for (const group of routeGroups) {
         // Extract group name from prefix (e.g., "/api/agent" -> "agent")
         const groupName =
@@ -988,10 +920,7 @@ export class ServerCommandFactory {
 
       // Handle --get
       if (argv.get) {
-        const value = getNestedValue(
-          config as unknown as Record<string, unknown>,
-          argv.get,
-        );
+        const value = getNestedValue(config, argv.get);
         if (value === undefined) {
           logger.error(chalk.red(`Unknown config key: ${argv.get}`));
           process.exit(1);
@@ -1013,11 +942,7 @@ export class ServerCommandFactory {
           process.exit(1);
         }
 
-        setNestedValue(
-          config as unknown as Record<string, unknown>,
-          key,
-          parseConfigValue(value),
-        );
+        setNestedValue(config, key, parseConfigValue(value));
         saveServerConfig(config);
         logger.always(chalk.green(`Set ${key} = ${value}`));
         return;

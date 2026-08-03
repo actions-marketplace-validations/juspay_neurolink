@@ -6,10 +6,8 @@
  * vector queries, and LLM-based extraction.
  */
 
-import {
-  type RetryOptions as _RetryOptions,
-  withRetry,
-} from "../../core/infrastructure/index.js";
+import { withRetry } from "../../core/infrastructure/index.js";
+import type { RAGRetryConfig } from "../../types/index.js";
 import { isAbortError } from "../../utils/errorHandling.js";
 import { logger } from "../../utils/logger.js";
 import {
@@ -20,10 +18,6 @@ import {
   RAGErrorCodes,
   VectorQueryError,
 } from "../errors/RAGError.js";
-
-import type { RAGRetryConfig } from "../../types/ragTypes.js";
-
-export type { RAGRetryConfig } from "../../types/ragTypes.js";
 
 /**
  * Default retry configuration

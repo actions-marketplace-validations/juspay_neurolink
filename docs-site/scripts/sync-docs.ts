@@ -77,8 +77,8 @@ const FILE_MAPPINGS: Record<string, string> = {
   // Memory docs -> memory/
   "conversation-memory.md": "memory/conversation.md",
   "context-summarization.md": "memory/summarization.md",
-  "mem0-integration.md": "memory/mem0.md",
   "features/memory.md": "features/memory.md",
+  "advanced/memory-integration.md": "advanced/memory-integration.md",
 
   // Workflow docs -> workflows/
   "advanced-orchestration.md": "workflows/orchestration.md",
@@ -138,16 +138,16 @@ const FILE_MAPPINGS: Record<string, string> = {
   "large-context-handling-design-doc.md": "development/large-context-design.md",
 };
 
-interface TransformResult {
+type TransformResult = {
   content: string;
   frontmatter: Record<string, unknown>;
-}
+};
 
-interface FileInfo {
+type FileInfo = {
   sourcePath: string;
   relativePath: string;
   targetPath: string;
-}
+};
 
 /**
  * Convert MkDocs admonitions to Docusaurus format
@@ -863,8 +863,6 @@ const LINK_MAPPINGS: Record<string, string> = {
   "conversation-memory.md": "/memory/conversation",
   "context-summarization": "/memory/summarization",
   "context-summarization.md": "/memory/summarization",
-  "mem0-integration": "/memory/mem0",
-  "mem0-integration.md": "/memory/mem0",
 
   // Workflow reorganization
   "advanced-orchestration": "/workflows/orchestration",
@@ -921,12 +919,22 @@ const LINK_MAPPINGS: Record<string, string> = {
   "guardrails-ai-integration": "/features/guardrails-ai",
   "image-generation-streaming": "/features/image-generation",
   "real-time-speech-agents": "/features/speech-agents",
+  "livekit-voice-agent": "/features/livekit-voice-agent",
+  "livekit-voice-agent.md": "/features/livekit-voice-agent",
   streaming: "/advanced/streaming",
   "features/streaming": "/advanced/streaming",
   "context-compaction": "/features/context-compaction",
   "context-compaction.md": "/features/context-compaction",
   "thinking-configuration": "/features/thinking-configuration",
   "thinking-configuration.md": "/features/thinking-configuration",
+  "claude-proxy": "/features/claude-proxy",
+  "claude-proxy.md": "/features/claude-proxy",
+  "claude-proxy-architecture": "/features/claude-proxy-architecture",
+  "claude-proxy-architecture.md": "/features/claude-proxy-architecture",
+  "claude-proxy-config-reference": "/features/claude-proxy-config-reference",
+  "claude-proxy-config-reference.md": "/features/claude-proxy-config-reference",
+  "claude-proxy-troubleshooting": "/features/claude-proxy-troubleshooting",
+  "claude-proxy-troubleshooting.md": "/features/claude-proxy-troubleshooting",
 
   // Provider guides -> getting-started/providers
   "ollama-setup": "/getting-started/providers/ollama",
@@ -967,9 +975,22 @@ const LINK_MAPPINGS: Record<string, string> = {
   "auto-evaluation": "/features/auto-evaluation",
   interactive: "/demos/interactive",
   "video-generation": "/features/video-generation",
+  "ppt-generation": "/features/ppt-generation",
   "conversation-history": "/features/conversation-history",
   "mcp-tools-showcase": "/features/mcp-tools-showcase",
   "provider-orchestration": "/features/provider-orchestration",
+  "claude-subscription": "/features/claude-subscription",
+  "claude-subscription.md": "/features/claude-subscription",
+  "claude-subscription-testing": "/features/claude-subscription-testing",
+  "claude-subscription-testing.md": "/features/claude-subscription-testing",
+  "mcp-enhancements": "/features/mcp-enhancements",
+  "mcp-enhancements.md": "/features/mcp-enhancements",
+  "mcp-enhancements-diagrams": "/features/mcp-enhancements-diagrams",
+  "mcp-enhancements-diagrams.md": "/features/mcp-enhancements-diagrams",
+  "client-sdk": "/features/client-sdk",
+  "client-sdk.md": "/features/client-sdk",
+  autoresearch: "/features/autoresearch",
+  "autoresearch.md": "/features/autoresearch",
 
   // Cookbook - absolute paths
   "batch-processing": "/cookbook/batch-processing",
@@ -982,6 +1003,8 @@ const LINK_MAPPINGS: Record<string, string> = {
   "tool-chaining": "/cookbook/tool-chaining",
   "context-window-management": "/cookbook/context-window-management",
   "conversation-summarization": "/cookbook/conversation-summarization",
+  "autoresearch-quickstart": "/cookbook/autoresearch-quickstart",
+  "autoresearch-quickstart.md": "/cookbook/autoresearch-quickstart",
 
   // Getting started - absolute paths
   "provider-setup": "/getting-started/provider-setup",
@@ -1012,6 +1035,16 @@ const LINK_MAPPINGS: Record<string, string> = {
   // Provider paths
   "openai-compatible": "/getting-started/providers/openai-compatible",
   "providers/openrouter": "/getting-started/providers/openrouter",
+  "providers/anthropic": "/getting-started/providers/anthropic",
+  anthropic: "/getting-started/providers/anthropic",
+  // Bare provider names so sibling-relative `./<name>.md` links inside
+  // docs/getting-started/providers/ resolve to the canonical Docusaurus path
+  // instead of falling through to the generic `/docs/<name>` (which 404s).
+  ollama: "/getting-started/providers/ollama",
+  deepseek: "/getting-started/providers/deepseek",
+  "nvidia-nim": "/getting-started/providers/nvidia-nim",
+  "lm-studio": "/getting-started/providers/lm-studio",
+  llamacpp: "/getting-started/providers/llamacpp",
 
   // MCP additional
   "mcp/server-catalog": "/guides/mcp/server-catalog",
@@ -1065,6 +1098,10 @@ const LINK_MAPPINGS: Record<string, string> = {
   "builtin-middleware": "/advanced/builtin-middleware",
   "google-vertex": "/getting-started/providers/google-vertex",
   huggingface: "/getting-started/providers/huggingface",
+  "openai-tts": "/getting-started/providers/openai-tts",
+  elevenlabs: "/getting-started/providers/elevenlabs",
+  deepgram: "/getting-started/providers/deepgram",
+  "azure-speech": "/getting-started/providers/azure-speech",
 
   // API documentation paths - these need /api/ prefix
   "enumerations/AIProviderName": "/api/enumerations/AIProviderName",
@@ -1303,6 +1340,67 @@ const LINK_MAPPINGS: Record<string, string> = {
   "functions/getBestProvider": "/api/functions/getBestProvider",
   "functions/getAvailableProviders": "/api/functions/getAvailableProviders",
   "functions/isValidProvider": "/api/functions/isValidProvider",
+
+  // ── New provider getting-started guides (feat/more-providers) ─────────
+  xai: "/getting-started/providers/xai",
+  groq: "/getting-started/providers/groq",
+  replicate: "/getting-started/providers/replicate",
+  voyage: "/getting-started/providers/voyage",
+  stability: "/getting-started/providers/stability",
+  "fish-audio": "/getting-started/providers/fish-audio",
+  cohere: "/getting-started/providers/cohere",
+  jina: "/getting-started/providers/jina",
+  "together-ai": "/getting-started/providers/together-ai",
+  together: "/getting-started/providers/together-ai",
+  fireworks: "/getting-started/providers/fireworks",
+  perplexity: "/getting-started/providers/perplexity",
+  cloudflare: "/getting-started/providers/cloudflare",
+  ideogram: "/getting-started/providers/ideogram",
+  recraft: "/getting-started/providers/recraft",
+  heygen: "/getting-started/providers/heygen",
+  "d-id": "/getting-started/providers/d-id",
+  did: "/getting-started/providers/d-id",
+  musetalk: "/getting-started/providers/musetalk",
+  lyria: "/getting-started/providers/lyria",
+  beatoven: "/getting-started/providers/beatoven",
+  "elevenlabs-music": "/getting-started/providers/elevenlabs-music",
+  kling: "/getting-started/providers/kling",
+  runway: "/getting-started/providers/runway",
+  cartesia: "/getting-started/providers/cartesia",
+
+  // ── New provider-integration guides + their cross-refs ────────────────
+  "00-architecture": "/provider-integration/00-architecture",
+  "01-shared-changes": "/provider-integration/01-shared-changes",
+  "02-deepseek": "/provider-integration/02-deepseek",
+  "03-nvidia-nim": "/provider-integration/03-nvidia-nim",
+  "04-lm-studio": "/provider-integration/04-lm-studio",
+  "05-llamacpp": "/provider-integration/05-llamacpp",
+  "06-testing": "/provider-integration/06-testing",
+  "07-implementation-order": "/provider-integration/07-implementation-order",
+  "08-feature-matrix": "/provider-integration/08-feature-matrix",
+  "09-test-suite-spec": "/provider-integration/09-test-suite-spec",
+  "10-test-results-final": "/provider-integration/10-test-results-final",
+  "11-test-failure-investigation":
+    "/provider-integration/11-test-failure-investigation",
+  "12-pr-analysis": "/provider-integration/12-pr-analysis",
+  "13-code-review": "/provider-integration/13-code-review",
+  "14-voice-speech-integration":
+    "/provider-integration/14-voice-speech-integration",
+  "15-adding-llm-provider": "/provider-integration/15-adding-llm-provider",
+  "16-adding-tts-provider": "/provider-integration/16-adding-tts-provider",
+  "17-adding-stt-provider": "/provider-integration/17-adding-stt-provider",
+  "18-adding-realtime-provider":
+    "/provider-integration/18-adding-realtime-provider",
+  "19-adding-video-provider": "/provider-integration/19-adding-video-provider",
+  "20-adding-image-gen-provider":
+    "/provider-integration/20-adding-image-gen-provider",
+  "21-adding-new-modality": "/provider-integration/21-adding-new-modality",
+  "22-adding-multimodal-provider":
+    "/provider-integration/22-adding-multimodal-provider",
+  CHECKLIST: "/provider-integration/checklist",
+  checklist: "/provider-integration/checklist",
+  "SAFETY-PRIMITIVES": "/provider-integration/safety-primitives",
+  "safety-primitives": "/provider-integration/safety-primitives",
 };
 
 /**

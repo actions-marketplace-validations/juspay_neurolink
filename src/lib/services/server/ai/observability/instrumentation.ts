@@ -7,96 +7,140 @@
  * Flow: Vercel AI SDK → OpenTelemetry Spans → LangfuseSpanProcessor → Langfuse Platform
  */
 
+import type { LangfuseSpanProcessor as LangfuseSpanProcessorType } from "@langfuse/otel";
+import type { Context, TracerProvider } from "@opentelemetry/api";
+import {
+  metrics,
+  SpanStatusCode,
+  trace,
+  type Span as ApiSpan,
+} from "@opentelemetry/api";
+import { W3CTraceContextPropagator } from "@opentelemetry/core";
+import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-http";
+import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-http";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+import { resourceFromAttributes } from "@opentelemetry/resources";
+import {
+  MeterProvider,
+  PeriodicExportingMetricReader,
+} from "@opentelemetry/sdk-metrics";
+import {
+  BatchLogRecordProcessor,
+  LoggerProvider,
+} from "@opentelemetry/sdk-logs";
+import {
+  BatchSpanProcessor,
+  type Span,
+  type SpanProcessor,
+} from "@opentelemetry/sdk-trace-base";
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
-import { LangfuseSpanProcessor } from "@langfuse/otel";
-import type { Span, SpanProcessor } from "@opentelemetry/sdk-trace-base";
 import {
   ATTR_SERVICE_NAME,
   ATTR_SERVICE_VERSION,
 } from "@opentelemetry/semantic-conventions";
-import { resourceFromAttributes } from "@opentelemetry/resources";
 import { AsyncLocalStorage } from "async_hooks";
-import { trace } from "@opentelemetry/api";
-import { logger } from "../../../../utils/logger.js";
 import type {
   LangfuseConfig,
-  LangfuseSpanAttributes,
-} from "../../../../types/observability.js";
+  LangfuseContext,
+} from "../../../../types/index.js";
+import { extractMcpErrorText } from "../../../../utils/mcpErrorText.js";
+import { logger } from "../../../../utils/logger.js";
+import { LANGFUSE_ATTR } from "../../../../telemetry/attributes.js";
 
 const LOG_PREFIX = "[OpenTelemetry]";
 
-/**
- * Extended context for Langfuse spans
- * Supports all Langfuse trace attributes for rich observability
- */
-export type LangfuseContext = {
-  userId?: string | null;
-  sessionId?: string | null;
-  /** Conversation/thread identifier for grouping related traces */
-  conversationId?: string | null;
-  /** Request identifier for correlating with application logs */
-  requestId?: string | null;
-  /** Custom trace name for better organization in Langfuse UI */
-  traceName?: string | null;
-  /** Custom metadata to attach to spans */
-  metadata?: Record<string, unknown> | null;
+function createOtelResource(config: LangfuseConfig, serviceName: string) {
+  return resourceFromAttributes({
+    [ATTR_SERVICE_NAME]: serviceName,
+    [ATTR_SERVICE_VERSION]: config.release || "v1.0.0",
+    "deployment.environment": config.environment || "dev",
+  });
+}
 
-  // Operation Name Support
+function initializeOtlpMetricsAndLogs(
+  resource: ReturnType<typeof resourceFromAttributes>,
+  otlpEndpoint: string | undefined,
+  serviceName: string,
+): void {
+  if (!otlpEndpoint) {
+    return;
+  }
 
-  /**
-   * Explicit operation name (e.g., "ai.streamText", "chat", "embeddings")
-   *
-   * If set, this overrides auto-detection from the span name.
-   * Use this when you want a custom operation name that doesn't match
-   * the auto-detected Vercel AI SDK operation.
-   *
-   * @example
-   * await setLangfuseContext({
-   *   userId: "user@email.com",
-   *   operationName: "customer-support-chat"
-   * }, async () => {
-   *   // Trace name: "user@email.com:customer-support-chat"
-   * });
-   */
-  operationName?: string | null;
+  try {
+    const metricExporter = new OTLPMetricExporter({
+      url: `${otlpEndpoint}/v1/metrics`,
+    });
+    const metricReader = new PeriodicExportingMetricReader({
+      exporter: metricExporter,
+      exportIntervalMillis: 15000,
+      exportTimeoutMillis: 10000,
+    });
+    meterProvider = new MeterProvider({
+      resource,
+      readers: [metricReader],
+    });
+    metrics.setGlobalMeterProvider(meterProvider);
+    logger.info(
+      `${LOG_PREFIX} OTLP metric exporter added — MeterProvider registered globally`,
+      {
+        endpoint: `${otlpEndpoint}/v1/metrics`,
+        exportIntervalMs: 15000,
+        serviceName,
+        meterProviderType: meterProvider.constructor.name,
+      },
+    );
+  } catch (metricsError) {
+    logger.warn(
+      `${LOG_PREFIX} Failed to create OTLP metric exporter (non-fatal)`,
+      {
+        error:
+          metricsError instanceof Error
+            ? metricsError.message
+            : String(metricsError),
+        endpoint: otlpEndpoint,
+      },
+    );
+  }
 
-  /**
-   * Override global autoDetectOperationName setting for this context.
-   *
-   * When undefined, uses the global setting from LangfuseConfig.
-   * Set to false to disable auto-detection for this specific context.
-   *
-   * @default undefined (uses global setting, which defaults to true)
-   */
-  autoDetectOperationName?: boolean;
-
-  /**
-   * Custom attributes to set on all spans within this context.
-   *
-   * These attributes are propagated to every span created within the
-   * AsyncLocalStorage context, enabling application-level context
-   * (e.g., Slack channel name, feature flag, tenant ID) to appear
-   * on all SDK-internal spans.
-   *
-   * @example
-   * await setLangfuseContext({
-   *   userId: "user@email.com",
-   *   customAttributes: {
-   *     "app.slack.channel": "engineering",
-   *     "app.tenant.id": "tenant-123",
-   *     "app.feature.flag": true,
-   *   }
-   * }, async () => {
-   *   // All spans created here will have these attributes
-   * });
-   */
-  customAttributes?: Record<string, string | number | boolean>;
-};
+  try {
+    const logExporter = new OTLPLogExporter({
+      url: `${otlpEndpoint}/v1/logs`,
+    });
+    const logProcessor = new BatchLogRecordProcessor(logExporter, {
+      maxQueueSize: 2048,
+      maxExportBatchSize: 512,
+      scheduledDelayMillis: 2000,
+      exportTimeoutMillis: 30000,
+    });
+    loggerProvider = new LoggerProvider({
+      resource,
+      processors: [logProcessor],
+    });
+    logger.info(
+      `${LOG_PREFIX} OTLP log exporter added — LoggerProvider created`,
+      {
+        endpoint: `${otlpEndpoint}/v1/logs`,
+        serviceName,
+      },
+    );
+  } catch (logsError) {
+    logger.warn(
+      `${LOG_PREFIX} Failed to create OTLP log exporter (non-fatal)`,
+      {
+        error:
+          logsError instanceof Error ? logsError.message : String(logsError),
+        endpoint: otlpEndpoint,
+      },
+    );
+  }
+}
 
 const contextStorage = new AsyncLocalStorage<LangfuseContext>();
 
 let tracerProvider: NodeTracerProvider | null = null;
-let langfuseProcessor: LangfuseSpanProcessor | null = null;
+let meterProvider: MeterProvider | null = null;
+let loggerProvider: LoggerProvider | null = null;
+let langfuseProcessor: LangfuseSpanProcessorType | null = null;
 let isInitialized = false;
 let isCredentialsValid = false;
 let currentConfig: LangfuseConfig | null = null;
@@ -146,6 +190,75 @@ function _hasExternalTracerProvider(): boolean {
 }
 
 /**
+ * Parse `ai.toolCall.result` on a Vercel AI SDK tool span and surface any
+ * embedded MCP `{ isError: true }` as a Langfuse ERROR + status message.
+ */
+function applyToolCallIsErrorStatus(attrs: Record<string, unknown>): void {
+  const resultAttr = attrs["ai.toolCall.result"];
+  if (typeof resultAttr !== "string" || resultAttr.length === 0) {
+    return;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(resultAttr);
+  } catch {
+    return;
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    (parsed as { isError?: unknown }).isError !== true
+  ) {
+    return;
+  }
+  attrs["langfuse.level"] = "ERROR";
+  // Always set a status_message, even when the MCP payload has non-text or
+  // empty content. Without a fallback the Curator P0-1 gap reappears for
+  // those failures (level=ERROR but statusMessage=null).
+  const errorText = extractMcpErrorText(parsed);
+  const toolName =
+    typeof attrs["ai.toolCall.name"] === "string"
+      ? (attrs["ai.toolCall.name"] as string)
+      : "tool";
+  attrs["langfuse.status_message"] =
+    errorText || `MCP ${toolName} returned isError=true`;
+}
+
+/**
+ * Map non-ERROR span conditions (content-filter, length, client abort, SDK
+ * timeout, empty output) onto Langfuse WARNING/ERROR levels. Mutates `attrs`.
+ */
+function applyNonErrorLangfuseLevel(attrs: Record<string, unknown>): void {
+  const finishReason =
+    attrs["ai.finishReason"] ?? attrs["gen_ai.response.finish_reasons"];
+  const reasonStr = Array.isArray(finishReason)
+    ? finishReason.join(",")
+    : String(finishReason ?? "");
+
+  if (reasonStr.includes("content-filter") || reasonStr === "length") {
+    attrs["langfuse.level"] = "WARNING";
+    attrs["langfuse.status_message"] =
+      `Generation stopped: finishReason=${reasonStr}`;
+    return;
+  }
+  if (attrs["neurolink.no_output"] === true) {
+    attrs["langfuse.level"] = "WARNING";
+    // Preserve any enriched status message StreamHandler already set
+    // (carries finishReason / token counts via buildNoOutputStatusMessage).
+    // Only fall back to the generic message when none was set upstream.
+    if (typeof attrs["langfuse.status_message"] !== "string") {
+      attrs["langfuse.status_message"] =
+        "Stream produced no output (NoOutputGeneratedError)";
+    }
+    return;
+  }
+  if (reasonStr === "aborted") {
+    attrs["langfuse.level"] = "WARNING";
+    attrs["langfuse.status_message"] = "Generation aborted by client";
+  }
+}
+
+/**
  * Span processor that enriches spans with user and session context from AsyncLocalStorage
  * Also extracts GenAI semantic convention attributes for Langfuse integration
  *
@@ -171,13 +284,14 @@ class ContextEnricher implements SpanProcessor {
    */
   private detectedOperations = new Map<string, string>();
 
-  onStart(span: Span): void {
+  onStart(span: Span, parentContext: Context): void {
     const context = contextStorage.getStore();
     const userId = context?.userId ?? currentConfig?.userId ?? "guest";
     const sessionId = context?.sessionId ?? currentConfig?.sessionId;
 
     // Get span name for operation auto-detection
-    const spanName = (span as unknown as { name?: string }).name;
+    // (sdk-trace-base's Span type includes the ReadableSpan members)
+    const spanName = span.name;
 
     // Determine if auto-detection is enabled for this context
     const autoDetect = this.shouldAutoDetectOperationName(context);
@@ -248,10 +362,11 @@ class ContextEnricher implements SpanProcessor {
       span.setAttribute("request.id", context.requestId);
     }
 
-    // Set trace name for Langfuse (using proper Langfuse attribute)
-    if (traceName) {
+    const isRootSpan = !trace.getSpan(parentContext);
+
+    if (traceName && isRootSpan) {
       span.setAttribute("langfuse.trace.name", traceName);
-      span.setAttribute("trace.name", traceName); // Keep for compatibility
+      span.setAttribute("trace.name", traceName);
     }
 
     // Set operation name as separate attribute for filtering/analytics
@@ -270,7 +385,12 @@ class ContextEnricher implements SpanProcessor {
             typeof value === "number" ||
             typeof value === "boolean"
           ) {
-            span.setAttribute(`metadata.${key}`, value);
+            if (metadata && isRootSpan) {
+              span.setAttribute(
+                "langfuse.trace.metadata",
+                JSON.stringify(metadata),
+              );
+            }
           } else if (
             Array.isArray(value) &&
             value.every(
@@ -281,10 +401,7 @@ class ContextEnricher implements SpanProcessor {
             )
           ) {
             // OTEL supports homogeneous arrays of primitives
-            span.setAttribute(
-              `metadata.${key}`,
-              value as string[] | number[] | boolean[],
-            );
+            span.setAttribute(`metadata.${key}`, JSON.stringify(value));
           } else {
             // Fall back to JSON string for complex types
             span.setAttribute(`metadata.${key}`, JSON.stringify(value));
@@ -382,12 +499,11 @@ class ContextEnricher implements SpanProcessor {
    */
   onEnd(span: Span): void {
     try {
-      // Get span attributes (ReadableSpan interface)
-      const readableSpan = span as unknown as {
-        attributes?: LangfuseSpanAttributes;
-        name?: string;
-      };
-      const attributes = readableSpan.attributes || {};
+      // Get span attributes (sdk-trace-base's Span type includes the
+      // ReadableSpan members, so attributes/name/status are directly typed).
+      // Keep the {} fallback: this processor can be attached to an external
+      // app-owned TracerProvider whose span implementation may omit attributes.
+      const attributes = span.attributes ?? {};
 
       // Handle wrapper/trace-root spans: update trace name with detected operation
       // This supports host apps (like Curator) that create wrapper spans before AI calls
@@ -451,29 +567,144 @@ class ContextEnricher implements SpanProcessor {
         attributes["gen_ai.request.model"];
 
       if (isGenAISpan) {
+        const model =
+          (attributes["gen_ai.request.model"] as string) ||
+          (attributes["ai.model.id"] as string);
+        const provider =
+          (attributes["gen_ai.system"] as string) ||
+          (attributes["ai.model.provider"] as string);
+
         logger.debug(`${LOG_PREFIX} GenAI span detected`, {
-          spanName: readableSpan.name,
-          model:
-            attributes["gen_ai.request.model"] || attributes["ai.model.id"],
-          provider:
-            attributes["gen_ai.system"] || attributes["ai.model.provider"],
+          spanName: span.name,
+          model,
+          provider,
         });
 
-        // Log token usage for observability
-        const inputTokens =
-          attributes["gen_ai.usage.input_tokens"] ||
-          attributes["ai.usage.promptTokens"];
-        const outputTokens =
-          attributes["gen_ai.usage.output_tokens"] ||
-          attributes["ai.usage.completionTokens"];
+        // L4/L6 fix: Set explicit Langfuse observation attributes so
+        // cost dashboards and model analytics work correctly.
+        try {
+          const mAttrs = span.attributes;
 
-        if (inputTokens !== undefined || outputTokens !== undefined) {
-          logger.debug(`${LOG_PREFIX} Token usage captured`, {
-            inputTokens,
-            outputTokens,
-            totalTokens: attributes["gen_ai.usage.total_tokens"],
-          });
+          // L6: Model identity
+          if (model) {
+            mAttrs["gen_ai.response.model"] = model;
+          }
+
+          // L4: Usage details — aggregate from AI SDK attributes into a
+          // structured JSON object that Langfuse can parse for cost analysis.
+          const inputTokens =
+            (attributes["gen_ai.usage.input_tokens"] as number) ??
+            (attributes["ai.usage.promptTokens"] as number);
+          const outputTokens =
+            (attributes["gen_ai.usage.output_tokens"] as number) ??
+            (attributes["ai.usage.completionTokens"] as number);
+          const totalTokens =
+            (attributes["gen_ai.usage.total_tokens"] as number) ??
+            (inputTokens !== undefined && outputTokens !== undefined
+              ? inputTokens + outputTokens
+              : undefined);
+          const reasoningTokens =
+            (attributes["gen_ai.usage.reasoning_tokens"] as number) ??
+            (attributes["ai.usage.reasoningTokens"] as number);
+          const cachedTokens = attributes[
+            "gen_ai.usage.input_cached_tokens"
+          ] as number;
+
+          if (inputTokens !== undefined || outputTokens !== undefined) {
+            const usageDetails: Record<string, number> = {};
+            if (inputTokens !== undefined) {
+              usageDetails.input = inputTokens;
+            }
+            if (outputTokens !== undefined) {
+              usageDetails.output = outputTokens;
+            }
+            if (totalTokens !== undefined) {
+              usageDetails.total = totalTokens;
+            }
+            if (reasoningTokens !== undefined) {
+              usageDetails.reasoning_tokens = reasoningTokens;
+            }
+            if (cachedTokens !== undefined) {
+              usageDetails.input_cached_tokens = cachedTokens;
+            }
+            mAttrs["langfuse.usage_details"] = JSON.stringify(usageDetails);
+
+            logger.debug(`${LOG_PREFIX} Token usage captured`, {
+              inputTokens,
+              outputTokens,
+              totalTokens,
+            });
+          }
+
+          // L7: Model parameters — surface temperature and max_tokens for
+          // generation tuning visibility.
+          const temperature =
+            attributes["gen_ai.request.temperature"] ??
+            attributes["ai.settings.temperature"];
+          const maxTokens =
+            attributes["gen_ai.request.max_tokens"] ??
+            attributes["ai.settings.maxTokens"];
+          const topP =
+            attributes["gen_ai.request.top_p"] ??
+            attributes["ai.settings.topP"];
+          if (
+            temperature !== undefined ||
+            maxTokens !== undefined ||
+            topP !== undefined
+          ) {
+            const params: Record<string, unknown> = {};
+            if (temperature !== undefined) {
+              params.temperature = temperature;
+            }
+            if (maxTokens !== undefined) {
+              params.max_tokens = maxTokens;
+            }
+            if (topP !== undefined) {
+              params.top_p = topP;
+            }
+            mAttrs["gen_ai.request.model_parameters"] = JSON.stringify(params);
+          }
+        } catch {
+          // Read-only attributes — cannot enrich; Pipeline A will still
+          // export the raw GenAI attributes that Langfuse can parse.
         }
+      }
+
+      // P8 fix: Propagate error status to Langfuse-consumable attributes.
+      // OTel ReadableSpan attributes may be readonly at onEnd() time; the type
+      // cast attempts late mutation. LangfuseSpanProcessor runs after
+      // ContextEnricher in the spanProcessors array and reads these attributes,
+      // so setting them here allows Langfuse to surface the correct level and
+      // status message on the trace/generation.
+      const readableStatus = span.status;
+      try {
+        const mutableAttrs = span.attributes;
+
+        // Curator P0-1/P0-2: detect MCP isError pattern on AI SDK tool call spans.
+        // The AI SDK's `ai.toolCall` span stays status=UNSET when the tool
+        // *returns* { isError:true } (no exception thrown), so Langfuse sees
+        // level=DEFAULT and no status message. Parse the stringified result
+        // and surface the embedded error text.
+        if (
+          span.name === "ai.toolCall" &&
+          readableStatus?.code !== SpanStatusCode.ERROR
+        ) {
+          applyToolCallIsErrorStatus(mutableAttrs);
+        }
+
+        if (readableStatus?.code === SpanStatusCode.ERROR) {
+          mutableAttrs["langfuse.level"] = "ERROR";
+          if (readableStatus.message) {
+            mutableAttrs["langfuse.status_message"] = readableStatus.message;
+          }
+        } else if (mutableAttrs["langfuse.level"] === undefined) {
+          applyNonErrorLangfuseLevel(mutableAttrs);
+        }
+      } catch {
+        // Readonly enforcement by OTel SDK — mutation not possible; log at debug.
+        logger.debug(
+          `${LOG_PREFIX} Could not set langfuse.level on span (read-only attributes)`,
+        );
       }
     } catch (error) {
       // Don't fail span processing on errors
@@ -494,6 +725,352 @@ class ContextEnricher implements SpanProcessor {
   }
 }
 
+async function createLangfuseProcessor(
+  config: LangfuseConfig,
+): Promise<LangfuseSpanProcessorType> {
+  let mod: typeof import("@langfuse/otel");
+  try {
+    mod = await import(/* @vite-ignore */ "@langfuse/otel");
+  } catch (err) {
+    const e = err instanceof Error ? (err as NodeJS.ErrnoException) : null;
+    if (e?.code === "ERR_MODULE_NOT_FOUND" && e.message.includes("langfuse")) {
+      throw new Error(
+        'Langfuse observability requires "@langfuse/otel". Install it with:\n  pnpm add @langfuse/otel',
+        { cause: err },
+      );
+    }
+    throw err;
+  }
+  return new mod.LangfuseSpanProcessor({
+    publicKey: config.publicKey,
+    secretKey: config.secretKey,
+    baseUrl: config.baseUrl || "https://cloud.langfuse.com",
+    environment: config.environment || "dev",
+    release: config.release || "v1.0.0",
+    // Curator P1-3: skip internal wrapper spans that duplicate ai.toolCall /
+    // ai.generateText observations in Langfuse. Wrappers still emit OTel spans
+    // for internal metrics; they just aren't forwarded to Langfuse.
+    shouldExportSpan: langfuseShouldExportSpan,
+  });
+}
+
+/**
+ * True when a span is an internal NeuroLink wrapper that should NOT be sent to
+ * Langfuse. Internal wrappers carry the `langfuse.internal: true` attribute.
+ *
+ * Exposed so host apps that bring their own `LangfuseSpanProcessor` (e.g.
+ * `skipLangfuseSpanProcessor: true`, or manual registration on an existing
+ * TracerProvider) can apply the same filter and avoid duplicate observations.
+ */
+export function isLangfuseInternalSpan(span: {
+  attributes?: Record<string, unknown>;
+}): boolean {
+  return span.attributes?.["langfuse.internal"] === true;
+}
+
+/**
+ * Drop-in `shouldExportSpan` predicate for a `LangfuseSpanProcessor` that
+ * filters out NeuroLink internal wrapper spans.
+ *
+ * Usage in host apps:
+ * ```ts
+ * import { langfuseShouldExportSpan } from "@juspay/neurolink";
+ * new LangfuseSpanProcessor({ ..., shouldExportSpan: langfuseShouldExportSpan });
+ * ```
+ */
+export function langfuseShouldExportSpan({
+  otelSpan,
+}: {
+  otelSpan: { attributes?: Record<string, unknown> };
+}): boolean {
+  return !isLangfuseInternalSpan(otelSpan);
+}
+
+async function initializeExternalOpenTelemetryMode(
+  config: LangfuseConfig,
+  resource: ReturnType<typeof resourceFromAttributes>,
+  otlpEndpoint: string | undefined,
+  serviceName: string,
+  langfuseRequested: boolean,
+  hasLangfuseCreds: boolean,
+): Promise<void> {
+  if (langfuseRequested && !hasLangfuseCreds) {
+    if (!otlpEndpoint) {
+      logger.warn(
+        `${LOG_PREFIX} External provider mode requested Langfuse but credentials are missing, and no OTLP endpoint is configured; skipping initialization`,
+        {
+          hasPublicKey: !!config?.publicKey,
+          hasSecretKey: !!config?.secretKey,
+        },
+      );
+      isInitialized = true;
+      isCredentialsValid = false;
+      return;
+    }
+
+    logger.warn(
+      `${LOG_PREFIX} External provider mode missing Langfuse credentials; continuing with OTLP-only metrics/logs`,
+      {
+        hasPublicKey: !!config?.publicKey,
+        hasSecretKey: !!config?.secretKey,
+        otlpEnabled: true,
+      },
+    );
+  }
+
+  try {
+    currentConfig = config;
+    isCredentialsValid = hasLangfuseCreds;
+    langfuseProcessor =
+      langfuseRequested && hasLangfuseCreds
+        ? await createLangfuseProcessor(config)
+        : null;
+
+    usingExternalProvider = true;
+    isInitialized = true;
+    initializeOtlpMetricsAndLogs(resource, otlpEndpoint, serviceName);
+
+    try {
+      const globalProvider = trace.getTracerProvider();
+      const provider = globalProvider as TracerProvider & {
+        addSpanProcessor?: (processor: SpanProcessor) => void;
+      };
+
+      if (globalProvider && typeof provider.addSpanProcessor === "function") {
+        provider.addSpanProcessor(new ContextEnricher());
+
+        // Auto-detect: skip if consumer already registered a LangfuseSpanProcessor.
+        //
+        // Detection strategy (ordered by robustness):
+        // 1. Duck-type check for Langfuse-specific public member
+        //    (`langfuseClient` property) — survives minification.
+        // 2. `constructor.name === "LangfuseSpanProcessor"` — last resort,
+        //    brittle under minification or bundler renaming.
+        //
+        // NOTE: `_registeredSpanProcessors` is an internal OpenTelemetry field.
+        // If the OTel SDK removes or renames it, the array defaults to [] and
+        // `hasExistingLangfuse` is false — NeuroLink registers its own processor
+        // (same behavior as before this check). Consumers can always force skip
+        // via `skipLangfuseSpanProcessor: true`.
+        const existingProcessors =
+          (provider as { _registeredSpanProcessors?: unknown[] })
+            ._registeredSpanProcessors ?? [];
+        const hasExistingLangfuse = existingProcessors.some((p) => {
+          if (p === null || p === undefined || typeof p !== "object") {
+            return false;
+          }
+          // Duck-type: Langfuse processor exposes a langfuseClient property
+          if ("langfuseClient" in p) {
+            return true;
+          }
+          // Fallback: constructor name (brittle under minification)
+          return (
+            (p as { constructor?: { name?: string } }).constructor?.name ===
+            "LangfuseSpanProcessor"
+          );
+        });
+
+        const skipLangfuse =
+          config.skipLangfuseSpanProcessor === true ||
+          !langfuseProcessor ||
+          hasExistingLangfuse;
+
+        if (hasExistingLangfuse && !config.skipLangfuseSpanProcessor) {
+          logger.info(
+            `${LOG_PREFIX} Auto-detected existing LangfuseSpanProcessor — skipping SDK registration to avoid duplicates`,
+          );
+        }
+
+        if (!skipLangfuse && langfuseProcessor) {
+          provider.addSpanProcessor(langfuseProcessor);
+        }
+
+        logger.info(
+          `${LOG_PREFIX} Auto-registered processors with global TracerProvider`,
+          {
+            processors: skipLangfuse
+              ? ["ContextEnricher"]
+              : ["ContextEnricher", "LangfuseSpanProcessor"],
+            reason: "External provider mode with auto-registration",
+            skippedLangfuseSpanProcessor: skipLangfuse,
+          },
+        );
+        return;
+      }
+
+      logger.info(`${LOG_PREFIX} Using external TracerProvider mode`, {
+        reason: config.useExternalTracerProvider
+          ? "useExternalTracerProvider=true"
+          : "autoDetectExternalProvider=true (trusting host signal)",
+        instructions:
+          "Add span processors to your TracerProvider using getSpanProcessors()",
+      });
+      logger.info(`${LOG_PREFIX} Span processors ready for external use`, {
+        processors: langfuseProcessor
+          ? ["ContextEnricher", "LangfuseSpanProcessor"]
+          : ["ContextEnricher"],
+        usage: "import { getSpanProcessors } from '@juspay/neurolink'",
+      });
+    } catch (autoRegisterError) {
+      logger.warn(
+        `${LOG_PREFIX} Auto-registration failed, manual registration required`,
+        {
+          error:
+            autoRegisterError instanceof Error
+              ? autoRegisterError.message
+              : String(autoRegisterError),
+          instructions:
+            "Add span processors to your TracerProvider using getSpanProcessors()",
+        },
+      );
+    }
+  } catch (error) {
+    logger.error(
+      `${LOG_PREFIX} Failed to create span processor for external mode`,
+      {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      },
+    );
+    isInitialized = true;
+  }
+}
+
+async function initializeStandaloneOpenTelemetryMode(
+  config: LangfuseConfig,
+  resource: ReturnType<typeof resourceFromAttributes>,
+  otlpEndpoint: string | undefined,
+  serviceName: string,
+  langfuseRequested: boolean,
+  hasLangfuseCreds: boolean,
+): Promise<void> {
+  if ((!langfuseRequested || !hasLangfuseCreds) && !otlpEndpoint) {
+    if (langfuseRequested && !hasLangfuseCreds) {
+      logger.warn(
+        `${LOG_PREFIX} Langfuse requested but credentials are missing, and no OTLP endpoint is configured; skipping initialization`,
+        {
+          hasPublicKey: !!config.publicKey,
+          hasSecretKey: !!config.secretKey,
+        },
+      );
+    } else {
+      logger.debug(
+        `${LOG_PREFIX} Langfuse disabled and OTLP endpoint missing, skipping initialization`,
+      );
+    }
+    isInitialized = true;
+    return;
+  }
+
+  if (langfuseRequested && !hasLangfuseCreds) {
+    logger.warn(
+      `${LOG_PREFIX} Langfuse requested but credentials are missing; continuing with OTLP-only telemetry`,
+      {
+        hasPublicKey: !!config.publicKey,
+        hasSecretKey: !!config.secretKey,
+        otlpEnabled: !!otlpEndpoint,
+      },
+    );
+  }
+
+  try {
+    currentConfig = config;
+    isCredentialsValid = hasLangfuseCreds;
+    langfuseProcessor =
+      langfuseRequested && hasLangfuseCreds
+        ? await createLangfuseProcessor(config)
+        : null;
+
+    logger.debug(`${LOG_PREFIX} Standalone observability mode`, {
+      langfuseEnabled: !!langfuseProcessor,
+      otlpEnabled: !!otlpEndpoint,
+      baseUrl: config.baseUrl || "https://cloud.langfuse.com",
+      environment: config.environment || "dev",
+    });
+
+    const spanProcessors: SpanProcessor[] = [new ContextEnricher()];
+    if (langfuseProcessor) {
+      spanProcessors.push(langfuseProcessor);
+    }
+
+    if (otlpEndpoint) {
+      try {
+        const otlpExporter = new OTLPTraceExporter({
+          url: `${otlpEndpoint}/v1/traces`,
+        });
+        spanProcessors.push(
+          new BatchSpanProcessor(otlpExporter, {
+            maxQueueSize: 2048,
+            maxExportBatchSize: 512,
+            scheduledDelayMillis: 1000,
+            exportTimeoutMillis: 30000,
+          }),
+        );
+        logger.info(`${LOG_PREFIX} OTLP trace exporter added`, {
+          endpoint: `${otlpEndpoint}/v1/traces`,
+          serviceName,
+        });
+      } catch (otlpError) {
+        logger.warn(
+          `${LOG_PREFIX} Failed to create OTLP exporter (non-fatal)`,
+          {
+            error:
+              otlpError instanceof Error
+                ? otlpError.message
+                : String(otlpError),
+            endpoint: otlpEndpoint,
+          },
+        );
+      }
+    }
+
+    tracerProvider = new NodeTracerProvider({ resource, spanProcessors });
+    tracerProvider.register({
+      propagator: new W3CTraceContextPropagator(),
+    });
+    usingExternalProvider = false;
+    isInitialized = true;
+    initializeOtlpMetricsAndLogs(resource, otlpEndpoint, serviceName);
+
+    logger.info(`${LOG_PREFIX} Observability initialized`, {
+      baseUrl: config.baseUrl || "https://cloud.langfuse.com",
+      environment: config.environment || "dev",
+      release: config.release || "v1.0.0",
+      mode: "standalone",
+      langfuseEnabled: !!langfuseProcessor,
+      otlpEnabled: !!otlpEndpoint,
+      serviceName,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const isDuplicateError =
+      errorMessage.includes("duplicate registration") ||
+      errorMessage.includes("already registered") ||
+      errorMessage.includes("already set");
+
+    if (isDuplicateError) {
+      logger.warn(
+        `${LOG_PREFIX} TracerProvider already registered, switching to external mode`,
+        {
+          error: errorMessage,
+          recommendation:
+            "Set useExternalTracerProvider=true or autoDetectExternalProvider=true in config",
+        },
+      );
+
+      usingExternalProvider = true;
+      isInitialized = true;
+      return;
+    }
+
+    logger.error(`${LOG_PREFIX} Initialization failed`, {
+      error: errorMessage,
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    throw error;
+  }
+}
+
 /**
  * Initialize OpenTelemetry with Langfuse span processor
  *
@@ -508,12 +1085,19 @@ class ContextEnricher implements SpanProcessor {
  *
  * @param config - Langfuse configuration passed from parent application
  */
-export function initializeOpenTelemetry(config: LangfuseConfig): void {
-  // Guard against multiple initializations
+export async function initializeOpenTelemetry(
+  config: LangfuseConfig,
+): Promise<void> {
+  // Guard against multiple initializations — but always update config
+  // so that later NeuroLink instances can change traceNameFormat,
+  // autoDetectOperationName, and other configuration preferences
+  // without re-initializing the OTEL infrastructure.
   if (isInitialized) {
-    logger.debug(`${LOG_PREFIX} Already initialized`, {
+    currentConfig = config;
+    logger.debug(`${LOG_PREFIX} Already initialized, config updated`, {
       usingExternalProvider,
       hasLangfuseProcessor: !!langfuseProcessor,
+      hasTraceNameFormat: typeof config.traceNameFormat === "function",
     });
     return;
   }
@@ -529,216 +1113,32 @@ export function initializeOpenTelemetry(config: LangfuseConfig): void {
   const shouldUseExternal =
     config?.useExternalTracerProvider === true ||
     config?.autoDetectExternalProvider === true;
+  const otlpEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+  const langfuseRequested = config?.enabled === true;
+  const hasLangfuseCreds = !!config.publicKey && !!config.secretKey;
+  const serviceName = process.env.OTEL_SERVICE_NAME || "neurolink";
+  const resource = createOtelResource(config, serviceName);
 
   if (shouldUseExternal) {
-    // Validate credentials even in external mode
-    if (!config?.publicKey || !config?.secretKey) {
-      logger.warn(
-        `${LOG_PREFIX} External provider mode but missing credentials, skipping initialization`,
-        {
-          hasPublicKey: !!config?.publicKey,
-          hasSecretKey: !!config?.secretKey,
-        },
-      );
-      isInitialized = true;
-      isCredentialsValid = false;
-      return;
-    }
-
-    try {
-      currentConfig = config;
-      isCredentialsValid = true;
-
-      // Create span processor for external provider mode
-      langfuseProcessor = new LangfuseSpanProcessor({
-        publicKey: config.publicKey,
-        secretKey: config.secretKey,
-        baseUrl: config.baseUrl || "https://cloud.langfuse.com",
-        environment: config.environment || "dev",
-        release: config.release || "v1.0.0",
-      });
-
-      usingExternalProvider = true;
-      isInitialized = true;
-
-      // Auto-register ContextEnricher with the global TracerProvider
-      // This ensures trace names are set even when host doesn't call getSpanProcessors()
-      try {
-        const globalProvider = trace.getTracerProvider();
-
-        // Check if it's a real provider with addSpanProcessor method (not the no-op default)
-        if (
-          globalProvider &&
-          typeof (globalProvider as unknown as { addSpanProcessor?: unknown })
-            .addSpanProcessor === "function"
-        ) {
-          const provider = globalProvider as unknown as {
-            addSpanProcessor: (processor: SpanProcessor) => void;
-          };
-
-          // Add ContextEnricher for trace name enrichment
-          provider.addSpanProcessor(new ContextEnricher());
-
-          // Only add LangfuseSpanProcessor if the host has not already registered one.
-          // When skipLangfuseSpanProcessor is true, the host (e.g. Curator) already
-          // registers its own LangfuseSpanProcessor via a DeferredSpanProcessor, so
-          // adding another one here would cause duplicate trace exports to Langfuse.
-          const skipLangfuse = config.skipLangfuseSpanProcessor === true;
-          if (!skipLangfuse) {
-            provider.addSpanProcessor(langfuseProcessor);
-          }
-
-          logger.info(
-            `${LOG_PREFIX} Auto-registered processors with global TracerProvider`,
-            {
-              processors: skipLangfuse
-                ? ["ContextEnricher"]
-                : ["ContextEnricher", "LangfuseSpanProcessor"],
-              reason: "External provider mode with auto-registration",
-              skippedLangfuseSpanProcessor: skipLangfuse,
-            },
-          );
-        } else {
-          // No real provider found - host will need to add processors manually
-          logger.info(`${LOG_PREFIX} Using external TracerProvider mode`, {
-            reason: config.useExternalTracerProvider
-              ? "useExternalTracerProvider=true"
-              : "autoDetectExternalProvider=true (trusting host signal)",
-            instructions:
-              "Add span processors to your TracerProvider using getSpanProcessors()",
-          });
-
-          logger.info(`${LOG_PREFIX} Span processors ready for external use`, {
-            processors: ["ContextEnricher", "LangfuseSpanProcessor"],
-            usage: "import { getSpanProcessors } from '@juspay/neurolink'",
-          });
-        }
-      } catch (autoRegisterError) {
-        // Auto-registration failed - fall back to manual registration
-        logger.warn(
-          `${LOG_PREFIX} Auto-registration failed, manual registration required`,
-          {
-            error:
-              autoRegisterError instanceof Error
-                ? autoRegisterError.message
-                : String(autoRegisterError),
-            instructions:
-              "Add span processors to your TracerProvider using getSpanProcessors()",
-          },
-        );
-      }
-
-      return;
-    } catch (error) {
-      logger.error(
-        `${LOG_PREFIX} Failed to create span processor for external mode`,
-        {
-          error: error instanceof Error ? error.message : String(error),
-          stack: error instanceof Error ? error.stack : undefined,
-        },
-      );
-      isInitialized = true;
-      return;
-    }
-  }
-
-  // THEN: Check enabled for standalone mode
-  if (!config?.enabled) {
-    logger.debug(
-      `${LOG_PREFIX} Langfuse disabled and no external provider, skipping initialization`,
-    );
-    isInitialized = true;
-    return;
-  }
-
-  // Validate credentials for standalone mode
-  if (!config.publicKey || !config.secretKey) {
-    logger.warn(
-      `${LOG_PREFIX} Langfuse enabled but missing credentials, skipping initialization`,
-      {
-        hasPublicKey: !!config.publicKey,
-        hasSecretKey: !!config.secretKey,
-      },
-    );
-    isInitialized = true;
-    isCredentialsValid = false;
-    return;
-  }
-
-  try {
-    currentConfig = config;
-    isCredentialsValid = true;
-
-    // Step 1: Create LangfuseSpanProcessor for standalone mode
-    langfuseProcessor = new LangfuseSpanProcessor({
-      publicKey: config.publicKey,
-      secretKey: config.secretKey,
-      baseUrl: config.baseUrl || "https://cloud.langfuse.com",
-      environment: config.environment || "dev",
-      release: config.release || "v1.0.0",
-    });
-
-    logger.debug(`${LOG_PREFIX} Created LangfuseSpanProcessor`, {
-      baseUrl: config.baseUrl || "https://cloud.langfuse.com",
-      environment: config.environment || "dev",
-    });
-
-    // Step 2: Create our own TracerProvider (standalone behavior)
-    const resource = resourceFromAttributes({
-      [ATTR_SERVICE_NAME]: "neurolink",
-      [ATTR_SERVICE_VERSION]: config.release || "v1.0.0",
-      "deployment.environment": config.environment || "dev",
-    });
-
-    tracerProvider = new NodeTracerProvider({
+    await initializeExternalOpenTelemetryMode(
+      config,
       resource,
-      spanProcessors: [new ContextEnricher(), langfuseProcessor],
-    });
-
-    // Step 4: Register globally
-    tracerProvider.register();
-    usingExternalProvider = false;
-    isInitialized = true;
-
-    logger.info(`${LOG_PREFIX} Initialized with Langfuse span processor`, {
-      baseUrl: config.baseUrl || "https://cloud.langfuse.com",
-      environment: config.environment || "dev",
-      release: config.release || "v1.0.0",
-      mode: "standalone",
-    });
-  } catch (error) {
-    // Check if this is a duplicate registration error
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    const isDuplicateError =
-      errorMessage.includes("duplicate registration") ||
-      errorMessage.includes("already registered") ||
-      errorMessage.includes("already set");
-
-    if (isDuplicateError) {
-      // Graceful handling: switch to external mode
-      logger.warn(
-        `${LOG_PREFIX} TracerProvider already registered, switching to external mode`,
-        {
-          error: errorMessage,
-          recommendation:
-            "Set useExternalTracerProvider=true or autoDetectExternalProvider=true in config",
-        },
-      );
-
-      usingExternalProvider = true;
-      isInitialized = true;
-
-      // Don't throw - processors are still usable
-      return;
-    }
-
-    // Other errors: log and re-throw
-    logger.error(`${LOG_PREFIX} Initialization failed`, {
-      error: errorMessage,
-      stack: error instanceof Error ? error.stack : undefined,
-    });
-    throw error;
+      otlpEndpoint,
+      serviceName,
+      langfuseRequested,
+      hasLangfuseCreds,
+    );
+    return;
   }
+
+  await initializeStandaloneOpenTelemetryMode(
+    config,
+    resource,
+    otlpEndpoint,
+    serviceName,
+    langfuseRequested,
+    hasLangfuseCreds,
+  );
 }
 
 /**
@@ -750,22 +1150,75 @@ export async function flushOpenTelemetry(): Promise<void> {
     return;
   }
 
-  if (!langfuseProcessor) {
-    logger.debug(`${LOG_PREFIX} No processor to flush (Langfuse disabled)`);
-    return;
+  const failures: Array<{ signal: string; error: unknown }> = [];
+
+  if (langfuseProcessor) {
+    try {
+      logger.info(`${LOG_PREFIX} Flushing Langfuse spans...`);
+      await langfuseProcessor.forceFlush();
+    } catch (error) {
+      failures.push({ signal: "langfuse", error });
+      logger.error(`${LOG_PREFIX} Langfuse flush failed`, {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+    }
+  } else {
+    logger.debug(`${LOG_PREFIX} Langfuse disabled, skipping Langfuse flush`);
   }
 
-  try {
-    logger.info(`${LOG_PREFIX} Flushing pending spans to Langfuse...`);
-    await langfuseProcessor.forceFlush();
-    logger.info(`${LOG_PREFIX} Successfully flushed spans to Langfuse`);
-  } catch (error) {
-    logger.error(`${LOG_PREFIX} Flush failed`, {
-      error: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined,
-    });
-    throw error;
+  if (tracerProvider && !usingExternalProvider) {
+    try {
+      logger.info(`${LOG_PREFIX} Flushing OTLP traces...`);
+      await tracerProvider.forceFlush();
+    } catch (error) {
+      failures.push({ signal: "traces", error });
+      logger.error(`${LOG_PREFIX} Trace flush failed`, {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+    }
+  } else {
+    logger.debug(`${LOG_PREFIX} No TracerProvider to flush`);
   }
+
+  if (meterProvider) {
+    try {
+      logger.info(`${LOG_PREFIX} Flushing OTLP metrics...`);
+      await meterProvider.forceFlush();
+    } catch (error) {
+      failures.push({ signal: "metrics", error });
+      logger.error(`${LOG_PREFIX} Metric flush failed`, {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+    }
+  } else {
+    logger.debug(`${LOG_PREFIX} No MeterProvider to flush`);
+  }
+
+  if (loggerProvider) {
+    try {
+      logger.info(`${LOG_PREFIX} Flushing OTLP logs...`);
+      await loggerProvider.forceFlush();
+    } catch (error) {
+      failures.push({ signal: "logs", error });
+      logger.error(`${LOG_PREFIX} Log flush failed`, {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+    }
+  } else {
+    logger.debug(`${LOG_PREFIX} No LoggerProvider to flush`);
+  }
+
+  if (failures.length > 0) {
+    throw new Error(
+      `${LOG_PREFIX} Flush failed for: ${failures.map((f) => f.signal).join(", ")}`,
+    );
+  }
+
+  logger.info(`${LOG_PREFIX} Flush complete`);
 }
 
 /**
@@ -792,7 +1245,19 @@ export async function shutdownOpenTelemetry(): Promise<void> {
       await cachedContextEnricher.shutdown();
     }
 
+    // Shutdown MeterProvider if we created it
+    if (meterProvider) {
+      await meterProvider.shutdown();
+    }
+
+    // Shutdown LoggerProvider if we created it
+    if (loggerProvider) {
+      await loggerProvider.shutdown();
+    }
+
     tracerProvider = null;
+    meterProvider = null;
+    loggerProvider = null;
     langfuseProcessor = null;
     cachedContextEnricher = null;
     isInitialized = false;
@@ -810,7 +1275,7 @@ export async function shutdownOpenTelemetry(): Promise<void> {
 /**
  * Get the Langfuse span processor
  */
-export function getLangfuseSpanProcessor(): LangfuseSpanProcessor | null {
+export function getLangfuseSpanProcessor(): SpanProcessor | null {
   return langfuseProcessor;
 }
 
@@ -819,6 +1284,14 @@ export function getLangfuseSpanProcessor(): LangfuseSpanProcessor | null {
  */
 export function getTracerProvider(): NodeTracerProvider | null {
   return tracerProvider;
+}
+
+/**
+ * Get the logger provider for emitting OTLP log records.
+ * Returns null if OTLP is not configured or LoggerProvider was not created.
+ */
+export function getLoggerProvider(): LoggerProvider | null {
+  return loggerProvider;
 }
 
 /**
@@ -970,6 +1443,92 @@ export async function setLangfuseContext<T = void>(
  */
 export function getLangfuseContext(): LangfuseContext | undefined {
   return contextStorage.getStore();
+}
+
+/**
+ * Fill a span's Langfuse identity when the caller's context would otherwise
+ * fall back to "guest". Identity (user.id / session.id) is set additively —
+ * only fields ambient context didn't already provide, so a host's own context
+ * is never overridden. trace.name (the title) is rescued only when no ambient
+ * name source exists AND this span is the trace root, mirroring
+ * ContextEnricher.onStart so a host wrapper span isn't relabelled.
+ */
+export function stampGuestRescueIdentity(
+  span: ApiSpan,
+  callContext: unknown,
+  isRootSpan: boolean,
+): void {
+  const ambient = getLangfuseContext();
+  const ctx = callContext as Record<string, unknown> | undefined;
+  const userId =
+    typeof ctx?.userId === "string" && ctx.userId ? ctx.userId : undefined;
+  const sessionId =
+    typeof ctx?.sessionId === "string" && ctx.sessionId
+      ? ctx.sessionId
+      : undefined;
+
+  // Title: the trace name comes from traceName ?? userId, so only rescue it
+  // from "guest" when ambient has neither, and only on the trace root.
+  if (isRootSpan && !ambient?.traceName && !ambient?.userId) {
+    const traceName =
+      typeof ctx?.traceName === "string" && ctx.traceName
+        ? ctx.traceName
+        : userId;
+    if (traceName) {
+      span.setAttribute(LANGFUSE_ATTR.TRACE_NAME, traceName);
+      span.setAttribute("trace.name", traceName);
+    }
+  }
+
+  // Identity: additive — set each field only where ambient didn't.
+  if (userId && !ambient?.userId) {
+    span.setAttribute("user.id", userId);
+  }
+  if (sessionId && !ambient?.sessionId) {
+    span.setAttribute("session.id", sessionId);
+  }
+}
+
+/**
+ * Capture the current Langfuse AsyncLocalStorage context and return a wrapper
+ * that re-enters that context when executing the provided callback.
+ *
+ * This is essential for preserving trace context across async boundaries that
+ * break the automatic ALS propagation chain, such as `setImmediate()`,
+ * `setTimeout()`, or event-emitter callbacks. Without this, spans created
+ * inside those callbacks become orphaned traces in Langfuse.
+ *
+ * **How it works:**
+ * 1. Captures the current ALS store at call time (synchronously).
+ * 2. Returns an async function that, when invoked, re-enters the captured
+ *    context via `contextStorage.run()` before executing the callback.
+ * 3. If no context exists at capture time, the callback runs without
+ *    ALS wrapping (no-op passthrough).
+ *
+ * @param fn - The async function to execute within the captured context
+ * @returns A new async function that preserves the Langfuse ALS context
+ *
+ * @example
+ * // Before (broken — setImmediate loses ALS context):
+ * setImmediate(async () => {
+ *   await this.checkAndSummarize(session, threshold);
+ * });
+ *
+ * // After (fixed — context is captured and re-entered):
+ * const wrappedFn = runWithCurrentLangfuseContext(async () => {
+ *   await this.checkAndSummarize(session, threshold);
+ * });
+ * setImmediate(wrappedFn);
+ */
+export function runWithCurrentLangfuseContext<T>(
+  fn: () => Promise<T>,
+): () => Promise<T> {
+  const capturedContext = contextStorage.getStore();
+  if (capturedContext) {
+    return () => contextStorage.run(capturedContext, fn);
+  }
+  // No context to preserve — return the function as-is
+  return fn;
 }
 
 /**

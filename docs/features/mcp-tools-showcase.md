@@ -1,16 +1,16 @@
 ---
-title: MCP Tools Ecosystem - 58+ Integrations
+title: MCP Tools Ecosystem - Built-in Tools + Any MCP Server
 description: Complete showcase of Model Context Protocol tools - built-in core tools and external MCP server ecosystem
 keywords: mcp, model context protocol, tools, integrations, ecosystem, servers
 ---
 
-# MCP Tools Ecosystem: 58+ Integrations
+# MCP Tools Ecosystem: Built-in Tools + Any MCP Server
 
 > **Since**: v7.0.0 | **Status**: Production Ready | **MCP Version**: 2024-11-05
 
 ## Overview
 
-NeuroLink's Model Context Protocol (MCP) integration provides a **universal plugin system** that transforms the SDK from a simple AI interface into a complete AI development platform. With 6 built-in core tools and access to 58+ community MCP servers, you can extend AI capabilities to interact with filesystems, databases, APIs, cloud services, and custom enterprise systems.
+NeuroLink's Model Context Protocol (MCP) integration provides a **universal plugin system** that transforms the SDK from a simple AI interface into a complete AI development platform. With 6 built-in core tools and the ability to connect any community MCP server (58+ cataloged in the [server directory](../guides/mcp/server-catalog.md)), you can extend AI capabilities to interact with filesystems, databases, APIs, cloud services, and custom enterprise systems.
 
 ### What is MCP?
 
@@ -22,13 +22,13 @@ The Model Context Protocol is an **open standard** (like USB-C for AI) that enab
 
 ### Why MCP Matters
 
-| Traditional Approach                    | MCP Approach                   | Benefit                 |
-| --------------------------------------- | ------------------------------ | ----------------------- |
-| Custom tool integrations per provider   | One MCP tool works everywhere  | 10x faster integration  |
-| Manual tool discovery and configuration | Automatic tool registry        | Zero-config tool usage  |
-| Provider-specific tool formats          | Universal JSON-RPC protocol    | Provider portability    |
-| Limited to SDK-defined tools            | 58+ community servers + custom | Unlimited extensibility |
-| Static tool set                         | Dynamic runtime addition       | Adapt to changing needs |
+| Traditional Approach                    | MCP Approach                      | Benefit                 |
+| --------------------------------------- | --------------------------------- | ----------------------- |
+| Custom tool integrations per provider   | One MCP tool works everywhere     | 10x faster integration  |
+| Manual tool discovery and configuration | Automatic tool registry           | Zero-config tool usage  |
+| Provider-specific tool formats          | Universal JSON-RPC protocol       | Provider portability    |
+| Limited to SDK-defined tools            | any community MCP server + custom | Unlimited extensibility |
+| Static tool set                         | Dynamic runtime addition          | Adapt to changing needs |
 
 ### NeuroLink's Deep MCP Integration
 
@@ -55,6 +55,28 @@ const result = await neurolink.generate({
 - **Rich Context**: 15+ fields including session, user, permissions, metadata
 - **Performance Optimized**: 0-11ms tool execution (target: <100ms)
 - **Enterprise Grade**: Comprehensive error handling, audit logging, security
+
+## Quick Start
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+
+const neurolink = new NeuroLink();
+
+// Add the GitHub MCP server
+await neurolink.addExternalMCPServer("github", {
+  command: "npx",
+  args: ["-y", "@modelcontextprotocol/server-github"],
+  env: { GITHUB_PERSONAL_ACCESS_TOKEN: process.env.GITHUB_TOKEN! },
+});
+
+// The AI can now use GitHub tools automatically
+const result = await neurolink.generate({
+  input: { text: "List open issues in my-org/my-repo" },
+});
+
+console.log(result.content);
+```
 
 ---
 
@@ -334,9 +356,9 @@ const result = await neurolink.generate({
 
 ---
 
-## External MCP Servers (58+)
+## External MCP Servers
 
-NeuroLink integrates with the growing MCP ecosystem of 58+ external servers across 6 major categories.
+NeuroLink connects to the growing MCP ecosystem — any MCP-compliant server works; the [server catalog](../guides/mcp/server-catalog.md) lists 58+ across 6 major categories.
 
 ### Quick Integration Example
 
@@ -346,7 +368,7 @@ import { NeuroLink } from "@juspay/neurolink";
 const neurolink = new NeuroLink();
 
 // Add external MCP servers dynamically
-await neurolink.addMCPServer("github", {
+await neurolink.addExternalMCPServer("github", {
   command: "npx",
   args: ["-y", "@modelcontextprotocol/server-github"],
   env: {
@@ -354,7 +376,7 @@ await neurolink.addMCPServer("github", {
   },
 });
 
-await neurolink.addMCPServer("postgres", {
+await neurolink.addExternalMCPServer("postgres", {
   command: "npx",
   args: ["-y", "@modelcontextprotocol/server-postgres"],
   env: {
@@ -409,7 +431,7 @@ const result = await neurolink.generate({
 **Example**:
 
 ```typescript
-await neurolink.addMCPServer("github", {
+await neurolink.addExternalMCPServer("github", {
   command: "npx",
   args: ["-y", "@modelcontextprotocol/server-github"],
   env: {
@@ -591,7 +613,7 @@ const result = await neurolink.generate({
 **Configuration**:
 
 ```typescript
-await neurolink.addMCPServer("postgres", {
+await neurolink.addExternalMCPServer("postgres", {
   command: "npx",
   args: ["-y", "@modelcontextprotocol/server-postgres"],
   env: {
@@ -1072,7 +1094,7 @@ import { NeuroLink } from "@juspay/neurolink";
 const neurolink = new NeuroLink();
 
 // Add official MCP server
-await neurolink.addMCPServer("github", {
+await neurolink.addExternalMCPServer("github", {
   command: "npx",
   args: ["-y", "@modelcontextprotocol/server-github"],
   env: {
@@ -1081,7 +1103,7 @@ await neurolink.addMCPServer("github", {
 });
 
 // Add custom MCP server
-await neurolink.addMCPServer("custom-analytics", {
+await neurolink.addExternalMCPServer("custom-analytics", {
   command: "node",
   args: ["./analytics-mcp-server.js"],
   env: {
@@ -1092,7 +1114,7 @@ await neurolink.addMCPServer("custom-analytics", {
 });
 
 // Add remote MCP server (SSE transport)
-await neurolink.addMCPServer("remote-tools", {
+await neurolink.addExternalMCPServer("remote-tools", {
   command: "http://mcp.company.com/tools",
   transport: "sse",
   url: "http://mcp.company.com/tools/mcp",
@@ -1319,7 +1341,7 @@ await server.connect(transport);
 **Using custom server**:
 
 ```typescript
-await neurolink.addMCPServer("crm", {
+await neurolink.addExternalMCPServer("crm", {
   command: "node",
   args: ["./custom-crm-server.js"],
   env: {
@@ -1335,7 +1357,7 @@ await neurolink.addMCPServer("crm", {
 
 ```typescript
 // Restrict filesystem access
-await neurolink.addMCPServer("filesystem", {
+await neurolink.addExternalMCPServer("filesystem", {
   command: "npx",
   args: [
     "-y",
@@ -1410,7 +1432,7 @@ const neurolink = new NeuroLink({
 
 ```typescript
 // Reuse database connections
-await neurolink.addMCPServer("postgres", {
+await neurolink.addExternalMCPServer("postgres", {
   command: "npx",
   args: ["-y", "@modelcontextprotocol/server-postgres"],
   env: {
@@ -1447,7 +1469,7 @@ const result2 = await neurolink.generate({
 #### 3. Timeout Handling
 
 ```typescript
-await neurolink.addMCPServer("slow-api", {
+await neurolink.addExternalMCPServer("slow-api", {
   command: "npx",
   args: ["-y", "slow-mcp-server"],
   timeout: 30000, // 30 second timeout

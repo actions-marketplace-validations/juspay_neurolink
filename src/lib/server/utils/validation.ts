@@ -4,6 +4,10 @@
  */
 
 import { z } from "zod";
+import type {
+  ErrorResponse,
+  ServerValidationResult,
+} from "../../types/index.js";
 
 // ============================================
 // Validation Schemas
@@ -37,7 +41,7 @@ export const AgentExecuteRequestSchema = z.object({
  */
 export const ToolExecuteRequestSchema = z.object({
   name: z.string().min(1, "Tool name is required"),
-  arguments: z.record(z.unknown()).default({}),
+  arguments: z.record(z.string(), z.unknown()).default({}),
   sessionId: z.string().optional(),
   userId: z.string().optional(),
 });
@@ -45,7 +49,7 @@ export const ToolExecuteRequestSchema = z.object({
 /**
  * Tool arguments schema (for direct tool execution)
  */
-export const ToolArgumentsSchema = z.record(z.unknown());
+export const ToolArgumentsSchema = z.record(z.string(), z.unknown());
 
 /**
  * Memory session ID parameter schema
@@ -121,25 +125,49 @@ export const SessionMessagesQuerySchema = z.object({
     .optional(),
 });
 
-// ============================================
-// Error Response Types
-// ============================================
+/**
+ * Embed request schema (single text)
+ */
+export const EmbedRequestSchema = z.object({
+  text: z.string().min(1, "Text is required"),
+  provider: z.string().optional(),
+  model: z.string().optional(),
+});
 
 /**
- * Standardized error response format
+ * Embed many request schema (batch texts)
  */
-export type ErrorResponse = {
-  error: {
-    code: string;
-    message: string;
-    details?: unknown;
-  };
-  metadata?: {
-    timestamp: string;
-    requestId?: string;
-  };
-  httpStatus?: number;
-};
+export const EmbedManyRequestSchema = z.object({
+  texts: z
+    .array(z.string().min(1))
+    .min(1, "At least one text is required")
+    .max(2048, "Maximum 2048 texts per batch"),
+  provider: z.string().optional(),
+  model: z.string().optional(),
+});
+
+/**
+ * Skill create request schema
+ */
+export const SkillCreateRequestSchema = z.object({
+  name: z.string().min(1, "Name is required"),
+  displayName: z.string().optional(),
+  description: z.string().min(1, "Description is required"),
+  instructions: z.string().min(1, "Instructions are required"),
+  tags: z.array(z.string()).optional(),
+  scope: z.enum(["global", "scoped"]).optional(),
+  scopeIds: z.array(z.string()).optional(),
+  requestedBy: z.string().optional(),
+});
+
+/**
+ * Skill update request schema — all fields optional (patch semantics)
+ */
+export const SkillUpdateRequestSchema = SkillCreateRequestSchema.partial();
+
+// ============================================
+// Error Response Type Guards / Helpers
+// ============================================
 
 /**
  * Type guard to check if a value is an ErrorResponse
@@ -173,6 +201,7 @@ function getDefaultHttpStatus(code: string): number {
     RATE_LIMIT_EXCEEDED: 429,
     MCP_UNAVAILABLE: 503,
     MEMORY_UNAVAILABLE: 503,
+    SKILLS_UNAVAILABLE: 503,
     EXECUTION_FAILED: 500,
     INTERNAL_ERROR: 500,
   };
@@ -208,20 +237,13 @@ export function createErrorResponse(
 }
 
 /**
- * Validation result type
- */
-export type ValidationResult<T> =
-  | { success: true; data: T }
-  | { success: false; error: ErrorResponse };
-
-/**
  * Validate request body against a Zod schema
  */
 export function validateRequest<T>(
   schema: z.ZodSchema<T>,
   data: unknown,
   requestId?: string,
-): ValidationResult<T> {
+): ServerValidationResult<T> {
   const result = schema.safeParse(data);
 
   if (!result.success) {
@@ -253,7 +275,7 @@ export function validateQuery<T>(
   schema: z.ZodSchema<T>,
   query: Record<string, string>,
   requestId?: string,
-): ValidationResult<T> {
+): ServerValidationResult<T> {
   const result = schema.safeParse(query);
 
   if (!result.success) {
@@ -285,7 +307,7 @@ export function validateParams<T>(
   schema: z.ZodSchema<T>,
   params: Record<string, string>,
   requestId?: string,
-): ValidationResult<T> {
+): ServerValidationResult<T> {
   const result = schema.safeParse(params);
 
   if (!result.success) {

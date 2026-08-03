@@ -3,15 +3,11 @@ import chalk from "chalk";
 import ora from "ora";
 import inquirer from "inquirer";
 import { logger } from "../../lib/utils/logger.js";
+import type { SetupHuggingFaceArgs } from "../../lib/types/index.js";
 import {
   updateEnvFile as writeEnvFile,
   displayEnvUpdateSummary,
 } from "../utils/envManager.js";
-
-type SetupHuggingFaceArgs = {
-  check?: boolean;
-  "non-interactive"?: boolean;
-};
 
 /**
  * Validates Hugging Face API key format
@@ -137,7 +133,7 @@ export const handleHuggingFaceSetup = async (
     // Step 2: Model Selection
     const { modelChoice } = await inquirer.prompt([
       {
-        type: "list",
+        type: "select",
         name: "modelChoice",
         message: "Select a Hugging Face model:",
         choices: [
@@ -221,6 +217,7 @@ export const handleHuggingFaceSetup = async (
       spinner.stop();
       throw new Error(
         `Failed to save configuration: ${envError instanceof Error ? envError.message : String(envError)}`,
+        { cause: envError },
       );
     }
     logger.always(chalk.blue("\n📖 Usage examples:"));

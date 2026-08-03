@@ -17,7 +17,7 @@ Core guides for getting the most out of NeuroLink.
 | Guide                                                 | Description                                                            |
 | ----------------------------------------------------- | ---------------------------------------------------------------------- |
 | **[Provider Selection Guide](provider-selection.md)** | Interactive wizard to choose the best provider for your use case       |
-| **[GitHub Action Guide](github-action.md)**           | Run AI-powered workflows in GitHub Actions with 13 providers           |
+| **[GitHub Action Guide](github-action.md)**           | Run AI-powered workflows in GitHub Actions with 30+ providers          |
 | **[Troubleshooting](troubleshooting.md)**             | Common issues, debugging tips, and solutions for NeuroLink CLI and SDK |
 
 ---
@@ -75,7 +75,7 @@ See also: [MCP Tools Showcase](../features/mcp-tools-showcase.md) for detailed t
 
 ---
 
-## 🖥️ Server Adapters :material-new-box:{ .new-feature title="New in v8.42" }
+## Server Adapters
 
 Deploy NeuroLink as production-ready HTTP APIs.
 

@@ -86,6 +86,20 @@ const config: Config = {
         },
       }),
     },
+    {
+      tagName: "script",
+      attributes: {
+        type: "application/ld+json",
+      },
+      innerHTML: JSON.stringify({
+        "@context": "https://schema.org",
+        "@type": "SoftwareSourceCode",
+        name: "NeuroLink SDK",
+        programmingLanguage: "TypeScript",
+        codeRepository: "https://github.com/juspay/neurolink",
+        license: "https://opensource.org/licenses/MIT",
+      }),
+    },
   ],
 
   markdown: {
@@ -129,7 +143,6 @@ const config: Config = {
             "**/package-overrides.md",
             "**/mcp/concurrency.md",
             "**/features/interactive-cli.md",
-            "**/mastra-features-implementation/**",
           ],
           showLastUpdateAuthor: true,
           showLastUpdateTime: true,
@@ -191,25 +204,9 @@ const config: Config = {
     image: "img/neurolink-social-card.png",
 
     metadata: [
-      {
-        name: "description",
-        content:
-          "Enterprise AI Development Platform - Universal provider support, MCP integration, and professional CLI",
-      },
-      {
-        property: "og:description",
-        content:
-          "Enterprise AI Development Platform - Universal provider support, MCP integration, and professional CLI",
-      },
       { property: "og:type", content: "website" },
       { property: "og:site_name", content: "NeuroLink" },
       { name: "twitter:card", content: "summary_large_image" },
-      { name: "twitter:title", content: "NeuroLink Documentation" },
-      {
-        name: "twitter:description",
-        content:
-          "Enterprise AI Development Platform - Universal provider support, MCP integration, and professional CLI",
-      },
       { name: "twitter:site", content: "@jaborhey" },
       { name: "twitter:creator", content: "@jaborhey" },
     ],
@@ -266,6 +263,11 @@ const config: Config = {
           position: "left",
         },
         {
+          href: "https://blog.neurolink.ink",
+          label: "Blog",
+          position: "left",
+        },
+        {
           href: "https://www.npmjs.com/package/@juspay/neurolink",
           label: "NPM",
           position: "right",
@@ -304,6 +306,7 @@ const config: Config = {
         {
           title: "Community",
           items: [
+            { label: "Blog", href: "https://blog.neurolink.ink" },
             { label: "GitHub", href: "https://github.com/juspay/neurolink" },
             {
               label: "GitHub Discussions",
@@ -369,15 +372,11 @@ const config: Config = {
       },
     ],
 
-    // Search index for MCP docs server
-    [
-      "./plugins/docusaurus-plugin-search-index",
-      {
-        docsDir: "docs",
-        outputFile: "search-index.json",
-        debug: process.env.NODE_ENV === "development",
-      },
-    ],
+    // Local search index generation (fallback when Algolia is not configured)
+    "./plugins/docusaurus-plugin-search-index",
+
+    // Generate unique OG images per page at build time (satori + resvg)
+    "./plugins/docusaurus-plugin-og-images",
 
     // Fix server bundle: handle Node-only native modules
     // (protobufjs from posthog→opentelemetry, ws from jsdom, fsevents, etc.)

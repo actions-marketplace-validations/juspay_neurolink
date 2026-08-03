@@ -7,7 +7,10 @@
 import fs from "fs";
 import chalk from "chalk";
 import { logger } from "../../lib/utils/logger.js";
-import type { EnvBackupResult, EnvUpdateResult } from "../../lib/types/cli.js";
+import type {
+  EnvBackupResult,
+  EnvUpdateResult,
+} from "../../lib/types/index.js";
 
 /**
  * Create a timestamped backup of the existing .env file
@@ -34,6 +37,7 @@ export function backupEnvFile(envPath: string = ".env"): EnvBackupResult {
     } catch (error) {
       throw new Error(
         `Failed to create backup: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
       );
     }
   }
@@ -201,6 +205,7 @@ export function updateEnvFile(
   } catch (error) {
     throw new Error(
       `Failed to write .env file: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
     );
   }
 

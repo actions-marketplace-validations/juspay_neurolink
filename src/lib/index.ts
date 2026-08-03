@@ -23,7 +23,7 @@
  * const result = await neurolink.generate({
  *   input: { text: 'Explain quantum computing' },
  *   provider: 'vertex',
- *   model: 'gemini-3-flash'
+ *   model: 'gemini-3-flash-preview'
  * });
  *
  * console.log(result.content);
@@ -38,6 +38,113 @@ export { AIProviderFactory };
 
 // Config Manager export
 export { NeuroLinkConfigManager as ConfigManager } from "./config/configManager.js";
+
+// Core Infrastructure exports (factory + registry patterns)
+export {
+  BaseFactory,
+  BaseRegistry,
+  NeuroLinkFeatureError,
+  createErrorFactory,
+  withRetry,
+  TypedEventEmitter,
+} from "./core/infrastructure/index.js";
+// ============================================================================
+// CLIENT SDK EXPORTS - Type-safe API access for browser and Node.js
+// Note: React hooks are NOT re-exported here. Import from '@juspay/neurolink/client'.
+// These re-exports intentionally bypass ./client/index.js: that barrel statically
+// re-exports ./reactHooks.js, so routing through it makes the ROOT import require
+// `react` (an optional peer dep) and crash react-less installs at import time.
+// ============================================================================
+
+export {
+  // HTTP Client
+  NeuroLinkClient,
+  createClient,
+  NeuroLinkApiError,
+} from "./client/httpClient.js";
+
+export {
+  // AI SDK Adapter
+  NeuroLinkLanguageModel,
+  NeuroLinkProvider as NeuroLinkAIProvider,
+  createNeuroLinkProvider,
+  createNeuroLinkModel,
+  createStreamingResponse,
+  neurolink as neuroLinkAIInstance,
+} from "./client/aiSdkAdapter.js";
+
+export {
+  // Interceptors
+  createApiKeyAuthInterceptor,
+  createBearerAuthInterceptor,
+  createDynamicAuthInterceptor,
+  createLoggingInterceptor,
+  createRetryInterceptor,
+  createRateLimitInterceptor,
+  createRequestTransformInterceptor,
+  createResponseTransformInterceptor,
+  createCacheInterceptor,
+  createTimeoutInterceptor,
+  createErrorHandlerInterceptor,
+  composeMiddleware,
+  conditionalMiddleware,
+} from "./client/interceptors.js";
+
+export {
+  // Streaming Client
+  SSEClient,
+  WebSocketStreamingClient,
+  createStreamingClient,
+  createAsyncStream,
+  collectStream,
+} from "./client/streamingClient.js";
+
+export {
+  // Authentication
+  OAuth2TokenManager,
+  JWTTokenManager,
+  createApiKeyMiddleware,
+  createBearerTokenMiddleware,
+  createTokenManagerMiddleware,
+  createAuthWithRetryMiddleware,
+  createMultiAuthMiddleware,
+  OAuth2Error,
+  OAuth2AuthenticationError as OAuth2AuthError,
+  TokenRefreshError,
+  decodeJWTPayload,
+  isJWTExpired,
+  getJWTExpiry,
+  getApiKeyFromEnv,
+} from "./client/auth.js";
+
+export {
+  // Errors
+  ErrorCode as ClientErrorCode,
+  NeuroLinkError as ClientNeuroLinkError,
+  HttpError,
+  ClientRateLimitError,
+  ClientValidationError,
+  ClientAuthenticationError,
+  ClientAuthorizationError,
+  NotFoundError,
+  ClientNetworkError,
+  ClientTimeoutError,
+  ClientConnectionError,
+  AbortError,
+  ClientConfigurationError,
+  StreamError,
+  ClientProviderError,
+  ContextLengthError,
+  ContentFilterError,
+  createErrorFromResponse,
+  createErrorFromNative,
+  mapStatusToErrorCode,
+  isRetryableStatus,
+  isRetryableError,
+  isNeuroLinkError,
+  isApiError,
+} from "./client/errors.js";
+
 export {
   AIProviderName,
   BedrockModels,
@@ -48,36 +155,146 @@ export {
 export { dynamicModelProvider } from "./core/dynamicModels.js";
 // Tool Registration utility
 export { validateTool } from "./sdk/toolRegistration.js";
+// Skills subsystem — manager, stores, and the built-in tool factory
+export { SkillsManager } from "./skills/skillsManager.js";
+export {
+  createSkillStore,
+  FileSystemSkillStore,
+  InMemorySkillStore,
+} from "./skills/skillStores.js";
+export { S3SkillStore } from "./skills/skillStoreS3.js";
+export { RedisSkillStore } from "./skills/skillStoreRedis.js";
+export { createSkillTools } from "./skills/skillTools.js";
 // Export ALL types from the centralized type barrel
 export * from "./types/index.js";
-export type { DynamicModelConfig, ModelRegistry } from "./types/modelTypes.js";
+// Error utilities
+export { isAbortError } from "./utils/errorHandling.js";
+// Pricing utilities
+export { calculateCost, hasPricing } from "./utils/pricing.js";
 // Utility exports
 export {
   getAvailableProviders,
   getBestProvider,
   isValidProvider,
 } from "./utils/providerUtils.js";
-// Pricing utilities
-export { calculateCost, hasPricing } from "./utils/pricing.js";
-// Error utilities
-export { isAbortError } from "./utils/errorHandling.js";
 // TTS utilities
 export { TTSProcessor } from "./utils/ttsProcessor.js";
-export { GoogleTTSHandler } from "./adapters/tts/googleTTSHandler.js";
+export { TTS_ERROR_CODES, TTSError } from "./utils/ttsProcessor.js";
+
+// Video utilities
+export { VideoProcessor } from "./utils/videoProcessor.js";
+export { VIDEO_ERROR_CODES, VideoError } from "./utils/videoProcessor.js";
+
+// Avatar / lip-sync utilities
+export { AvatarProcessor } from "./utils/avatarProcessor.js";
+export { AVATAR_ERROR_CODES, AvatarError } from "./utils/avatarProcessor.js";
+
+// Music utilities
+export { MusicProcessor } from "./utils/musicProcessor.js";
+export { MUSIC_ERROR_CODES, MusicError } from "./utils/musicProcessor.js";
+
+// STT / Realtime processors (registries for speech-to-text + live voice)
+export { STTProcessor } from "./utils/sttProcessor.js";
+// STT_ERROR_CODES is surfaced via the types barrel (export * from "./types/index.js")
+// STTError is re-exported below from the voice/index.js barrel
+
+// ============================================================================
+// MEDIA HANDLER CLASSES + AUTO-REGISTRATION
+// ============================================================================
+// Re-exporting from the voice/music/avatar barrels also triggers their
+// module-level auto-registration side effects. Consumers who follow the
+// documented `nl.generate(...)` flow get every shipped handler whose API
+// key is present in process.env, with no manual registerHandler() needed.
+
+// TTS, STT, Realtime handlers + RealtimeProcessor
+export {
+  // TTS
+  AzureTTS,
+  AzureTTSHandler,
+  CartesiaTTS,
+  CartesiaTTSHandler,
+  ElevenLabsTTS,
+  ElevenLabsTTSHandler,
+  FishAudioTTS,
+  FishAudioTTSHandler,
+  GoogleTTSHandler,
+  OpenAITTS,
+  OpenAITTSHandler,
+  // STT
+  AzureSTT,
+  AzureSTTHandler,
+  DeepgramSTT,
+  DeepgramSTTHandler,
+  GoogleSTT,
+  GoogleSTTHandler,
+  OpenAISTT,
+  OpenAISTTHandler,
+  WhisperSTT,
+  WhisperSTTHandler,
+  // Realtime
+  BaseRealtimeHandler,
+  GeminiLive,
+  GeminiLiveHandler,
+  OpenAIRealtime,
+  OpenAIRealtimeHandler,
+  RealtimeProcessor,
+  // Voice error classes (RealtimeError + STTError + VoiceError)
+  RealtimeError,
+  STTError,
+  VoiceError,
+  // Auto-registration functions (exposed so consumers can re-run them
+  // after mutating process.env at runtime, e.g. in test setups)
+  registerDefaultRealtimeHandlers,
+  registerDefaultSTTHandlers,
+  registerDefaultTTSHandlers,
+} from "./voice/index.js";
+
+// Music handlers
+export {
+  BeatovenMusic,
+  BeatovenMusicHandler,
+  ElevenLabsMusic,
+  ElevenLabsMusicHandler,
+  LyriaMusic,
+  LyriaMusicHandler,
+  registerDefaultMusicHandlers,
+  ReplicateMusic,
+  ReplicateMusicHandler,
+} from "./music/index.js";
+
+// Avatar handlers
+export {
+  DIDAvatar,
+  DIDAvatarHandler,
+  HeyGenAvatar,
+  HeyGenAvatarHandler,
+  registerDefaultAvatarHandlers,
+  ReplicateAvatar,
+  ReplicateAvatarHandler,
+} from "./avatar/index.js";
+
+// Video handlers (live under adapters/video; no separate video/ barrel)
+export { KlingVideoHandler } from "./adapters/video/klingVideoHandler.js";
+export { ReplicateVideoHandler } from "./adapters/video/replicateVideoHandler.js";
+export { RunwayVideoHandler } from "./adapters/video/runwayVideoHandler.js";
+export {
+  VertexVideoHandler,
+  isVertexVideoConfigured,
+} from "./adapters/video/vertexVideoHandler.js";
+
+// Image generation + HITL — surfaced from their dedicated barrels
+export { ImageGenService } from "./image-gen/ImageGenService.js";
+export { HITLManager } from "./hitl/hitlManager.js";
+
+// Provider registry (for tests, advanced consumers, and tools that need to
+// invoke registerAllProviders() outside of constructing a NeuroLink instance)
+export { ProviderRegistry } from "./factories/providerRegistry.js";
 
 // Main NeuroLink wrapper class and diagnostic types
 import { NeuroLink } from "./neurolink.js";
 export { NeuroLink };
-export type { MCPServerInfo } from "./types/mcpTypes.js";
 
 // Observability configuration types
-export type {
-  LangfuseConfig,
-  LangfuseSpanAttributes,
-  ObservabilityConfig,
-  OpenTelemetryConfig,
-  TraceNameFormat,
-} from "./types/observability.js";
 
 export { buildObservabilityConfigFromEnv } from "./utils/observabilityHelpers.js";
 
@@ -93,12 +310,15 @@ import {
   getTracer,
   getTracerProvider,
   initializeOpenTelemetry,
+  isLangfuseInternalSpan,
   isOpenTelemetryInitialized,
   isUsingExternalTracerProvider,
+  langfuseShouldExportSpan,
+  runWithCurrentLangfuseContext,
   setLangfuseContext,
   shutdownOpenTelemetry,
 } from "./services/server/ai/observability/instrumentation.js";
-export type { LangfuseContext } from "./services/server/ai/observability/instrumentation.js";
+
 import {
   getTelemetryStatus as getStatus,
   initializeTelemetry as init,
@@ -117,9 +337,15 @@ export {
   getSpanProcessors,
   createContextEnricher,
   isUsingExternalTracerProvider,
+  // Host-processor filter helpers — reuse NeuroLink's internal-span filtering
+  // when the host app registers its own LangfuseSpanProcessor.
+  isLangfuseInternalSpan,
+  langfuseShouldExportSpan,
   // Enhanced context and tracing
   getLangfuseContext,
   getTracer,
+  // ALS context propagation helper
+  runWithCurrentLangfuseContext,
 };
 
 // Analytics Middleware exports
@@ -128,18 +354,45 @@ export {
   createAnalyticsMiddleware,
   getAnalyticsMetrics,
 } from "./middleware/builtin/analytics.js";
+export { createLifecycleMiddleware } from "./middleware/builtin/lifecycle.js";
 export { MiddlewareFactory } from "./middleware/factory.js";
+export { ExporterRegistry } from "./observability/exporterRegistry.js";
+export { NoOpExporter } from "./observability/exporters/baseExporter.js";
+// Observability modules and types
+export {
+  getMetricsAggregator,
+  MetricsAggregator,
+  resetMetricsAggregator,
+} from "./observability/metricsAggregator.js";
+export {
+  AlwaysSampler,
+  NeverSampler,
+} from "./observability/sampling/samplers.js";
+export { TokenTracker } from "./observability/tokenTracker.js";
+export { GENAI_ATTRIBUTES, SpanStatus, SpanType } from "./types/index.js";
+export { SpanSerializer } from "./observability/utils/spanSerializer.js";
 // Middleware exports
-export type {
-  MiddlewareConfig,
-  MiddlewareContext,
-  MiddlewareFactoryOptions,
-  MiddlewarePreset,
-  NeuroLinkMiddleware,
-} from "./types/middlewareTypes.js";
 
 // Version
 export const VERSION = "1.0.0";
+
+// ============================================================================
+// Dynamic Arguments
+// ============================================================================
+//
+// Dynamic arguments let you pass functions instead of static values to
+// generate() and stream(). Resolution happens automatically before
+// provider dispatch. Pass dynamicContext inline for per-request
+// user/tenant/session context that dynamic functions can read.
+//
+// Example:
+//   await neurolink.generate({
+//     input: { text: "Hello" },
+//     model: (ctx) => ctx.requestContext.tenant?.plan === "enterprise"
+//       ? "gpt-4o" : "gpt-4o-mini",
+//     dynamicContext: { tenant: { id: "t1", plan: "enterprise" } },
+//   });
+// ============================================================================
 
 /**
  * Quick start factory function for creating AI provider instances.
@@ -165,7 +418,7 @@ export const VERSION = "1.0.0";
  *
  * @example With custom model
  * ```typescript
- * const provider = await createAIProvider('vertex', 'gemini-3-flash');
+ * const provider = await createAIProvider('vertex', 'gemini-3-flash-preview');
  * ```
  *
  * @see {@link AIProviderFactory.createProvider}
@@ -335,6 +588,7 @@ export {
   isTokenExpired,
   listMCPs,
   // Circuit Breaker
+  CircuitBreakerOpenError,
   MCPCircuitBreaker,
   mcpLogger,
   NeuroLinkOAuthProvider,
@@ -342,31 +596,122 @@ export {
   validateServerTools,
   validateTool as validateMCPTool,
   withHTTPRetry,
+  // Core MCP Components
+  MCPToolRegistry,
+  ExternalServerManager,
+  MCPClientFactory,
+  // MCP Enhancements - Routing, Caching, Batching
+  ToolRouter,
+  createToolRouter,
+  DEFAULT_ROUTER_CONFIG,
+  ToolCache,
+  createToolCache,
+  DEFAULT_CACHE_CONFIG,
+  ToolResultCache,
+  createToolResultCache,
+  RequestBatcher,
+  ToolCallBatcher,
+  createRequestBatcher,
+  createToolCallBatcher,
+  DEFAULT_BATCH_CONFIG,
+  // MCP Enhancements - Tool Annotations
+  inferAnnotations,
+  createAnnotatedTool,
+  validateAnnotations,
+  filterToolsByAnnotations,
+  mergeAnnotations,
+  getAnnotationSummary,
+  requiresConfirmation,
+  isSafeToRetry,
+  getToolSafetyLevel,
+  // MCP Enhancements - Elicitation
+  ElicitationManager,
+  globalElicitationManager,
+  // MCP Enhancements - Enhanced Tool Discovery
+  EnhancedToolDiscovery,
+  // MCP Enhancements - Registry Client
+  MCPRegistryClient,
+  globalMCPRegistryClient,
+  getWellKnownServer,
+  getAllWellKnownServers,
+  // MCP Enhancements - Server Base
+  MCPServerBase,
+  // MCP Enhancements - Multi-Server Manager
+  MultiServerManager,
+  globalMultiServerManager,
+  // MCP Enhancements - Agent Exposure
+  AgentExposureManager,
+  exposeAgentAsTool,
+  exposeAgentsAsTools,
+  exposeWorkflowAsTool,
+  exposeWorkflowsAsTools,
+  globalAgentExposureManager,
+  // MCP Enhancements - Server Capabilities
+  ServerCapabilitiesManager,
+  createTextResource,
+  createJsonResource,
+  createPrompt,
+  // MCP Enhancements - Tool Converter
+  neuroLinkToolToMCP,
+  mcpToolToNeuroLink,
+  batchConvertToMCP,
+  batchConvertToNeuroLink,
+  sanitizeToolName,
+  validateToolName,
+  createToolFromFunction,
+  mcpProtocolToolToServerTool,
+  serverToolToMCPProtocol,
+  TOOL_COMPATIBILITY,
+  // MCP Enhancements - Tool Integration
+  ToolIntegrationManager,
+  globalToolIntegrationManager,
+  wrapToolWithElicitation,
+  wrapToolsWithElicitation,
+  createElicitationContext,
+  confirmationMiddleware,
+  validationMiddleware,
+  loggingMiddleware,
+  createRetryMiddleware,
+  createTimeoutMiddleware,
+  createToolMiddlewareChain,
+  // MCP Enhancements - Elicitation Protocol
+  ElicitationProtocolAdapter,
+  globalElicitationProtocol,
+  isElicitationProtocolMessage,
+  protocolMessageToElicitation,
+  elicitationResponseToProtocol,
+  createElicitationRequest,
+  createElicitationResponse,
+  createElicitationCancel,
+  createTextInputRequest,
+  createSelectRequest,
+  createConfirmationRequest,
+  createFormRequest,
 } from "./mcp/index.js";
 
-export type {
-  AuthorizationUrlResult,
-  DiscoveredMcp,
-  HTTPRetryConfig,
-  MCPOAuthConfig,
-  McpMetadata,
-  OAuthClientInformation,
-  OAuthTokens,
-  // HTTP Transport types
-  RateLimitConfig,
-  TokenExchangeRequest,
-  TokenStorage,
-} from "./types/mcpTypes.js";
+// Tool signature deduplication utilities (opt-in, fail-open)
+export { computeToolSignature, dedupeTools } from "./core/toolDedup.js";
 
-export type {
-  ExecutionContext,
-  ToolExecutionResult,
-  ToolInfo,
-} from "./types/tools.js";
-
-export type { LogLevel } from "./types/utilities.js";
 export { logger } from "./utils/logger.js";
 export { getPoolStats } from "./utils/redis.js";
+
+// Pre-call tool routing cache (ITEM C: LRU+TTL cache + session stickiness)
+export { ToolRoutingCache } from "./core/toolRoutingCache.js";
+
+// Pre-call tool routing resolver — exported for host integrations and testing
+export {
+  resolveToolRoutingExclusions,
+  buildToolRoutingCatalog,
+  buildRoutingQueryFromHistory,
+  DEFAULT_ROUTER_PROMPT_PREFIX,
+} from "./core/toolRouting.js";
+
+// Pre-call tool routing — embedding fast-path (ITEM B: L2 semantic retrieval)
+export {
+  cosineSimilarity,
+  ToolEmbeddingIndex,
+  selectRelevantToolNames,
+} from "./core/toolRoutingEmbedding.js";
 
 // ============================================================================
 // REAL-TIME SERVICES & TELEMETRY - Enterprise Platform Features
@@ -397,16 +742,161 @@ export async function getTelemetryStatus(): Promise<{
 }
 
 // ============================================================================
+// EVALUATION SYSTEM - Comprehensive Response Evaluation & Scoring
+// ============================================================================
+
+/**
+ * Evaluation System Exports
+ *
+ * A comprehensive evaluation framework for assessing AI response quality,
+ * with support for RAGAS-style metrics, custom scorers, and pipeline-based evaluation.
+ *
+ * @example
+ * ```typescript
+ * import {
+ *   Evaluator,
+ *   ScorerRegistry,
+ *   EvaluationPipeline,
+ *   createFaithfulnessScorer,
+ *   createAnswerRelevancyScorer,
+ * } from '@juspay/neurolink';
+ *
+ * // Create a pipeline with multiple scorers
+ * const pipeline = new EvaluationPipeline({
+ *   scorers: [
+ *     createFaithfulnessScorer({ model: 'gpt-4' }),
+ *     createAnswerRelevancyScorer({ model: 'gpt-4' }),
+ *   ],
+ * });
+ *
+ * // Run evaluation
+ * const result = await pipeline.evaluate({
+ *   question: 'What is quantum computing?',
+ *   answer: 'Quantum computing uses quantum mechanics...',
+ *   context: ['Quantum computing is a type of computation...'],
+ * });
+ * ```
+ */
+export {
+  // Main Evaluator
+  Evaluator,
+  // Factory and Registry
+  EvaluationAggregator,
+  EvaluatorFactory,
+  getEvaluatorFactory,
+  getEvaluatorRegistry,
+  // Error utilities
+  evaluationErrors,
+  isRetryableEvaluationError,
+  isEvaluationError,
+  createEvaluationFailedError,
+  createParseError,
+  createStrategyNotFoundError,
+  createProviderError,
+  createMaxRetriesExceededError,
+  createBatchEvaluationError,
+  createConfigurationError,
+  contextToErrorContext,
+  // Hooks
+  createLangfuseAdapter,
+  createMockLangfuseClient,
+  startLangfuseAdapter,
+  createConsoleLoggerHook,
+  createMetricsCollectorHook,
+  ObservabilityHooks,
+  observabilityHooks,
+  pipelineToSpanAttributes,
+  scorerToSpanAttributes,
+  // Pipeline
+  createAndInitializePipeline,
+  createPipeline,
+  EvaluationPipeline,
+  PipelineBuilder,
+  Pipelines,
+  CODE_GENERATION_PIPELINE,
+  COMPREHENSIVE_PIPELINE,
+  CUSTOMER_SUPPORT_PIPELINE,
+  getPreset,
+  getPresetNames,
+  MINIMAL_PIPELINE,
+  QUALITY_PIPELINE,
+  RAG_PIPELINE,
+  SAFETY_PIPELINE,
+  SUMMARIZATION_PIPELINE,
+  // Strategies
+  BatchStrategy,
+  createBatchStrategy,
+  evaluateBatch,
+  streamBatchEvaluation,
+  createSamplingStrategy,
+  DEFAULT_SAMPLING_CONFIG,
+  SamplingStrategies,
+  SamplingStrategy,
+  // Reporting
+  createMetricsCollector,
+  globalMetricsCollector,
+  MetricsCollector,
+  createReportGenerator,
+  ReportGenerator,
+  Reports,
+  // Scorers - Base
+  BaseScorer,
+  DEFAULT_SCORE_SCALE as EVAL_DEFAULT_SCORE_SCALE,
+  // Scorers - Custom utilities
+  composeScorers,
+  createConditionalScorer,
+  createFunctionScorer,
+  createInvertedScorer,
+  createKeywordScorer,
+  createRegexScorer,
+  createScorerMetadata,
+  createSimpleLengthScorer,
+  // Scorers - LLM-based
+  AnswerRelevancyScorer,
+  createAnswerRelevancyScorer,
+  BaseLLMScorer,
+  DEFAULT_LLM_SCORER_CONFIG,
+  BiasDetectionScorer,
+  createBiasDetectionScorer,
+  ContextPrecisionScorer,
+  createContextPrecisionScorer,
+  ContextRelevancyScorer,
+  createContextRelevancyScorer,
+  createFaithfulnessScorer,
+  FaithfulnessScorer,
+  createHallucinationScorer,
+  HallucinationScorer,
+  createPromptAlignmentScorer,
+  PromptAlignmentScorer,
+  createSummarizationScorer,
+  SummarizationScorer,
+  createToneConsistencyScorer,
+  ToneConsistencyScorer,
+  createToxicityScorer,
+  ToxicityScorer,
+  // Scorers - Rule-based
+  BaseRuleScorer,
+  DEFAULT_RULE_SCORER_CONFIG,
+  createContentSimilarityScorer,
+  createFormatScorer,
+  FormatScorerPresets,
+  createKeywordCoverageScorer,
+  createLengthScorer,
+  LengthScorerPresets,
+  // Scorers - Builder & Registry
+  ScorerBuilder,
+  Scorers,
+  ScorerRegistry,
+  // RAGAS evaluator + retry manager (legacy + still-supported classes).
+  RAGASEvaluator,
+  RetryManager,
+} from "./evaluation/index.js";
+
+// ============================================================================
 // BACKWARD COMPATIBILITY: Legacy generateText Function Exports
 // ============================================================================
 
 // Export legacy types for backward compatibility
-export type {
-  AnalyticsData,
-  EvaluationData,
-  TextGenerationOptions,
-  TextGenerationResult,
-} from "./types/index.js";
 
 /**
  * Legacy generateText function for backward compatibility.
@@ -488,153 +978,101 @@ export async function generateText(
  * ```
  */
 
-// Core workflow types
-export type {
-  WorkflowConfig,
-  WorkflowResult,
-  ModelConfig,
-  JudgeConfig,
-  ModelGroup,
-  EnsembleResponse,
-  JudgeScores,
-  MultiJudgeScores,
-  WorkflowType,
-  ExecutionStrategy,
-  WorkflowValidationResult,
-} from "./workflow/types.js";
-
-// Workflow execution
-export { runWorkflow } from "./workflow/core/workflowRunner.js";
-export type { RunWorkflowOptions } from "./workflow/core/workflowRunner.js";
-
 // Workflow registry
 export {
-  registerWorkflow,
+  clearRegistry as clearWorkflowRegistry,
   getWorkflow,
   listWorkflows,
-  clearRegistry as clearWorkflowRegistry,
+  registerWorkflow,
 } from "./workflow/core/workflowRegistry.js";
-
-// Pre-built workflows - Consensus
+// Workflow execution
+export { runWorkflow } from "./workflow/core/workflowRunner.js";
+// Workflow constants
 export {
-  CONSENSUS_3_WORKFLOW,
-  CONSENSUS_3_FAST_WORKFLOW,
-  createConsensus3WithPrompt,
-} from "./workflow/workflows/consensusWorkflow.js";
-
-// Pre-built workflows - Fallback
-export {
-  FAST_FALLBACK_WORKFLOW,
-  AGGRESSIVE_FALLBACK_WORKFLOW,
-} from "./workflow/workflows/fallbackWorkflow.js";
-
-// Pre-built workflows - Multi-judge
-export {
-  MULTI_JUDGE_5_WORKFLOW,
-  MULTI_JUDGE_3_WORKFLOW,
-  createMultiJudgeWorkflow,
-} from "./workflow/workflows/multiJudgeWorkflow.js";
-
-// Pre-built workflows - Adaptive
-export {
-  QUALITY_MAX_WORKFLOW,
-  SPEED_FIRST_WORKFLOW,
-  BALANCED_ADAPTIVE_WORKFLOW,
-  createAdaptiveWorkflow,
-} from "./workflow/workflows/adaptiveWorkflow.js";
-
-// Validation and metrics
-export { validateWorkflow } from "./workflow/utils/workflowValidation.js";
-
+  DEFAULT_SCORE_SCALE,
+  WORKFLOW_ENGINE_VERSION,
+} from "./workflow/index.js";
+// Core workflow types
 export {
   calculateModelMetrics,
   compareWorkflows,
   generateSummaryStats,
 } from "./workflow/utils/workflowMetrics.js";
+// Validation and metrics
+export { validateWorkflow } from "./workflow/utils/workflowValidation.js";
 
-// Workflow constants
+// Pre-built workflows - Adaptive
 export {
-  WORKFLOW_ENGINE_VERSION,
-  DEFAULT_SCORE_SCALE,
-} from "./workflow/index.js";
+  BALANCED_ADAPTIVE_WORKFLOW,
+  createAdaptiveWorkflow,
+  QUALITY_MAX_WORKFLOW,
+  SPEED_FIRST_WORKFLOW,
+} from "./workflow/workflows/adaptiveWorkflow.js";
+// Pre-built workflows - Consensus
+export {
+  CONSENSUS_3_FAST_WORKFLOW,
+  CONSENSUS_3_WORKFLOW,
+  createConsensus3WithPrompt,
+} from "./workflow/workflows/consensusWorkflow.js";
+// Pre-built workflows - Fallback
+export {
+  AGGRESSIVE_FALLBACK_WORKFLOW,
+  FAST_FALLBACK_WORKFLOW,
+} from "./workflow/workflows/fallbackWorkflow.js";
+// Pre-built workflows - Multi-judge
+export {
+  createMultiJudgeWorkflow,
+  MULTI_JUDGE_3_WORKFLOW,
+  MULTI_JUDGE_5_WORKFLOW,
+} from "./workflow/workflows/multiJudgeWorkflow.js";
+
+// ============================================================================
+// MODEL POOL & REQUEST ROUTER - Pluggable pre-call routing + failover
+// ============================================================================
+
+/**
+ * ModelPool and RequestRouter — opt-in multi-provider failover with
+ * error-class-aware cooldown, and a pluggable pre-call provider/model router.
+ *
+ * @example ModelPool
+ * ```typescript
+ * import { ModelPool, classifyProviderError } from '@juspay/neurolink';
+ *
+ * const pool = new ModelPool({
+ *   members: [
+ *     { provider: 'anthropic', model: 'claude-sonnet-4-5' },
+ *     { provider: 'vertex',    model: 'gemini-2.5-flash' },
+ *   ],
+ *   strategy: 'priority',
+ *   cooldownMs: 30_000,
+ * });
+ * ```
+ *
+ * @example RequestRouter
+ * ```typescript
+ * import { createDefaultRequestRouter } from '@juspay/neurolink';
+ *
+ * const router = createDefaultRequestRouter({
+ *   visionTier: { provider: 'vertex', model: 'gemini-2.5-pro' },
+ *   largeTier:  { provider: 'anthropic', model: 'claude-opus-4-5' },
+ *   smallTier:  { provider: 'anthropic', model: 'claude-haiku-3-5' },
+ * });
+ * ```
+ */
+export {
+  classifyProviderError,
+  ModelPool,
+  createDefaultRequestRouter,
+  ClassifierRouter,
+  classifyHeuristic,
+} from "./routing/index.js";
 
 // ============================================================================
 // SERVER ADAPTERS - HTTP API Framework Integration
 // ============================================================================
 
 // Server Types
-export type {
-  AgentExecuteRequest,
-  AgentExecuteResponse,
-  AuthConfig,
-  AuthenticatedUser,
-  AuthResult,
-  AuthStrategy,
-  BodyParserConfig,
-  CacheConfig,
-  CacheEntry,
-  CacheStore,
-  CORSConfig,
-  // Route Types
-  CreateRoutesOptions,
-  DataEvent,
-  DataStreamEvent,
-  DataStreamEventType,
-  DataStreamResponseConfig,
-  DataStreamWriter,
-  DataStreamWriterConfig,
-  // Error Types
-  ErrorCategoryType,
-  ErrorEvent,
-  ErrorResponse,
-  ErrorSeverityType,
-  FinishEvent,
-  HealthResponse,
-  HttpMethod,
-  LoggingConfig,
-  MCPServerStatusResponse,
-  MiddlewareDefinition,
-  MiddlewareHandler,
-  OpenAPIGeneratorConfig,
-  OpenAPISpec,
-  PropertySchema,
-  RateLimitConfig as ServerRateLimitConfig,
-  RateLimitMiddlewareConfig,
-  RateLimitStore,
-  ReadyResponse,
-  RequiredServerAdapterConfig,
-  RouteDefinition,
-  RouteGroup,
-  RouteHandler,
-  ServerAdapterConfig,
-  ServerAdapterErrorCodeType,
-  ServerAdapterErrorContext,
-  ServerAdapterEvents,
-  ServerAdapterFactoryOptions,
-  ServerContext,
-  ServerFramework,
-  ServerResponse,
-  ServerStatus,
-  SSEWriteOptions,
-  StreamingConfig,
-  TextDeltaEvent,
-  TextEndEvent,
-  TextStartEvent,
-  ToolCallEvent,
-  ToolExecuteRequest,
-  ToolExecuteResponse,
-  ToolResultEvent,
-  ValidationConfig,
-  ValidationResult,
-  ValidationSchema,
-  WebSocketAuthConfig,
-  // WebSocket Types
-  WebSocketConfig,
-  WebSocketConnection,
-  WebSocketHandler,
-  WebSocketMessage,
-  WebSocketMessageType,
-} from "./server/index.js";
+
 /**
  * Server Adapters for exposing NeuroLink as HTTP APIs
  *
@@ -694,7 +1132,6 @@ export {
   createSSEHeaders,
   createTimingMiddleware,
   createToolRoutes,
-  DataStreamResponse,
   // Error Constants
   ErrorCategory,
   ErrorRecoveryStrategies,
@@ -712,7 +1149,6 @@ export {
   MissingDependencyError,
   NotRunningError,
   // OpenAPI
-  OpenAPIGenerator,
   pipeAsyncIterableToDataStream,
   RateLimitError,
   RouteConflictError,
@@ -752,73 +1188,7 @@ export {
 // ============================================================================
 
 // Export RAG types
-export type {
-  // Chunker configs
-  BaseChunkerConfig,
-  BM25Result,
-  CharacterChunkerConfig,
-  Chunk,
-  ChunkingStrategy,
-  ChunkMetadata,
-  ChunkParams,
-  CitationFormat,
-  // Context
-  ContextAssemblyOptions,
-  ContextWindow,
-  CSVLoaderOptions,
-  // Document types
-  DocumentType,
-  EmbeddingModelConfig,
-  ExtractionResult,
-  // Metadata types
-  ExtractParams,
-  GenerationModelConfig,
-  GraphChunk,
-  GraphEdge,
-  GraphEmbedding,
-  // Graph RAG
-  GraphNode,
-  GraphQueryParams,
-  GraphRAGConfig,
-  GraphStats,
-  HTMLChunkerConfig,
-  // Hybrid search
-  HybridSearchConfig,
-  HybridSearchResult,
-  IngestOptions,
-  JSONChunkerConfig,
-  LaTeXChunkerConfig,
-  // Loader options
-  LoaderOptions,
-  MarkdownChunkerConfig,
-  MDocumentConfig,
-  MetadataFilter,
-  PDFLoaderOptions,
-  PipelineStats,
-  QueryOptions as RAGQueryOptions,
-  // CLI
-  RAGCommandArgs,
-  // RAG Integration
-  RAGConfig,
-  // Pipeline
-  RAGPipelineConfig,
-  RAGResponse,
-  RankedNode,
-  RecursiveChunkerConfig,
-  // Reranker
-  RerankerConfig,
-  RerankerOptions,
-  RerankResult,
-  SemanticChunkerConfig,
-  SentenceChunkerConfig,
-  TokenChunkerConfig,
-  VectorQueryResponse,
-  VectorQueryResult,
-  VectorQueryToolConfig,
-  // Vector types
-  VectorStore,
-  WebLoaderOptions,
-} from "./rag/index.js";
+
 /**
  * RAG (Retrieval-Augmented Generation) Document Processing
  *
@@ -897,10 +1267,7 @@ export {
   prepareRAGTool,
   processDocument,
   RAGCircuitBreaker,
-  type RAGCircuitBreakerConfig,
-  type RAGCircuitBreakerEvents,
   RAGCircuitBreakerManager,
-  type RAGCircuitBreakerStats,
   RAGPipeline,
   RAGRetryHandler,
   RecursiveChunker,
@@ -908,6 +1275,9 @@ export {
   reciprocalRankFusion,
   rerank,
   SemanticChunker,
+  ChromaVectorStore,
+  PgVectorStore,
+  PineconeVectorStore,
   SentenceChunker,
   simpleRerank,
   summarizeContext,
@@ -915,3 +1285,130 @@ export {
   TokenChunker,
   WebLoader,
 } from "./rag/index.js";
+
+// Knowledge grounding — lexical-first host-supplied retrieval (no vectors).
+// Types flow via the ./types barrel above; these are the runtime values.
+export {
+  assembleKnowledgeContext,
+  buildDocument,
+  buildIndexSnapshot,
+  DEFAULT_ALIAS_BOOST,
+  DEFAULT_CANDIDATE_LIMIT,
+  DEFAULT_EXACT_BOOST,
+  DEFAULT_FIELD_WEIGHTS,
+  DEFAULT_MAX_CONTEXT_TOKENS,
+  DEFAULT_RECENT_TURNS,
+  DEFAULT_RELATION_LIMIT,
+  DEFAULT_RESULT_LIMIT,
+  DEFAULT_TIMEOUT_MS,
+  KnowledgeGroundingEngine,
+  KnowledgeLexicalIndex,
+  manifestToSources,
+  normalizeAndValidate,
+  normalizePhrases,
+  normalizeText,
+  resolveEntry,
+  retrieve,
+  tokenize,
+} from "./knowledge/index.js";
+
+// Legacy RAGAS evaluation classes are now exported from the unified
+// evaluation block above (via ./evaluation/index.js barrel).
+// ContextBuilder is the only class not covered by the barrel export.
+export { ContextBuilder } from "./evaluation/contextBuilder.js";
+
+// ============================================================================
+// AUTHENTICATION PROVIDERS - Multi-provider Auth Integration
+// ============================================================================
+// Single-sourced from ./auth/index.js.  Only aliases that differ from the
+// canonical export name are listed explicitly; everything else is re-exported
+// as-is.
+
+export {
+  // Factory & Registry
+  AuthProviderFactory,
+  createAuthProvider,
+  AuthProviderRegistry,
+  // Unified error factory
+  AuthError as AuthErrorFactory,
+  AuthErrorCodes,
+  // Base Provider
+  BaseAuthProvider,
+  InMemorySessionStorage,
+  AuthProviderError,
+  // Auth Middleware (aliased to avoid conflict with server createAuthMiddleware)
+  createAuthMiddleware as createAuthProviderMiddleware,
+  createRBACMiddleware,
+  createProtectedMiddleware,
+  createExpressAuthMiddleware,
+  createRequestContext,
+  extractToken,
+  AuthMiddlewareError,
+  AuthMiddlewareErrorCodes,
+  // Rate Limiting Middleware
+  UserRateLimiter,
+  MemoryRateLimitStorage,
+  RedisRateLimitStorage,
+  createRateLimitByUserMiddleware,
+  createAuthenticatedRateLimitMiddleware,
+  createRateLimitStorage,
+  // Session Management
+  SessionManager,
+  MemorySessionStorage,
+  RedisSessionStorage,
+  createSessionStorage,
+  // Auth Context
+  AuthContextHolder,
+  globalAuthContext,
+  getAuthContext,
+  getCurrentUser,
+  getCurrentSession,
+  isAuthenticated,
+  hasRole,
+  hasAnyRole,
+  hasPermission,
+  hasAllPermissions,
+  requireAuth,
+  requireRole,
+  requirePermission,
+  requireUser,
+  runWithAuthContext,
+  createAuthenticatedContext,
+  // Request Context
+  RequestContext,
+  NEUROLINK_RESOURCE_ID_KEY,
+  NEUROLINK_THREAD_ID_KEY,
+  // Server Bridge
+  createAuthValidatorFromProvider,
+} from "./auth/index.js";
+
+// ============================================================================
+// SAFETY UTILITIES — PII Detection, Response Validation, Tripwires
+// ============================================================================
+
+export { detectAndRedactPII } from "./utils/piiDetector.js";
+export { validateResponse } from "./utils/responseValidator.js";
+export {
+  TripwireEvaluator,
+  createDefaultTripwireEvaluator,
+  commonTripwires,
+} from "./utils/tripwireEvaluator.js";
+
+// ============================================================================
+// Multi-Agent Orchestration exports
+// ============================================================================
+export { Agent } from "./agent/agent.js";
+export { AgentNetwork } from "./agent/agentNetwork.js";
+
+// Advanced agent orchestration exports
+export {
+  // Coordination
+  AgentCoordinator,
+  TaskDistributor,
+  // Communication
+  MessageBus,
+  // Orchestration
+  NetworkOrchestrator,
+  NetworkTopology,
+  TopologyBuilder,
+} from "./agent/index.js";

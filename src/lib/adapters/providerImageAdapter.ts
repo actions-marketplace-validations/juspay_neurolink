@@ -3,9 +3,9 @@
  * Handles provider-specific image formatting and vision capability validation
  */
 
-import { logger } from "../utils/logger.js";
+import type { Content, ImageWithAltText } from "../types/index.js";
 import { ImageProcessor } from "../utils/imageProcessor.js";
-import type { Content, ImageWithAltText } from "../types/multimodal.js";
+import { logger } from "../utils/logger.js";
 
 /**
  * Simplified logger for essential error reporting only
@@ -45,11 +45,73 @@ const IMAGE_LIMITS = {
 } as const;
 
 /**
+ * Proxy providers that route to arbitrary underlying models.
+ * Vision capability cannot be statically determined for these — pass requests
+ * through and let the underlying provider surface errors if needed.
+ */
+const PROXY_PROVIDERS = new Set(["litellm", "openrouter"]);
+
+/**
+ * Family-level vision rules, checked ONLY after a model id misses the exact
+ * VISION_CAPABILITIES allowlist for its provider. Kept as patterns (mirroring
+ * SAMPLING_PARAM_REJECTING_FAMILIES in modelRegistry.ts) because gateway ids
+ * carry arbitrary prefixes/suffixes (`vertex_ai/claude-sonnet-5@20260203`,
+ * `claude-opus-4-7-20260115`) that exact entries can't cover.
+ *
+ * Matches name-first Claude ids (claude-{opus,sonnet,haiku}-N…) with major
+ * version ≥ 4 — e.g. `claude-sonnet-5`, `claude-opus-5`, `claude-opus-4-7`,
+ * `claude-haiku-4-5` — all of which are vision-capable, plus the
+ * Fable/Mythos-class models (`claude-fable-5`, `claude-mythos-5`).
+ *
+ * Legacy number-first 3.x ids (`claude-3-5-haiku`, `claude-3-haiku`, …)
+ * deliberately do NOT match: the family word follows the version there, and
+ * claude-3-5-haiku — the last non-vision Claude — must stay rejected.
+ */
+const CLAUDE_MODERN_VISION_FAMILIES: RegExp[] = [
+  /claude-(?:opus|sonnet|haiku)-(?:[4-9]|\d{2,})/i,
+  /claude-(?:fable|mythos)-\d/i,
+];
+const VISION_FAMILY_RULES: Partial<Record<string, RegExp[]>> = {
+  anthropic: CLAUDE_MODERN_VISION_FAMILIES,
+  vertex: CLAUDE_MODERN_VISION_FAMILIES,
+};
+
+/**
+ * Normalize provider name/alias to its canonical form for vision checks.
+ */
+function normalizeVisionProvider(provider: string): string {
+  const lower = provider.toLowerCase();
+  // Strip non-alpha characters so alias forms (e.g. "lm-studio", "lm_studio",
+  // "llama.cpp", "nvidia_nim") all collapse onto a canonical key. Mirrors
+  // the alias-normalization pattern used in pricing.ts and contextWindows.ts.
+  const stripped = lower.replace(/[^a-z]/g, "");
+  switch (stripped) {
+    case "lmstudio":
+      return "lm-studio";
+    case "llamacpp":
+      return "llamacpp";
+    case "nvidianim":
+      return "nvidia-nim";
+    case "googleaistudio":
+      return "google-ai";
+    case "or":
+      return "openrouter";
+    default:
+      return lower;
+  }
+}
+
+/**
  * Vision capability definitions for each provider
  */
 const VISION_CAPABILITIES = {
   openai: [
-    // GPT-5.2 family (released Dec 11, 2025) - Latest flagship models
+    // GPT-5.4 family (released Mar 2026) - Latest flagship models
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.4-pro",
+    // GPT-5.2 family (released Dec 11, 2025)
     "gpt-5.2",
     "gpt-5.2-chat-latest",
     "gpt-5.2-pro",
@@ -77,15 +139,15 @@ const VISION_CAPABILITIES = {
     "gpt-4-vision-preview",
   ],
   "google-ai": [
-    // Gemini 3 Series (Preview - November 2025)
-    "gemini-3-pro-preview",
-    "gemini-3-pro-preview-11-2025",
-    "gemini-3-pro-latest",
-    "gemini-3-pro-image-preview",
-    // Gemini 3 Flash Series
-    "gemini-3-flash",
+    // Gemini 3.1 Series (all require -preview suffix)
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-flash-image-preview",
+    "gemini-3.1-pro-preview-customtools",
+    // Gemini 3 Series
     "gemini-3-flash-preview",
-    "gemini-3-flash-latest",
+    "gemini-3-pro-image-preview",
+    "gemini-3-pro-preview",
     // Gemini 2.5 Series
     "gemini-2.5-pro",
     "gemini-2.5-flash",
@@ -102,6 +164,9 @@ const VISION_CAPABILITIES = {
     "gemini-pro-vision",
   ],
   anthropic: [
+    // Claude 4.6 Series (February 2026)
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
     // Claude 4.5 Series (September-November 2025)
     "claude-sonnet-4-5",
     "claude-sonnet-4-5-20250929",
@@ -155,15 +220,15 @@ const VISION_CAPABILITIES = {
     "gpt-4",
   ],
   vertex: [
-    // Gemini 3.x models on Vertex AI (Preview)
-    "gemini-3-pro-preview-11-2025",
-    "gemini-3-pro-latest",
-    "gemini-3-pro-preview",
-    "gemini-3-pro",
-    // Gemini 3 Flash Series on Vertex AI
-    "gemini-3-flash",
+    // Gemini 3.1 models on Vertex AI (all require -preview suffix)
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-flash-image-preview",
+    "gemini-3.1-pro-preview-customtools",
+    // Gemini 3 Series on Vertex AI
     "gemini-3-flash-preview",
-    "gemini-3-flash-latest",
+    "gemini-3-pro-image-preview",
+    "gemini-3-pro-preview",
     // Gemini 2.5 models on Vertex AI
     "gemini-2.5-pro",
     "gemini-2.5-flash",
@@ -237,11 +302,8 @@ const VISION_CAPABILITIES = {
     "vertex_ai/gemini-2.5-pro",
     "gemini/gemini-2.5-pro",
     "gemini/gemini-2.0-flash",
-    "gemini-3-pro-preview",
-    "gemini-3-pro-latest",
-    "gemini-3-flash",
+    "gemini-3.1-pro-preview",
     "gemini-3-flash-preview",
-    "gemini-3-flash-latest",
     "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.0-flash-lite",
@@ -251,7 +313,7 @@ const VISION_CAPABILITIES = {
   openrouter: [
     // OpenRouter provides access to vision-capable models from multiple providers
     // Anthropic Claude models (via OpenRouter)
-    "anthropic/claude-3-5-sonnet",
+    "anthropic/claude-3.7-sonnet",
     "anthropic/claude-3-5-haiku",
     "anthropic/claude-3-opus",
     "anthropic/claude-3-sonnet",
@@ -418,226 +480,78 @@ const VISION_CAPABILITIES = {
     "meta-llama-4-maverick-17b-128e-instruct",
     "meta-llama-4-scout-17b-16e-instruct",
   ],
+  // DeepSeek has no vision support — empty list
+  deepseek: [] as readonly string[],
+  "nvidia-nim": [
+    "meta/llama-3.2-90b-vision-instruct",
+    "meta/llama-3.2-11b-vision-instruct",
+  ],
+  // LM Studio + llama.cpp: vision depends on the loaded model.
+  // Substrings must point at known multimodal variants only — bare
+  // "llama-3.2" matches the text-only Llama-3.2-1B/3B chat models.
+  "lm-studio": [
+    "llava",
+    "llama-3.2-11b-vision",
+    "llama-3.2-90b-vision",
+    "vision-instruct",
+    "qwen2-vl",
+    "qwen2.5-vl",
+    "phi-3-vision",
+  ],
+  llamacpp: [
+    "llava",
+    "llama-3.2-11b-vision",
+    "llama-3.2-90b-vision",
+    "vision-instruct",
+    "qwen2-vl",
+    "phi-3-vision",
+  ],
+  // xAI: only grok-2-vision is multimodal today
+  xai: ["grok-2-vision-latest"],
+  // Groq: vision models are explicit "*-vision-preview" variants
+  groq: ["llama-3.2-90b-vision-preview", "llama-3.2-11b-vision-preview"],
+  // Cohere: command-r* are text-only (no vision); empty list
+  cohere: [] as readonly string[],
+  // Together AI: text-only by default; add vision variants if/when used.
+  "together-ai": [] as readonly string[],
+  // Fireworks: vision via Phi-3-Vision and Llama 3.2 vision variants.
+  fireworks: [
+    "accounts/fireworks/models/phi-3-vision-128k-instruct",
+    "accounts/fireworks/models/llama-v3p2-90b-vision-instruct",
+    "accounts/fireworks/models/llama-v3p2-11b-vision-instruct",
+  ],
+  // Perplexity Sonar — text-only with web grounding.
+  perplexity: [] as readonly string[],
+  // Cloudflare: explicit vision variants only.
+  cloudflare: ["@cf/meta/llama-3.2-11b-vision-instruct"],
+  // Replicate: vision capability depends on the specific model id.
+  replicate: ["llava", "llama-3.2-vision", "moondream", "qwen2-vl"],
+  // Voyage / Jina — embedding-only, not multimodal in this sense.
+  voyage: [] as readonly string[],
+  jina: [] as readonly string[],
+  // Stability / Ideogram / Recraft — image-OUTPUT, not image-INPUT.
+  // VISION_CAPABILITIES tracks reference-image input support.
+  stability: [] as readonly string[],
+  ideogram: [] as readonly string[],
+  recraft: [] as readonly string[],
 } as const;
 
 /**
  * Provider Image Adapter - Smart routing and formatting
  */
 export class ProviderImageAdapter {
-  /**
-   * Main adapter method - routes to provider-specific formatting
-   */
-  static async adaptForProvider(
-    text: string,
-    images: Array<Buffer | string>,
-    provider: string,
-    model: string,
-  ): Promise<unknown> {
-    try {
-      // Validate provider supports vision
-      this.validateVisionSupport(provider, model);
-
-      let adaptedPayload: unknown;
-
-      // Process images based on provider requirements
-      switch (provider.toLowerCase()) {
-        case "openai":
-          adaptedPayload = this.formatForOpenAI(text, images);
-          break;
-        case "azure":
-        case "azure-openai":
-          // Azure uses same format as OpenAI but validate with azure provider name
-          this.validateImageCount(images.length, "azure");
-          adaptedPayload = this.formatForOpenAI(text, images, true);
-          break;
-        case "google-ai":
-        case "google":
-          adaptedPayload = this.formatForGoogleAI(text, images);
-          break;
-        case "anthropic":
-          adaptedPayload = this.formatForAnthropic(text, images);
-          break;
-        case "vertex":
-          adaptedPayload = this.formatForVertex(text, images, model);
-          break;
-        case "ollama":
-          // Ollama uses same format as OpenAI but validate with ollama provider name
-          this.validateImageCount(images.length, "ollama");
-          adaptedPayload = this.formatForOpenAI(text, images, true);
-          break;
-        case "huggingface":
-          adaptedPayload = this.formatForOpenAI(text, images);
-          break;
-        case "sagemaker":
-          adaptedPayload = this.formatForOpenAI(text, images);
-          break;
-        case "litellm":
-          // LiteLLM uses same format as OpenAI but validate with litellm provider name
-          this.validateImageCount(images.length, "litellm");
-          adaptedPayload = this.formatForOpenAI(text, images, true);
-          break;
-        case "mistral":
-          // Mistral uses same format as OpenAI but validate with mistral provider name
-          this.validateImageCount(images.length, "mistral");
-          adaptedPayload = this.formatForOpenAI(text, images, true);
-          break;
-        case "bedrock":
-          // Bedrock uses same format as Anthropic but validate with bedrock provider name
-          this.validateImageCount(images.length, "bedrock");
-          adaptedPayload = this.formatForAnthropic(text, images, true);
-          break;
-        case "openrouter":
-          // OpenRouter routes to underlying providers, use OpenAI format
-          this.validateImageCount(images.length, "openrouter");
-          adaptedPayload = this.formatForOpenAI(text, images);
-          break;
-        default:
-          throw new Error(`Vision not supported for provider: ${provider}`);
-      }
-
-      return adaptedPayload;
-    } catch (error) {
-      MultimodalLogger.logError("ADAPTATION", error as Error, {
-        provider,
-        model,
-        imageCount: images.length,
-      });
-      throw error;
-    }
-  }
+  // NOTE: The legacy `adaptForProvider` method and its private helpers
+  // (formatForOpenAI, formatForGoogleAI, formatForAnthropic, formatForVertex,
+  // validateVisionSupport) were removed as dead code. The production image
+  // pipeline uses `convertSimpleImagesToProviderFormat` in messageBuilder.ts
+  // with Vercel AI SDK's native ImagePart format. Image count limits are
+  // enforced via the public `validateImageCount` method below.
 
   /**
-   * Format content for OpenAI (GPT-4o format)
+   * Validate image count against provider limits.
+   * Warns at 80% threshold, throws error if limit exceeded.
    */
-  private static formatForOpenAI(
-    text: string,
-    images: Array<Buffer | string>,
-    skipValidation = false,
-  ): unknown {
-    // Validate image count before processing (unless called from another formatter)
-    if (!skipValidation) {
-      this.validateImageCount(images.length, "openai");
-    }
-
-    const content: unknown[] = [{ type: "text", text }];
-
-    images.forEach((image, index) => {
-      try {
-        const imageUrl = ImageProcessor.processImageForOpenAI(image);
-        content.push({
-          type: "image_url",
-          image_url: { url: imageUrl },
-        });
-      } catch (error) {
-        MultimodalLogger.logError("PROCESS_IMAGE", error as Error, {
-          index,
-          provider: "openai",
-        });
-        throw error;
-      }
-    });
-
-    return { messages: [{ role: "user", content }] };
-  }
-
-  /**
-   * Format content for Google AI (Gemini format)
-   */
-  private static formatForGoogleAI(
-    text: string,
-    images: Array<Buffer | string>,
-    skipValidation = false,
-  ): unknown {
-    // Validate image count before processing (unless called from another formatter)
-    if (!skipValidation) {
-      this.validateImageCount(images.length, "google-ai");
-    }
-
-    const parts: unknown[] = [{ text }];
-
-    images.forEach((image, index) => {
-      try {
-        const { mimeType, data } = ImageProcessor.processImageForGoogle(image);
-        parts.push({
-          inlineData: { mimeType, data },
-        });
-      } catch (error) {
-        MultimodalLogger.logError("PROCESS_IMAGE", error as Error, {
-          index,
-          provider: "google-ai",
-        });
-        throw error;
-      }
-    });
-
-    return { contents: [{ parts }] };
-  }
-
-  /**
-   * Format content for Anthropic (Claude format)
-   */
-  private static formatForAnthropic(
-    text: string,
-    images: Array<Buffer | string>,
-    skipValidation = false,
-  ): unknown {
-    // Validate image count before processing (unless called from another formatter)
-    if (!skipValidation) {
-      this.validateImageCount(images.length, "anthropic");
-    }
-
-    const content: unknown[] = [{ type: "text", text }];
-
-    images.forEach((image, index) => {
-      try {
-        const { mediaType, data } =
-          ImageProcessor.processImageForAnthropic(image);
-        content.push({
-          type: "image",
-          source: {
-            type: "base64",
-            media_type: mediaType,
-            data,
-          },
-        });
-      } catch (error) {
-        MultimodalLogger.logError("PROCESS_IMAGE", error as Error, {
-          index,
-          provider: "anthropic",
-        });
-        throw error;
-      }
-    });
-
-    return { messages: [{ role: "user", content }] };
-  }
-
-  /**
-   * Format content for Vertex AI (model-specific routing)
-   */
-  private static formatForVertex(
-    text: string,
-    images: Array<Buffer | string>,
-    model: string,
-  ): unknown {
-    // Validate image count with model-specific limits before processing
-    this.validateImageCount(images.length, "vertex", model);
-
-    // Route based on model type, skip validation in delegated methods
-    if (model.includes("gemini")) {
-      return this.formatForGoogleAI(text, images, true);
-    } else if (model.includes("claude")) {
-      return this.formatForAnthropic(text, images, true);
-    } else {
-      return this.formatForGoogleAI(text, images, true);
-    }
-  }
-
-  /**
-   * Validate image count against provider limits
-   * Warns at 80% threshold, throws error if limit exceeded
-   */
-  private static validateImageCount(
+  static validateImageCount(
     imageCount: number,
     provider: string,
     model?: string,
@@ -694,35 +608,6 @@ export class ProviderImageAdapter {
   }
 
   /**
-   * Validate that provider and model support vision
-   */
-  private static validateVisionSupport(provider: string, model: string): void {
-    const normalizedProvider = provider.toLowerCase();
-    const supportedModels =
-      VISION_CAPABILITIES[
-        normalizedProvider as keyof typeof VISION_CAPABILITIES
-      ];
-
-    if (!supportedModels) {
-      throw new Error(
-        `Provider ${provider} does not support vision processing. ` +
-          `Supported providers: ${Object.keys(VISION_CAPABILITIES).join(", ")}`,
-      );
-    }
-
-    const isSupported = supportedModels.some((supportedModel) =>
-      model.toLowerCase().includes(supportedModel.toLowerCase()),
-    );
-
-    if (!isSupported) {
-      throw new Error(
-        `Provider ${provider} with model ${model} does not support vision processing. ` +
-          `Supported models for ${provider}: ${supportedModels.join(", ")}`,
-      );
-    }
-  }
-
-  /**
    * Convert simple images array to advanced content format
    * @param text - Text content to include
    * @param images - Array of images (Buffer, string, or ImageWithAltText)
@@ -772,7 +657,18 @@ export class ProviderImageAdapter {
    */
   static supportsVision(provider: string, model?: string): boolean {
     try {
-      const normalizedProvider = provider.toLowerCase();
+      const normalizedProvider = normalizeVisionProvider(provider);
+
+      // Anthropic behind a proxy (ANTHROPIC_BASE_URL set) routes to whatever
+      // the proxy exposes — capability gating is the upstream's job. Mirrors
+      // the validateModelAccess tier-check bypass in providers/anthropic.ts.
+      if (
+        normalizedProvider === "anthropic" &&
+        process.env.ANTHROPIC_BASE_URL
+      ) {
+        return true;
+      }
+
       const supportedModels =
         VISION_CAPABILITIES[
           normalizedProvider as keyof typeof VISION_CAPABILITIES
@@ -782,13 +678,38 @@ export class ProviderImageAdapter {
         return false;
       }
 
+      // An empty list means the provider has NO vision support (e.g. deepseek).
+      // Without this guard, the no-model branch below would return `true` for
+      // every provider that has an entry in VISION_CAPABILITIES — even an empty
+      // one — letting vision requests through to a text-only API.
+      if (supportedModels.length === 0) {
+        return false;
+      }
+
       if (!model) {
         return true; // Provider supports vision, but need to check specific model
       }
 
-      return supportedModels.some((supportedModel) =>
+      const modelMatched = supportedModels.some((supportedModel) =>
         model.toLowerCase().includes(supportedModel.toLowerCase()),
       );
+
+      if (
+        !modelMatched &&
+        VISION_FAMILY_RULES[normalizedProvider]?.some((rule) =>
+          rule.test(model),
+        )
+      ) {
+        return true;
+      }
+
+      // Proxy providers route to arbitrary underlying models — pass through if
+      // the model isn't in the known allowlist.
+      if (!modelMatched && PROXY_PROVIDERS.has(normalizedProvider)) {
+        return true;
+      }
+
+      return modelMatched;
     } catch {
       return false;
     }
@@ -810,7 +731,12 @@ export class ProviderImageAdapter {
    * Get all vision-capable providers
    */
   static getVisionProviders(): string[] {
-    return Object.keys(VISION_CAPABILITIES);
+    // Filter out providers whose allowlist is empty (e.g. deepseek). They're
+    // listed in VISION_CAPABILITIES so supportsVision can return false for
+    // them, but they should not be advertised as vision-capable.
+    return Object.entries(VISION_CAPABILITIES)
+      .filter(([, models]) => models.length > 0)
+      .map(([provider]) => provider);
   }
 
   /**

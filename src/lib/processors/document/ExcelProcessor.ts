@@ -36,26 +36,55 @@
  * ```
  */
 
-import ExcelJS from "exceljs";
-
-const { Workbook } = ExcelJS;
-type CellValue = ExcelJS.CellValue;
-
 import { BaseFileProcessor } from "../base/BaseFileProcessor.js";
 import type {
+  CellValue,
+  ExcelJSCell,
+  ExcelJSRow,
+  ExcelJSWorkbook,
+  ExcelJSWorksheet,
+  ExcelWorksheet,
   FileInfo,
-  FileProcessingResult,
   ProcessOptions,
-} from "../base/types.js";
+  ProcessedExcel,
+  ProcessorFileProcessingResult,
+} from "../../types/index.js";
 import { SIZE_LIMITS } from "../config/index.js";
 import { FileErrorCode } from "../errors/index.js";
 
+let _exceljs: typeof import("exceljs") | null = null;
+async function loadExcelJS() {
+  if (_exceljs) {
+    return _exceljs;
+  }
+  try {
+    const mod: unknown = await import(/* @vite-ignore */ "exceljs");
+    // exceljs is a CommonJS module. Under Node ESM (and some bundlers) the
+    // `Workbook` constructor is exposed at runtime on the namespace's `default`
+    // export rather than on the namespace itself — so a bare
+    // `new ExcelJS.Workbook()` throws "ExcelJS.Workbook is not a constructor"
+    // (TS still types it as present via esModuleInterop, masking the bug).
+    // Normalise here so the constructor is reachable regardless of interop style.
+    const ns = mod as { Workbook?: unknown; default?: unknown };
+    _exceljs = (
+      ns.Workbook ? ns : (ns.default ?? ns)
+    ) as typeof import("exceljs");
+    return _exceljs;
+  } catch (err) {
+    const e = err instanceof Error ? (err as NodeJS.ErrnoException) : null;
+    if (e?.code === "ERR_MODULE_NOT_FOUND" && e.message.includes("exceljs")) {
+      throw new Error(
+        'Excel file processing requires the "exceljs" package. Install it with:\n  pnpm add exceljs',
+        { cause: err },
+      );
+    }
+    throw err;
+  }
+}
+
 // Re-export for consumers who import from this module
-export type { ExcelWorksheet, ProcessedExcel } from "../base/types.js";
 
 // Import for local use
-import type { ExcelWorksheet, ProcessedExcel } from "../base/types.js";
-
 // =============================================================================
 // CONSTANTS
 // =============================================================================
@@ -191,7 +220,7 @@ export class ExcelProcessor extends BaseFileProcessor<ProcessedExcel> {
   override async processFile(
     fileInfo: FileInfo,
     options?: ProcessOptions,
-  ): Promise<FileProcessingResult<ProcessedExcel>> {
+  ): Promise<ProcessorFileProcessingResult<ProcessedExcel>> {
     try {
       // Step 1: Validate file type and size
       const validationResult = this.validateFileWithResult(fileInfo);
@@ -303,10 +332,13 @@ export class ExcelProcessor extends BaseFileProcessor<ProcessedExcel> {
    * @param buffer - Excel file content
    * @returns Parsed ExcelJS Workbook
    */
-  private async parseWorkbook(
-    buffer: Buffer,
-  ): Promise<InstanceType<typeof Workbook>> {
-    const workbook = new Workbook();
+  private async parseWorkbook(buffer: Buffer): Promise<ExcelJSWorkbook> {
+    const ExcelJS = await loadExcelJS();
+    // The exceljs constructor comes from a normalised CJS/ESM interop
+    // namespace (see loadExcelJS); probe the instance as `unknown` and
+    // narrow to the structural subset this processor uses.
+    const workbookInstance: unknown = new ExcelJS.Workbook();
+    const workbook = workbookInstance as ExcelJSWorkbook;
     // ExcelJS load() types expect Buffer but Node 22+ Buffer<ArrayBufferLike>
     // is not directly assignable. Extract a clean ArrayBuffer for the exact
     // byte range via slice, then cast for type compatibility.
@@ -325,7 +357,7 @@ export class ExcelProcessor extends BaseFileProcessor<ProcessedExcel> {
    * @param workbook - Parsed ExcelJS Workbook
    * @returns Extracted worksheets with truncation metadata
    */
-  private extractWorksheets(workbook: InstanceType<typeof Workbook>): {
+  private extractWorksheets(workbook: ExcelJSWorkbook): {
     worksheets: ExcelWorksheet[];
     truncated: boolean;
     truncatedSheets: string[];
@@ -351,7 +383,7 @@ export class ExcelProcessor extends BaseFileProcessor<ProcessedExcel> {
       let rowIndex = 0;
       let hitLimit = false;
 
-      worksheet.eachRow((row: ExcelJS.Row, rowNumber: number) => {
+      worksheet.eachRow((row: ExcelJSRow, rowNumber: number) => {
         if (hitLimit) {
           return;
         }
@@ -524,7 +556,7 @@ export class ExcelProcessor extends BaseFileProcessor<ProcessedExcel> {
     const workbook = await this.parseWorkbook(buffer);
 
     // Resolve the target worksheet
-    let worksheet: ExcelJS.Worksheet | undefined;
+    let worksheet: ExcelJSWorksheet | undefined;
     if (typeof sheet === "number") {
       // exceljs worksheets are 1-indexed
       worksheet = workbook.worksheets[sheet];
@@ -535,7 +567,9 @@ export class ExcelProcessor extends BaseFileProcessor<ProcessedExcel> {
     }
 
     if (!worksheet) {
-      const sheetNames = workbook.worksheets.map((ws) => ws.name).join(", ");
+      const sheetNames = workbook.worksheets
+        .map((ws: ExcelJSWorksheet) => ws.name)
+        .join(", ");
       return `Sheet not found. Available sheets: ${sheetNames}`;
     }
 
@@ -554,24 +588,30 @@ export class ExcelProcessor extends BaseFileProcessor<ProcessedExcel> {
     const actualRowEnd = rowEnd ?? worksheet.rowCount;
     let rowCount = 0;
 
-    worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
-      if (rowNumber < rowStart || rowNumber > actualRowEnd) {
-        return;
-      }
-      rowCount++;
-
-      const values: string[] = [];
-      row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
-        if (columnIndices && !columnIndices.includes(colNumber)) {
+    worksheet.eachRow(
+      { includeEmpty: false },
+      (row: ExcelJSRow, rowNumber: number) => {
+        if (rowNumber < rowStart || rowNumber > actualRowEnd) {
           return;
         }
-        const val = this.getCellValue(cell.value as CellValue);
-        values.push(val === null ? "" : String(val));
-      });
+        rowCount++;
 
-      // Add row number prefix for easy reference
-      lines.push(`${rowNumber}\t${values.join("\t")}`);
-    });
+        const values: string[] = [];
+        row.eachCell(
+          { includeEmpty: true },
+          (cell: ExcelJSCell, colNumber: number) => {
+            if (columnIndices && !columnIndices.includes(colNumber)) {
+              return;
+            }
+            const val = this.getCellValue(cell.value as CellValue);
+            values.push(val === null ? "" : String(val));
+          },
+        );
+
+        // Add row number prefix for easy reference
+        lines.push(`${rowNumber}\t${values.join("\t")}`);
+      },
+    );
 
     if (rowCount === 0) {
       lines.push(`(No data in rows ${rowStart}-${actualRowEnd})`);
@@ -677,7 +717,7 @@ export function validateExcelSize(sizeBytes: number): boolean {
 export async function processExcel(
   fileInfo: FileInfo,
   options?: ProcessOptions,
-): Promise<FileProcessingResult<ProcessedExcel>> {
+): Promise<ProcessorFileProcessingResult<ProcessedExcel>> {
   return excelProcessor.processFile(fileInfo, options);
 }
 

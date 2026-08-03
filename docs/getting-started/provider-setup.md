@@ -9,12 +9,16 @@ NeuroLink supports multiple AI providers with flexible authentication methods. T
 - **Amazon SageMaker** - Custom models deployed on SageMaker endpoints
 - **Google Vertex AI** - Gemini 3 Flash/Pro (preview), Gemini 2.5 Flash, Claude 4.0 Sonnet
 - **Google AI Studio** - Gemini 1.5 Pro, Gemini 2.0 Flash, Gemini 1.5 Flash
-- **Anthropic** - Claude 3.5 Sonnet, Claude 3 Opus, Claude 3 Haiku
+- **Anthropic** - Claude 4.5 Opus/Sonnet/Haiku, Claude 4.0 Opus/Sonnet, Claude 3.7 Sonnet
 - **Azure OpenAI** - GPT-4, GPT-3.5-Turbo
 - **LiteLLM** - 100+ models from all providers via proxy server
 - **Hugging Face** - 100,000+ open source models including DialoGPT, GPT-2, GPT-Neo
 - **Ollama** - Local AI models including Llama 2, Code Llama, Mistral, Vicuna
 - **Mistral AI** - Mistral Tiny, Small, Medium, and Large models
+- **DeepSeek** - deepseek-chat (V3) and deepseek-reasoner (R1)
+- **NVIDIA NIM** - Llama 3.3 70B and 400+ catalog models via NVIDIA hosted or self-hosted NIM
+- **LM Studio** - Any model loaded in LM Studio desktop app (local, no API key required)
+- **llama.cpp** - Any GGUF model served by llama-server (local, no API key required)
 
 ## 💰 Model Availability & Cost Considerations
 
@@ -480,6 +484,8 @@ const result = await neurolink.generate({
 - `veo-3.1` / `veo-3.1-generate-001` - Video generation from image + text prompt (8-second videos with audio)
 
 > **Video Generation:** Use `output.mode: "video"` with Veo 3.1 to generate videos. See [Video Generation Guide](../features/video-generation.md).
+
+> **PPT Generation:** Use `output.mode: "ppt"` with supported providers (Vertex AI, Google AI, OpenAI, Anthropic, Azure OpenAI, or Bedrock) and compatible text models to generate PowerPoint presentations. See [PPT Generation Guide](../features/ppt-generation.md).
 
 ### Gemini 3 Extended Thinking Configuration
 
@@ -1141,12 +1147,16 @@ Mistral models excel at multilingual tasks:
 
 ## Anthropic Configuration {#anthropic}
 
-Direct access to Anthropic's Claude models without going through AWS Bedrock.
+Direct access to Anthropic's Claude models. Supports both API key and OAuth (Claude subscription) authentication.
 
 ### Basic Setup
 
 ```bash
+# Option 1: API key authentication
 export ANTHROPIC_API_KEY="sk-ant-api03-your-key-here"
+
+# Option 2: OAuth authentication (Claude Pro/Max subscribers)
+neurolink auth login anthropic
 ```
 
 ### Optional Configuration
@@ -1157,10 +1167,13 @@ export ANTHROPIC_MODEL="claude-3-5-sonnet-20241022"  # Default model
 
 ### Supported Models
 
-- `claude-3-7-sonnet-20250219` - Latest Claude 3.7 Sonnet
-- `claude-3-5-sonnet-20241022` (default) - Claude 3.5 Sonnet v2
-- `claude-3-opus-20240229` - Most capable model
-- `claude-3-haiku-20240307` - Fastest, most cost-effective
+- `claude-opus-4-5-20251101` - Claude 4.5 Opus (most capable)
+- `claude-sonnet-4-5-20250929` - Claude 4.5 Sonnet
+- `claude-haiku-4-5-20251001` - Claude 4.5 Haiku (fastest)
+- `claude-opus-4-1-20250805` - Claude 4.1 Opus
+- `claude-opus-4-20250514` - Claude 4.0 Opus
+- `claude-sonnet-4-20250514` - Claude 4.0 Sonnet
+- `claude-3-7-sonnet-20250219` - Claude 3.7 Sonnet
 
 ### Usage Example
 
@@ -1187,10 +1200,12 @@ const result = await neurolink.generate({
 
 ### Getting Started with Anthropic
 
-1. **Create Account**: Visit [anthropic.com](https://www.anthropic.com)
-2. **Get API Key**: Navigate to API Keys section
-3. **Generate Key**: Create new API key
-4. **Set Environment**: Export key as `ANTHROPIC_API_KEY`
+1. **API Key**: Visit [console.anthropic.com](https://console.anthropic.com), navigate to API Keys, and export as `ANTHROPIC_API_KEY`
+2. **OAuth (Subscription)**: Run `neurolink auth login anthropic` to authenticate with your Claude Pro/Max subscription
+
+### Complete Guide
+
+For comprehensive Anthropic setup including OAuth configuration, subscription tiers, and advanced options, see the [Detailed Anthropic Provider Guide](providers/anthropic.md) and the [Claude Subscription Guide](../features/claude-subscription.md).
 
 ## Azure OpenAI Configuration {#azure}
 
@@ -1312,6 +1327,340 @@ export OPENAI_COMPATIBLE_API_KEY="your-api-key-if-needed"
 # Optional: Default model name
 export OPENAI_COMPATIBLE_MODEL="your-model-name"
 ```
+
+## DeepSeek Configuration {#deepseek}
+
+DeepSeek provides cost-effective access to its own frontier models: the general-purpose V3 chat model and the R1 reasoning model.
+
+### Basic Setup
+
+```bash
+export DEEPSEEK_API_KEY="sk-your-deepseek-api-key"
+```
+
+### Optional Configuration
+
+```bash
+export DEEPSEEK_MODEL="deepseek-chat"               # Default: deepseek-chat
+export DEEPSEEK_BASE_URL="https://api.deepseek.com" # Default base URL (override for compatible proxies)
+```
+
+### Supported Models
+
+- `deepseek-chat` (default) - DeepSeek V3, high-quality general chat at low cost
+- `deepseek-reasoner` - DeepSeek R1, extended chain-of-thought reasoning (thinking mode)
+
+### Usage Example
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+
+const neurolink = new NeuroLink();
+
+// General chat with DeepSeek V3
+const result = await neurolink.generate({
+  input: { text: "Explain transformers in simple terms" },
+  provider: "deepseek",
+  model: "deepseek-chat",
+  temperature: 0.7,
+  maxTokens: 1000,
+});
+
+// Extended reasoning with DeepSeek R1
+const reasoned = await neurolink.generate({
+  input: { text: "Solve step by step: ..." },
+  provider: "deepseek",
+  model: "deepseek-reasoner",
+  thinkingLevel: "high",
+});
+```
+
+### CLI Usage
+
+```bash
+# Use DeepSeek V3
+npx @juspay/neurolink generate "Explain quantum computing" --provider deepseek
+
+# Use DeepSeek R1 with alias
+npx @juspay/neurolink generate "Solve this math problem" --provider ds --model deepseek-reasoner
+```
+
+### Getting Started with DeepSeek
+
+1. **Create Account**: Visit [platform.deepseek.com](https://platform.deepseek.com)
+2. **Generate Key**: Navigate to **API Keys** and create a new key
+3. **Add Billing**: Top up your account balance at [platform.deepseek.com/usage](https://platform.deepseek.com/usage)
+4. **Set Environment**: Export `DEEPSEEK_API_KEY`
+
+### Environment Variables Reference
+
+| Variable            | Required | Default                    | Description                                             |
+| ------------------- | -------- | -------------------------- | ------------------------------------------------------- |
+| `DEEPSEEK_API_KEY`  | ✅       | -                          | DeepSeek API key                                        |
+| `DEEPSEEK_MODEL`    | ❌       | `deepseek-chat`            | Model: `deepseek-chat` (V3) or `deepseek-reasoner` (R1) |
+| `DEEPSEEK_BASE_URL` | ❌       | `https://api.deepseek.com` | Override for proxies or alternative endpoints           |
+
+### Provider ID and Aliases
+
+- **Provider ID**: `deepseek`
+- **Aliases**: `ds`
+
+---
+
+## NVIDIA NIM Configuration {#nvidia-nim}
+
+NVIDIA NIM provides access to 400+ optimized models through NVIDIA's hosted cloud inference API, and also supports self-hosted NIM deployments.
+
+### Basic Setup
+
+```bash
+export NVIDIA_NIM_API_KEY="nvapi-your-nvidia-api-key"
+```
+
+### Optional Configuration
+
+```bash
+export NVIDIA_NIM_MODEL="meta/llama-3.3-70b-instruct"              # Default model
+export NVIDIA_NIM_BASE_URL="https://integrate.api.nvidia.com/v1"   # Default; override for self-hosted NIM
+```
+
+### NIM-Specific Extras (Advanced)
+
+These environment variables pass NIM-specific request body extensions. Leave them unset unless you have a specific need:
+
+```bash
+export NVIDIA_NIM_TOP_K=""                  # Integer; -1 or unset = disabled
+export NVIDIA_NIM_MIN_P=""                  # Float; 0 or unset = disabled
+export NVIDIA_NIM_REPETITION_PENALTY=""     # Float; 1.0 or unset = disabled
+export NVIDIA_NIM_MIN_TOKENS=""             # Integer; 0 or unset = disabled
+export NVIDIA_NIM_CHAT_TEMPLATE=""          # Override model chat template (advanced)
+```
+
+### Supported Models
+
+- `meta/llama-3.3-70b-instruct` (default) - Meta Llama 3.3 70B Instruct
+- Any model from the [NVIDIA NIM catalog](https://build.nvidia.com/models)
+
+### Usage Example
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+
+const neurolink = new NeuroLink();
+
+const result = await neurolink.generate({
+  input: { text: "Explain GPU architecture" },
+  provider: "nvidia-nim",
+  model: "meta/llama-3.3-70b-instruct",
+  temperature: 0.7,
+  maxTokens: 1000,
+});
+```
+
+### CLI Usage
+
+```bash
+# Use NVIDIA NIM with default model
+npx @juspay/neurolink generate "Explain GPU architecture" --provider nvidia-nim
+
+# Use nim alias
+npx @juspay/neurolink generate "Hello" --provider nim --model "mistralai/mistral-7b-instruct-v0.3"
+```
+
+### Self-Hosted NIM Endpoints
+
+Override the base URL to point at your own NIM deployment:
+
+```bash
+export NVIDIA_NIM_BASE_URL="http://your-nim-server:8000/v1"
+```
+
+### Getting Started with NVIDIA NIM
+
+1. **Create Account**: Visit [build.nvidia.com](https://build.nvidia.com/)
+2. **Open Settings**: Navigate to **Settings → API Keys**
+3. **Generate Key**: Create a new Bearer token API key
+4. **Browse Models**: Explore the catalog at [build.nvidia.com/models](https://build.nvidia.com/models)
+5. **Set Environment**: Export `NVIDIA_NIM_API_KEY`
+
+### Environment Variables Reference
+
+| Variable                        | Required | Default                               | Description                             |
+| ------------------------------- | -------- | ------------------------------------- | --------------------------------------- |
+| `NVIDIA_NIM_API_KEY`            | ✅       | -                                     | NVIDIA NIM API key (Bearer token)       |
+| `NVIDIA_NIM_MODEL`              | ❌       | `meta/llama-3.3-70b-instruct`         | Default model                           |
+| `NVIDIA_NIM_BASE_URL`           | ❌       | `https://integrate.api.nvidia.com/v1` | Override for self-hosted NIM            |
+| `NVIDIA_NIM_TOP_K`              | ❌       | -                                     | Top-K sampling parameter                |
+| `NVIDIA_NIM_MIN_P`              | ❌       | -                                     | Min-P sampling parameter                |
+| `NVIDIA_NIM_REPETITION_PENALTY` | ❌       | -                                     | Repetition penalty                      |
+| `NVIDIA_NIM_MIN_TOKENS`         | ❌       | -                                     | Minimum tokens to generate              |
+| `NVIDIA_NIM_CHAT_TEMPLATE`      | ❌       | -                                     | Override model chat template (advanced) |
+
+### Provider ID and Aliases
+
+- **Provider ID**: `nvidia-nim`
+- **Aliases**: `nim`, `nvidia`
+
+---
+
+## LM Studio Configuration {#lm-studio}
+
+LM Studio is a local AI provider — it runs models entirely on your machine with no data sent to any external service. No API key is required for standard (non-proxied) installations.
+
+### Prerequisites
+
+1. Install LM Studio from [lmstudio.ai](https://lmstudio.ai/)
+2. Open LM Studio and download a model from the **Discover** tab
+3. Go to **Local Server** and click **Start Server**
+
+The server starts at `http://localhost:1234/v1` by default. NeuroLink auto-discovers the currently loaded model via `/v1/models` — you do not need to specify a model name.
+
+### Optional Configuration
+
+```bash
+export LM_STUDIO_BASE_URL="http://localhost:1234/v1"   # Default; override if server is on a different host/port
+export LM_STUDIO_MODEL=""                              # Blank = auto-discover; set to force a specific model ID
+# export LM_STUDIO_API_KEY="your-key"                 # Only needed behind an auth-proxying reverse-proxy
+```
+
+### Usage Example
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+
+const neurolink = new NeuroLink();
+
+// Model is auto-discovered from LM Studio
+const result = await neurolink.generate({
+  input: { text: "Explain machine learning" },
+  provider: "lm-studio",
+  temperature: 0.7,
+  maxTokens: 500,
+});
+
+// Or specify a model explicitly (must be loaded in LM Studio)
+const result2 = await neurolink.generate({
+  input: { text: "Write a poem" },
+  provider: "lm-studio",
+  model: "lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF",
+});
+```
+
+### CLI Usage
+
+```bash
+# Auto-discover loaded model
+npx @juspay/neurolink generate "Hello from LM Studio" --provider lm-studio
+
+# Use alias
+npx @juspay/neurolink generate "Hello" --provider lmstudio
+```
+
+### Notes
+
+- **API key**: Not required for vanilla LM Studio installs. Set `LM_STUDIO_API_KEY` only when running LM Studio behind an authenticating reverse-proxy.
+- **Model auto-discovery**: If the server is not running or has no model loaded, NeuroLink logs a warning and falls back gracefully. Start LM Studio and load a model, then retry.
+
+### Timeout Configuration
+
+- **Default Timeout**: 5 minutes (longer for local CPU/GPU inference)
+- **Environment Variable**: `LM_STUDIO_TIMEOUT='10m'` (optional)
+
+### Environment Variables Reference
+
+| Variable             | Required | Default                    | Description                                           |
+| -------------------- | -------- | -------------------------- | ----------------------------------------------------- |
+| `LM_STUDIO_BASE_URL` | ❌       | `http://localhost:1234/v1` | LM Studio server URL                                  |
+| `LM_STUDIO_MODEL`    | ❌       | _(auto-discovered)_        | Force a specific model ID; blank = use loaded model   |
+| `LM_STUDIO_API_KEY`  | ❌       | -                          | API key — only for reverse-proxy authenticated setups |
+
+### Provider ID and Aliases
+
+- **Provider ID**: `lm-studio`
+- **Aliases**: `lmstudio`, `lms`
+
+---
+
+## llama.cpp Configuration {#llamacpp}
+
+llama.cpp's `llama-server` is a local AI provider — it runs GGUF models entirely on your machine. No API key is required for standard (non-proxied) installations.
+
+### Prerequisites
+
+1. Build llama.cpp: follow the [build instructions](https://github.com/ggerganov/llama.cpp#build)
+2. Download a GGUF model file (e.g., from [Hugging Face](https://huggingface.co/models?library=gguf))
+3. Start the server:
+
+   ```bash
+   # Basic usage
+   ./llama-server -m model.gguf --port 8080
+
+   # With tool/function-call support (required for MCP tools)
+   ./llama-server -m model.gguf --port 8080 --jinja
+   ```
+
+The server starts at `http://localhost:8080/v1` by default. NeuroLink auto-discovers the loaded model via `/v1/models`.
+
+### Optional Configuration
+
+```bash
+export LLAMACPP_BASE_URL="http://localhost:8080/v1"    # Default; override if server is on a different host/port
+export LLAMACPP_MODEL=""                               # Blank = auto-discover; set to force a specific model ID
+# export LLAMACPP_API_KEY="your-key"                  # Only needed behind an auth-proxying reverse-proxy
+```
+
+### Usage Example
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+
+const neurolink = new NeuroLink();
+
+// Model is auto-discovered from llama-server
+const result = await neurolink.generate({
+  input: { text: "Explain machine learning" },
+  provider: "llamacpp",
+  temperature: 0.7,
+  maxTokens: 500,
+});
+```
+
+### CLI Usage
+
+```bash
+# Auto-discover loaded model
+npx @juspay/neurolink generate "Hello from llama.cpp" --provider llamacpp
+
+# Use alias
+npx @juspay/neurolink generate "Hello" --provider "llama.cpp"
+```
+
+### Notes
+
+- **API key**: Not required for vanilla llama-server installs. Set `LLAMACPP_API_KEY` only when running behind an authenticating reverse-proxy.
+- **Tool support**: llama-server must be started with the `--jinja` flag to enable tool/function-call support. Without it, tool calls return a 400 error.
+- **Model auto-discovery**: llama-server hosts one model at a time. NeuroLink reads it from `/v1/models` automatically.
+- **Health check**: NeuroLink validates connectivity via the `/health` endpoint with up to 3 retries.
+
+### Timeout Configuration
+
+- **Default Timeout**: 5 minutes (longer for local CPU/GPU inference)
+- **Environment Variable**: `LLAMACPP_TIMEOUT='10m'` (optional)
+
+### Environment Variables Reference
+
+| Variable            | Required | Default                    | Description                                           |
+| ------------------- | -------- | -------------------------- | ----------------------------------------------------- |
+| `LLAMACPP_BASE_URL` | ❌       | `http://localhost:8080/v1` | llama-server URL                                      |
+| `LLAMACPP_MODEL`    | ❌       | _(auto-discovered)_        | Force a specific model ID; blank = use loaded model   |
+| `LLAMACPP_API_KEY`  | ❌       | -                          | API key — only for reverse-proxy authenticated setups |
+
+### Provider ID and Aliases
+
+- **Provider ID**: `llamacpp`
+- **Aliases**: `llama.cpp`
+
+---
 
 ## Redis Configuration {#redis}
 
@@ -1461,6 +1810,20 @@ OLLAMA_MODEL=llama2  # Optional
 # Mistral AI
 MISTRAL_API_KEY=your_mistral_api_key
 MISTRAL_MODEL=mistral-small  # Optional
+
+# DeepSeek
+DEEPSEEK_API_KEY=sk-your-deepseek-key
+DEEPSEEK_MODEL=deepseek-chat  # Optional (deepseek-chat or deepseek-reasoner)
+
+# NVIDIA NIM
+NVIDIA_NIM_API_KEY=nvapi-your-nvidia-key
+NVIDIA_NIM_MODEL=meta/llama-3.3-70b-instruct  # Optional
+
+# LM Studio (local — no API key required)
+LM_STUDIO_BASE_URL=http://localhost:1234/v1  # Optional
+
+# llama.cpp (local — no API key required)
+LLAMACPP_BASE_URL=http://localhost:8080/v1  # Optional
 
 # Application Settings
 DEFAULT_PROVIDER=auto
@@ -1654,6 +2017,530 @@ Authentication failed
 - Implement rate limiting in your applications
 - Monitor usage and costs
 - Use HTTPS for all API communications
+
+---
+
+## OpenAI TTS Configuration {#openai-tts}
+
+OpenAI TTS provides text-to-speech synthesis using the same API key as the OpenAI LLM provider. No additional credentials are required.
+
+### Basic Setup
+
+```bash
+export OPENAI_API_KEY="sk-your-openai-api-key"
+```
+
+**Note:** `OPENAI_API_KEY` is shared with the OpenAI LLM provider. No separate key is needed.
+
+### Supported Models
+
+- `tts-1` (default) - Optimized for speed, lower latency
+- `tts-1-hd` - Optimized for quality, higher fidelity audio
+
+### Supported Voices
+
+`alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`
+
+### Supported Output Formats
+
+`mp3` (default), `opus`, `wav`, `ogg`
+
+### Usage Example
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+
+const neurolink = new NeuroLink();
+
+const result = await neurolink.generate({
+  input: { text: "Hello, world!" },
+  tts: {
+    enabled: true,
+    provider: "openai-tts",
+    voice: "alloy",
+    format: "mp3",
+  },
+});
+```
+
+### CLI Usage
+
+```bash
+npx @juspay/neurolink generate "Hello, world!" --tts --tts-provider openai-tts
+```
+
+### Environment Variables Reference
+
+| Variable         | Required | Default | Description                         |
+| ---------------- | -------- | ------- | ----------------------------------- |
+| `OPENAI_API_KEY` | ✅       | -       | Shared with the OpenAI LLM provider |
+
+### Provider ID and Aliases
+
+- **Provider ID**: `openai-tts`
+
+---
+
+## ElevenLabs Configuration {#elevenlabs}
+
+ElevenLabs provides high-quality, multilingual text-to-speech synthesis with a wide selection of voices and voice cloning support.
+
+### Basic Setup
+
+```bash
+export ELEVENLABS_API_KEY="your-elevenlabs-api-key"
+```
+
+### How to Get ElevenLabs API Key
+
+1. Visit [ElevenLabs](https://elevenlabs.io)
+2. Sign up or log in to your account
+3. Navigate to **Profile → API Key**
+4. Copy the key
+
+### Supported Models
+
+- `eleven_multilingual_v2` (default) - Best quality, 29 languages
+- `eleven_turbo_v2_5` - Low-latency streaming, 32 languages
+- `eleven_flash_v2_5` - Fastest, suitable for real-time applications
+
+### Usage Example
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+
+const neurolink = new NeuroLink();
+
+const result = await neurolink.generate({
+  input: { text: "Bonjour le monde!" },
+  tts: {
+    enabled: true,
+    provider: "elevenlabs",
+    voice: "Rachel",
+    model: "eleven_multilingual_v2",
+  },
+});
+```
+
+### CLI Usage
+
+```bash
+npx @juspay/neurolink generate "Hello, world!" --tts --tts-provider elevenlabs
+```
+
+### Notes
+
+- **Multilingual support**: ElevenLabs models support up to 32 languages with natural prosody
+- **Voice cloning**: ElevenLabs supports custom voice IDs from your ElevenLabs account
+
+### Environment Variables Reference
+
+| Variable             | Required | Default | Description        |
+| -------------------- | -------- | ------- | ------------------ |
+| `ELEVENLABS_API_KEY` | ✅       | -       | ElevenLabs API key |
+
+### Provider ID and Aliases
+
+- **Provider ID**: `elevenlabs`
+
+---
+
+## Deepgram STT Configuration {#deepgram}
+
+Deepgram provides fast, accurate speech-to-text transcription with support for real-time streaming and pre-recorded audio.
+
+### Basic Setup
+
+```bash
+export DEEPGRAM_API_KEY="your-deepgram-api-key"
+```
+
+### How to Get Deepgram API Key
+
+1. Visit [Deepgram Console](https://console.deepgram.com)
+2. Sign up or log in to your account
+3. Navigate to **API Keys**
+4. Click **Create a New API Key**
+5. Copy the key
+
+### Supported Models
+
+- `nova-3` (default) - Latest, highest accuracy
+- `nova-2` - High accuracy, broad language support
+- `base` - Balanced accuracy and speed
+
+### Usage Example
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+import { readFileSync } from "fs";
+
+const neurolink = new NeuroLink();
+const audioBuffer = readFileSync("audio.wav");
+
+const result = await neurolink.generate({
+  input: { text: "Respond to what was said" },
+  stt: {
+    enabled: true,
+    provider: "deepgram",
+    audio: audioBuffer,
+    model: "nova-3",
+    language: "en",
+  },
+});
+```
+
+### CLI Usage
+
+```bash
+npx @juspay/neurolink generate "Respond to this" --stt --stt-provider deepgram --input-audio file.wav
+```
+
+### Notes
+
+- **Streaming transcription**: Deepgram supports real-time audio streaming for live transcription
+- **Language support**: Deepgram nova models support 30+ languages
+
+### Environment Variables Reference
+
+| Variable           | Required | Default | Description      |
+| ------------------ | -------- | ------- | ---------------- |
+| `DEEPGRAM_API_KEY` | ✅       | -       | Deepgram API key |
+
+### Provider ID and Aliases
+
+- **Provider ID**: `deepgram` (STT only — Deepgram's TTS product is not wired today)
+
+---
+
+## Whisper Configuration {#whisper}
+
+Whisper is OpenAI's speech-to-text model — registered as the provider id `whisper`.
+It accepts MP3, WAV, M4A, and FLAC inputs up to 25 MB.
+
+```bash
+# Required environment variable
+OPENAI_API_KEY=sk-...
+```
+
+Get your API key from: **OpenAI Platform** > **API Keys**.
+
+### Usage
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Repeat what was said" },
+  provider: "openai",
+  stt: {
+    enabled: true,
+    provider: "whisper",
+    audio: audioBuffer,
+    format: "mp3",
+  },
+});
+console.log(result.transcription?.text);
+```
+
+### CLI
+
+```bash
+neurolink generate "Repeat what was said" \
+  --provider openai \
+  --stt --stt-provider whisper --input-audio ./audio.mp3
+```
+
+### Provider ID
+
+- **Provider ID**: `whisper`
+
+---
+
+## Azure Speech Configuration {#azure-speech}
+
+Azure Cognitive Services Speech provides both TTS (`azure-tts`) and STT (`azure-stt`).
+
+```bash
+# Required environment variables
+AZURE_SPEECH_KEY=your-speech-key
+AZURE_SPEECH_REGION=eastus
+```
+
+Get credentials from: **Azure Portal** > **Cognitive Services** > **Speech** > **Keys and Endpoint**.
+
+### TTS Usage
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Hello world" },
+  tts: {
+    enabled: true,
+    provider: "azure-tts",
+    voice: "en-US-JennyNeural",
+    format: "mp3",
+  },
+});
+```
+
+### STT Usage
+
+> **MP3 not supported** — Azure's short-audio REST endpoint only decodes WAV
+> PCM and Ogg/Opus. Passing `format: "mp3"` to `azure-stt` throws
+> `STT_INVALID_AUDIO_FORMAT` early. Convert with
+> `ffmpeg -i in.mp3 -ar 16000 -ac 1 out.wav` first.
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "" },
+  provider: "openai",
+  stt: {
+    enabled: true,
+    provider: "azure-stt",
+    audio: wavBuffer,
+    format: "wav",
+    language: "en-US",
+  },
+});
+```
+
+### Provider IDs
+
+- **TTS**: `azure-tts`
+- **STT**: `azure-stt`
+
+---
+
+## Fish Audio TTS Configuration {#fish-audio}
+
+Low-cost TTS provider focused on voice cloning. Wrapped as a TTSHandler so it
+slots into the same `generate({ tts: { provider: "fish-audio" } })` flow as
+OpenAI / ElevenLabs / Azure / Google AI TTS.
+
+```bash
+# Required
+FISH_AUDIO_API_KEY=your-fish-audio-api-key
+
+# Optional: default voice (any reference_id from the Fish library)
+# FISH_AUDIO_VOICE_ID=...
+
+# Optional: base URL override
+# FISH_AUDIO_BASE_URL=https://api.fish.audio
+```
+
+Get an API key from [fish.audio](https://fish.audio/) → dashboard.
+
+### Usage
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Hello world from Fish Audio" },
+  provider: "openai",
+  tts: {
+    enabled: true,
+    provider: "fish-audio",
+    format: "mp3",
+  },
+});
+```
+
+- **Provider ID**: `fish-audio`
+- **Default model**: `s1` (override via `tts.model`: `speech-1.5`, `speech-1.6`, `s1`)
+- **Max text length**: 5000 characters
+- **Output formats**: `mp3` (default, 44.1 kHz), `wav` (44.1 kHz), `pcm16` (raw, 44.1 kHz)
+- **Languages**: 14 (English, Mandarin, Cantonese, Japanese, Korean, French, German, Spanish, Italian, Portuguese, Russian, Arabic, Hindi, Indonesian)
+- **Voice cloning**: 15 s of reference audio → custom `reference_id`
+
+Full guide: [Fish Audio TTS Provider](./providers/fish-audio.md).
+
+---
+
+## Cartesia TTS Configuration {#cartesia}
+
+Low-latency TTS provider running Cartesia's Sonic models. The synchronous
+`/tts/bytes` endpoint is wrapped as a TTSHandler; the realtime WebSocket flow
+is exposed separately as `CartesiaStream` for the voice server.
+
+```bash
+# Required
+CARTESIA_API_KEY=sk_car_...
+
+# Optional: default voice id (any voice from your Cartesia library)
+# CARTESIA_VOICE_ID=...
+
+# Optional: model override (default sonic-2)
+# CARTESIA_MODEL=sonic-2
+
+# Optional: API version header (default 2025-04-16)
+# CARTESIA_API_VERSION=2025-04-16
+
+# Optional: base URL override
+# CARTESIA_BASE_URL=https://api.cartesia.ai
+```
+
+Get an API key from [play.cartesia.ai/keys](https://play.cartesia.ai/keys).
+
+### Usage
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Hello world from Cartesia Sonic" },
+  provider: "openai",
+  tts: {
+    enabled: true,
+    provider: "cartesia",
+    format: "mp3",
+  },
+});
+```
+
+- **Provider ID**: `cartesia`
+- **Default model**: `sonic-2` (also `sonic`)
+- **Default voice**: `694f9389-aac1-45b6-b726-9d9369183238` ("Bright Female", English)
+- **Max text length**: 5000 characters
+- **Output formats**: `mp3` (default, 44.1 kHz), `wav` (PCM s16le @ 44.1 kHz), `pcm16` (raw, 24 kHz)
+- **Streaming**: synchronous via this handler; WebSocket via `CartesiaStream` adapter
+
+Full guide: [Cartesia TTS Provider](./providers/cartesia.md).
+
+---
+
+## Google Speech Configuration {#google-speech}
+
+Covers both Google Cloud TTS (`google-tts` / via `google-ai`) and Google Cloud
+Speech-to-Text (`google-stt`). Both share the same service-account credentials.
+
+```bash
+# Required environment variable
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+
+# OR (for TTS only) an API key
+GOOGLE_API_KEY=AIza...
+```
+
+> **Speech-to-Text API must be enabled** in your Google Cloud project for
+> `google-stt` to work. Enable it at
+> [console.cloud.google.com/apis/library/speech.googleapis.com](https://console.cloud.google.com/apis/library/speech.googleapis.com).
+
+### TTS Usage
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Hello world" },
+  tts: {
+    enabled: true,
+    provider: "google-ai",
+    voice: "en-US-Neural2-A",
+    format: "mp3",
+  },
+});
+```
+
+### STT Usage
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "" },
+  provider: "openai",
+  stt: {
+    enabled: true,
+    provider: "google-stt",
+    audio: audioBuffer,
+    format: "mp3",
+  },
+});
+```
+
+### Provider IDs
+
+- **TTS**: `google-ai` (or `google-tts` alias)
+- **STT**: `google-stt`
+
+---
+
+## OpenAI Realtime Configuration {#openai-realtime}
+
+Real-time voice via the OpenAI Realtime WebSocket API. Provider id
+`openai-realtime` is registered for future use; the typical pattern is to
+launch the integrated voice server (`neurolink serve voice`) which wires
+this through Soniox/Cartesia.
+
+```bash
+OPENAI_API_KEY=sk-...
+```
+
+### Provider ID
+
+- **Provider ID**: `openai-realtime`
+- **Audio chunk format**: `pcm16` — raw 16-bit PCM at 24 kHz, **NOT**
+  WAV-headered. Do not pass these chunks to a WAV duration parser.
+
+---
+
+## Gemini Live Configuration {#gemini-live}
+
+Real-time voice via Google's Gemini Live WebSocket API. Provider id
+`gemini-live` is registered for future use.
+
+```bash
+GOOGLE_API_KEY=AIza...
+# OR
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+```
+
+### Provider ID
+
+- **Provider ID**: `gemini-live`
+
+---
+
+## Streaming + Voice Patterns {#streaming-voice}
+
+### `stream()` + STT (transcribe before stream)
+
+```typescript
+const audio = readFileSync("./recording.mp3");
+const r = await neurolink.stream({
+  input: { text: "" },
+  provider: "openai",
+  stt: { enabled: true, provider: "whisper", audio, format: "mp3" },
+});
+
+console.log("transcription:", r.transcription?.text); // available before iterating
+for await (const chunk of r.stream) {
+  if ("content" in chunk) process.stdout.write(chunk.content);
+}
+```
+
+### `stream()` + TTS Mode 2 (synthesise the streamed reply)
+
+Two ergonomic options — both deliver byte-identical audio:
+
+```typescript
+const r = await neurolink.stream({
+  input: { text: "Tell me a fact." },
+  provider: "openai",
+  tts: {
+    enabled: true,
+    useAiResponse: true,
+    provider: "openai-tts",
+    format: "mp3",
+  },
+});
+
+// --- Option A: collect inline while iterating ---
+const audioBufs: Buffer[] = [];
+for await (const c of r.stream) {
+  if ("content" in c) process.stdout.write(c.content);
+  else if (c.type === "audio") audioBufs.push(c.audio.data);
+}
+writeFileSync("./out.mp3", Buffer.concat(audioBufs));
+
+// --- Option B: ergonomic Promise — read after the stream completes ---
+const tts = await r.audio; // resolves to TTSResult or undefined
+if (tts) writeFileSync("./out.mp3", tts.buffer);
+```
+
+When `tts.useAiResponse` is `false` (Mode 1) or TTS is not enabled,
+`r.audio` resolves to `undefined` rather than hanging.
 
 ---
 

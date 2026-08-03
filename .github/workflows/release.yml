@@ -22,12 +22,12 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 8
+          version: 10.15.1
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          node-version: "22"
           cache: "pnpm"
           registry-url: https://registry.npmjs.org/
 
@@ -68,12 +68,12 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 10.15.1
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
           cache: "pnpm"
 
@@ -90,8 +90,10 @@ jobs:
           }
           echo "✅ ffmpeg installed successfully"
 
-      - name: Upgrade npm for OIDC support
-        run: npm install -g npm@latest
+      - name: Upgrade npm for native OIDC publish support
+        run: |
+          npx -y npm@11 install -g npm@11
+          echo "npm version: $(npm --version)"
 
       - name: Install dependencies
         run: pnpm install
@@ -111,7 +113,7 @@ jobs:
       - name: Setup Node for GitHub Packages
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: "https://npm.pkg.github.com"
           scope: "@juspay"
 

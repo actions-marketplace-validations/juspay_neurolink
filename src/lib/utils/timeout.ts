@@ -5,7 +5,7 @@
  * Supports multiple time formats: milliseconds, seconds, minutes, hours.
  */
 
-import type { TimeoutConfig, TimeoutResult } from "../types/utilities.js";
+import type { TimeoutConfig, TimeoutResult } from "../types/index.js";
 
 /**
  * Custom error class for timeout operations
@@ -102,6 +102,7 @@ export const DEFAULT_TIMEOUTS = {
     huggingface: "2m", // Open source models vary significantly
     ollama: "5m", // Local models need more time, especially large ones
     mistral: "45s", // Mistral AI moderate speed
+    litellm: "5m", // Self-hosted proxy over arbitrary backends, same variable-latency profile as ollama
   },
   tools: {
     default: "10s", // Default timeout for MCP tool execution
@@ -441,6 +442,12 @@ export function createTimeoutController(
   const controller = new AbortController();
 
   const timer = setTimeout(() => {
+    // NOTE: we cannot stamp the AI SDK's ai.streamText/ai.generateText span
+    // from here — the setTimeout callback runs in the async context captured
+    // at schedule time, which is BEFORE the AI SDK span exists. Instead we
+    // rely on the AI SDK propagating the TimeoutError through its recordSpan
+    // wrapper, which sets span.status = ERROR + message. ContextEnricher's
+    // SpanStatusCode.ERROR branch then surfaces level=ERROR + status_message.
     controller.abort(
       new TimeoutError(
         `${provider} ${operation} operation timed out after ${timeout}`,
@@ -478,7 +485,65 @@ export function composeAbortSignals(
 }
 
 /**
+ * Scoped variant of {@link composeAbortSignals} for per-step / per-request
+ * composition against a LONG-LIVED external signal (e.g. the generate-call
+ * signal inside a multi-step agent loop). `AbortSignal.any` keeps its source
+ * registration alive until the derived signal is GC'd, so composing per step
+ * accumulates listeners on the outer signal for the whole turn
+ * (MaxListenersExceededWarning at 10+ steps). This helper registers plain
+ * listeners instead and returns a `dispose()` that removes them the moment
+ * the step settles.
+ */
+export function composeAbortSignalsScoped(
+  externalSignal?: AbortSignal,
+  timeoutSignal?: AbortSignal,
+): { signal: AbortSignal | undefined; dispose: () => void } {
+  if (!externalSignal || !timeoutSignal) {
+    return { signal: externalSignal ?? timeoutSignal, dispose: () => {} };
+  }
+  const controller = new AbortController();
+  const sources = [externalSignal, timeoutSignal];
+  const listeners: Array<{ source: AbortSignal; listener: () => void }> = [];
+  const dispose = () => {
+    for (const { source, listener } of listeners) {
+      source.removeEventListener("abort", listener);
+    }
+    listeners.length = 0;
+  };
+  const onAbort = (source: AbortSignal) => {
+    if (!controller.signal.aborted) {
+      controller.abort(source.reason);
+    }
+    // Self-clean on abort: once the composed signal fired, no source
+    // listener has any work left — detach from the OTHER source too (the
+    // firing one auto-removed via `once`), so callers that only observe
+    // `signal.aborted` and never reach their dispose() leave nothing behind.
+    dispose();
+  };
+  for (const source of sources) {
+    const listener = () => onAbort(source);
+    source.addEventListener("abort", listener, { once: true });
+    listeners.push({ source, listener });
+  }
+  for (const source of sources) {
+    if (source.aborted) {
+      onAbort(source);
+      break;
+    }
+  }
+  return { signal: controller.signal, dispose };
+}
+
+/**
  * Merge abort signals (for combining user abort with timeout)
+ *
+ * Implemented via `AbortSignal.any` with a single once-listener forward, so
+ * no per-source listeners are left behind on long-lived input signals once
+ * the merged controller becomes unreachable (registrations are released with
+ * the derived signal). The previous implementation attached one permanent
+ * listener per source per call — repeated stream calls sharing one caller
+ * signal accumulated listeners for the life of that signal.
+ *
  * @param signals - Array of abort signals to merge
  * @returns Combined abort controller
  */
@@ -486,21 +551,33 @@ export function mergeAbortSignals(
   signals: (AbortSignal | undefined)[],
 ): AbortController {
   const controller = new AbortController();
+  const active = signals.filter((s): s is AbortSignal => s !== undefined);
 
-  for (const signal of signals) {
-    if (signal && !signal.aborted) {
-      signal.addEventListener("abort", () => {
-        if (!controller.signal.aborted) {
-          controller.abort(signal.reason);
-        }
-      });
-    }
-
-    if (signal?.aborted) {
-      controller.abort(signal.reason);
-      break;
-    }
+  const aborted = active.find((s) => s.aborted);
+  if (aborted) {
+    controller.abort(aborted.reason);
+    return controller;
   }
+  if (active.length === 0) {
+    return controller;
+  }
+
+  const merged = AbortSignal.any(active);
+  merged.addEventListener(
+    "abort",
+    () => {
+      if (!controller.signal.aborted) {
+        controller.abort(merged.reason);
+      }
+    },
+    { once: true },
+  );
+  // Pin the derived signal to the returned controller: sources hold only
+  // weak refs to `any()` dependents, so without this strong ref the derived
+  // signal (and the forward listener with it) could be GC'd before firing.
+  (
+    controller as AbortController & { __nlMergedSignal?: AbortSignal }
+  ).__nlMergedSignal = merged;
 
   return controller;
 }

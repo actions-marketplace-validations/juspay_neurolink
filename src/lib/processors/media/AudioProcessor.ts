@@ -37,80 +37,44 @@
  * ```
  */
 
-import { parseBuffer, selectCover } from "music-metadata";
-
 import { BaseFileProcessor } from "../base/BaseFileProcessor.js";
 import type {
   FileInfo,
-  FileProcessingResult,
-  ProcessedFileBase,
+  ProcessedAudio,
+  ProcessorFileProcessingResult,
   ProcessOptions,
-} from "../base/types.js";
+} from "../../types/index.js";
 import { SIZE_LIMITS_MB } from "../config/index.js";
 import { FileErrorCode } from "../errors/index.js";
+import { withTimeout } from "../../utils/timeout.js";
+import { formatMediaDuration } from "../../utils/mediaDuration.js";
+
+let _musicMetadata: typeof import("music-metadata") | null = null;
+async function loadMusicMetadata() {
+  if (_musicMetadata) {
+    return _musicMetadata;
+  }
+  try {
+    _musicMetadata = await import(/* @vite-ignore */ "music-metadata");
+    return _musicMetadata;
+  } catch (err) {
+    const e = err instanceof Error ? (err as NodeJS.ErrnoException) : null;
+    if (
+      e?.code === "ERR_MODULE_NOT_FOUND" &&
+      e.message.includes("music-metadata")
+    ) {
+      throw new Error(
+        'Audio processing requires the "music-metadata" package. Install it with:\n  pnpm add music-metadata',
+        { cause: err },
+      );
+    }
+    throw err;
+  }
+}
 
 // =============================================================================
 // TYPES
 // =============================================================================
-
-/**
- * Processed audio file result.
- * Extends ProcessedFileBase with audio-specific metadata, tags, and transcript info.
- */
-export type ProcessedAudio = ProcessedFileBase & {
-  /** LLM-friendly text representation of the audio file metadata and tags */
-  textContent: string;
-  /** Audio stream metadata (codec, duration, bitrate, etc.) */
-  metadata: {
-    /** Duration in seconds */
-    duration: number;
-    /** Human-readable duration string (e.g., "3:45", "1:02:30") */
-    durationFormatted: string;
-    /** Audio codec name (e.g., "MPEG 1 Layer 3", "FLAC", "AAC") */
-    codec: string;
-    /** Codec profile if available (e.g., "CBR", "VBR") */
-    codecProfile?: string;
-    /** Bitrate in bits per second */
-    bitrate?: number;
-    /** Sample rate in Hz (e.g., 44100, 48000) */
-    sampleRate?: number;
-    /** Number of audio channels (e.g., 1 for mono, 2 for stereo) */
-    channels?: number;
-    /** Bits per sample (e.g., 16, 24) */
-    bitsPerSample?: number;
-    /** Whether the codec is lossless (e.g., FLAC, WAV) */
-    lossless: boolean;
-    /** File size in bytes */
-    fileSize: number;
-  };
-  /** Extracted ID3/Vorbis/APE tags */
-  tags: {
-    /** Track title */
-    title?: string;
-    /** Track artist */
-    artist?: string;
-    /** Album title */
-    album?: string;
-    /** Release year */
-    year?: number;
-    /** Genre tags */
-    genre?: string[];
-    /** Track number within album */
-    track?: { no: number | null; of: number | null };
-    /** Comment text (first comment if multiple) */
-    comment?: string;
-    /** Composer name (first composer if multiple) */
-    composer?: string;
-  };
-  /** Transcribed text content, if transcription was performed */
-  transcript?: string;
-  /** Whether a transcript is available */
-  hasTranscript: boolean;
-  /** Transcription provider used (e.g., "openai-whisper") */
-  transcriptionProvider?: string;
-  /** Embedded cover art image buffer, if present */
-  coverArt?: Buffer;
-};
 
 // =============================================================================
 // CONSTANTS
@@ -259,7 +223,7 @@ export class AudioProcessor extends BaseFileProcessor<ProcessedAudio> {
   override async processFile(
     fileInfo: FileInfo,
     options?: ProcessOptions,
-  ): Promise<FileProcessingResult<ProcessedAudio>> {
+  ): Promise<ProcessorFileProcessingResult<ProcessedAudio>> {
     try {
       // Step 1: Validate file type and size
       const validationResult = this.validateFileWithResult(fileInfo);
@@ -326,7 +290,7 @@ export class AudioProcessor extends BaseFileProcessor<ProcessedAudio> {
       const tags = this.extractTags(audioMetadata);
 
       // Step 6: Extract embedded cover art if present
-      const coverArt = this.extractCoverArt(audioMetadata);
+      const coverArt = await this.extractCoverArt(audioMetadata);
 
       // Step 7: Attempt transcription if API key is available
       const filename = this.getFilename(fileInfo);
@@ -460,16 +424,25 @@ export class AudioProcessor extends BaseFileProcessor<ProcessedAudio> {
     try {
       // Dynamic imports to avoid loading these modules when transcription is not needed
       const [{ createOpenAI }, { experimental_transcribe }] = await Promise.all(
-        [import("@ai-sdk/openai"), import("ai")],
+        [import("@ai-sdk/openai"), import("../../utils/generation.js")],
       );
 
       const openai = createOpenAI({ apiKey });
       const model = openai.transcription("whisper-1");
 
-      const result = await experimental_transcribe({
-        model,
-        audio: buffer,
-      });
+      // Wrap in withTimeout — large audio files can take a while, but a
+      // stalled request shouldn't block the processor forever. The outer
+      // catch swallows any error (transcription is best-effort), so a
+      // TimeoutError ends up in the same fallback path as other failures.
+      const result = await withTimeout(
+        experimental_transcribe({
+          model,
+          audio: buffer,
+        }),
+        AUDIO_CONFIG.TRANSCRIPTION_TIMEOUT_MS,
+        "openai-whisper",
+        "generate",
+      );
 
       if (result.text && result.text.trim().length > 0) {
         return {
@@ -507,7 +480,7 @@ export class AudioProcessor extends BaseFileProcessor<ProcessedAudio> {
       textContent: "",
       metadata: {
         duration: 0,
-        durationFormatted: "0:00",
+        durationFormatted: formatMediaDuration(0),
         codec: "unknown",
         lossless: false,
         fileSize: buffer.length,
@@ -542,6 +515,7 @@ export class AudioProcessor extends BaseFileProcessor<ProcessedAudio> {
     // where string is interpreted as MIME type.
     const mimeType = fileInfo.mimetype || undefined;
 
+    const { parseBuffer } = await loadMusicMetadata();
     return parseBuffer(buffer, mimeType);
   }
 
@@ -619,14 +593,15 @@ export class AudioProcessor extends BaseFileProcessor<ProcessedAudio> {
    * @param audioMetadata - Parsed audio metadata from music-metadata
    * @returns Cover art as Buffer, or null if no cover art is embedded
    */
-  private extractCoverArt(
+  private async extractCoverArt(
     audioMetadata: import("music-metadata").IAudioMetadata,
-  ): Buffer | null {
+  ): Promise<Buffer | null> {
     const pictures = audioMetadata.common.picture;
     if (!pictures || pictures.length === 0) {
       return null;
     }
 
+    const { selectCover } = await loadMusicMetadata();
     const cover = selectCover(pictures);
     if (!cover) {
       return null;
@@ -763,28 +738,15 @@ export class AudioProcessor extends BaseFileProcessor<ProcessedAudio> {
   /**
    * Format a duration in seconds to a human-readable string.
    *
-   * @param seconds - Duration in seconds
-   * @returns Formatted string: "M:SS" for < 1 hour, "H:MM:SS" for >= 1 hour
+   * Delegates to the shared formatter so audio and video describe the same
+   * file the same way — this used to render "0:02" where VideoProcessor
+   * rendered "2s".
    *
-   * @example
-   * formatDuration(225)   // "3:45"
-   * formatDuration(3750)  // "1:02:30"
-   * formatDuration(0)     // "0:00"
+   * @param seconds - Duration in seconds
+   * @returns Formatted string: "45s", "3m 45s", "1h 2m 30s"
    */
   private formatDuration(seconds: number): string {
-    if (!seconds || seconds <= 0) {
-      return "0:00";
-    }
-
-    const totalSeconds = Math.round(seconds);
-    const hours = Math.floor(totalSeconds / 3600);
-    const minutes = Math.floor((totalSeconds % 3600) / 60);
-    const secs = totalSeconds % 60;
-
-    if (hours > 0) {
-      return `${hours}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
-    }
-    return `${minutes}:${String(secs).padStart(2, "0")}`;
+    return formatMediaDuration(seconds);
   }
 
   /**
@@ -896,6 +858,6 @@ export function isAudioFile(mimetype: string, filename: string): boolean {
 export async function processAudio(
   fileInfo: FileInfo,
   options?: ProcessOptions,
-): Promise<FileProcessingResult<ProcessedAudio>> {
+): Promise<ProcessorFileProcessingResult<ProcessedAudio>> {
   return audioProcessor.processFile(fileInfo, options);
 }

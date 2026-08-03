@@ -13,7 +13,7 @@ import type {
   ChunkerConfig,
   ChunkerMetadata,
   ChunkingStrategy,
-} from "./types.js";
+} from "../types/index.js";
 
 /**
  * Default chunker metadata entries
@@ -59,7 +59,7 @@ const DEFAULT_CHUNKER_METADATA: Record<ChunkingStrategy, ChunkerMetadata> = {
   },
   markdown: {
     description: "Splits markdown content by headers and structural elements",
-    defaultConfig: { maxSize: 1000, overlap: 0 },
+    defaultConfig: { maxSize: 1000, overlap: 50 },
     supportedOptions: ["maxSize", "headerLevels", "splitCodeBlocks"],
     useCases: ["Documentation processing", "README files"],
     aliases: ["md", "markdown-header"],
@@ -153,9 +153,8 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
     this.registerChunker(
       "character",
       async (config?: ChunkerConfig) => {
-        const { CharacterChunker } = await import(
-          "./chunkers/CharacterChunker.js"
-        );
+        const { CharacterChunker } =
+          await import("./chunkers/CharacterChunker.js");
         return new CharacterChunker(config);
       },
       DEFAULT_CHUNKER_METADATA.character,
@@ -165,9 +164,8 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
     this.registerChunker(
       "recursive",
       async (config?: ChunkerConfig) => {
-        const { RecursiveChunker } = await import(
-          "./chunkers/RecursiveChunker.js"
-        );
+        const { RecursiveChunker } =
+          await import("./chunkers/RecursiveChunker.js");
         return new RecursiveChunker(config);
       },
       DEFAULT_CHUNKER_METADATA.recursive,
@@ -177,9 +175,8 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
     this.registerChunker(
       "sentence",
       async (config?: ChunkerConfig) => {
-        const { SentenceChunker } = await import(
-          "./chunkers/SentenceChunker.js"
-        );
+        const { SentenceChunker } =
+          await import("./chunkers/SentenceChunker.js");
         return new SentenceChunker(config);
       },
       DEFAULT_CHUNKER_METADATA.sentence,
@@ -199,9 +196,8 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
     this.registerChunker(
       "markdown",
       async (config?: ChunkerConfig) => {
-        const { MarkdownChunker } = await import(
-          "./chunkers/MarkdownChunker.js"
-        );
+        const { MarkdownChunker } =
+          await import("./chunkers/MarkdownChunker.js");
         return new MarkdownChunker(config);
       },
       DEFAULT_CHUNKER_METADATA.markdown,
@@ -241,11 +237,10 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
     this.registerChunker(
       "semantic",
       async (config?: ChunkerConfig) => {
-        // TODO: Implement dedicated SemanticChunker with LLM support
+        // TODO(#1179): Implement dedicated SemanticChunker with LLM support
         // For now, fall back to RecursiveChunker with semantic defaults
-        const { RecursiveChunker } = await import(
-          "./chunkers/RecursiveChunker.js"
-        );
+        const { RecursiveChunker } =
+          await import("./chunkers/RecursiveChunker.js");
         return new RecursiveChunker(config);
       },
       DEFAULT_CHUNKER_METADATA.semantic,
@@ -255,9 +250,8 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
     this.registerChunker(
       "semantic-markdown",
       async (config?: ChunkerConfig) => {
-        const { SemanticMarkdownChunker } = await import(
-          "./chunkers/SemanticMarkdownChunker.js"
-        );
+        const { SemanticMarkdownChunker } =
+          await import("./chunkers/SemanticMarkdownChunker.js");
         return new SemanticMarkdownChunker(config);
       },
       DEFAULT_CHUNKER_METADATA["semantic-markdown"],

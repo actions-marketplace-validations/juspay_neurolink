@@ -2,24 +2,68 @@
  * Provider-specific type definitions for NeuroLink
  */
 
-import type { UnknownRecord, JsonValue } from "./common.js";
+import type {
+  UnknownRecord,
+  JsonValue,
+  StreamingCapability,
+} from "./common.js";
+import type { NeuroLink } from "../neurolink.js";
 import {
   AIProviderName,
   AnthropicModels,
   BedrockModels,
+  DeepSeekModels,
   GoogleAIModels,
+  LlamaCppModels,
+  LMStudioModels,
+  NvidiaNimModels,
   OpenAIModels,
   VertexModels,
 } from "../constants/enums.js";
-import type { Tool } from "ai";
-import type { ValidationSchema } from "./typeAliases.js";
+import type { ValidationSchema } from "./aliases.js";
 import type {
   EnhancedGenerateResult,
   GenerateResult,
   TextGenerationOptions,
-} from "./generateTypes.js";
-import type { StreamOptions, StreamResult } from "./streamTypes.js";
+} from "./generate.js";
+import type { StreamOptions, StreamResult } from "./stream.js";
 import type { ExternalMCPToolInfo } from "./externalMcp.js";
+
+// Subscription types for Claude/Anthropic authentication and tier management
+import type {
+  ClaudeSubscriptionTier,
+  AnthropicAuthMethod,
+  AnthropicAuthConfig,
+  SubscriptionInfo,
+  OAuthToken,
+} from "./subscription.js";
+import type { Tool } from "./tools.js";
+
+// Language-model handles, embedding/image models, and generation-result shapes.
+// Today these resolve through the upstream generation library; consumers should
+// import via the package barrel.
+export type {
+  LanguageModel,
+  EmbeddingModel,
+  ImageModel,
+  GenerateTextResult,
+  StepResult,
+  ToolCallRepairFunction,
+  PrepareStepFunction,
+  PrepareStepResult,
+  FinishReason,
+  LanguageModelUsage,
+  LanguageModelRequestMetadata,
+  LanguageModelResponseMetadata,
+} from "ai";
+
+// Re-export subscription types for convenience
+export type {
+  ClaudeSubscriptionTier,
+  AnthropicAuthMethod,
+  AnthropicAuthConfig,
+  SubscriptionInfo,
+} from "./subscription.js";
 
 // ============================================================================
 // TYPE ALIASES
@@ -38,10 +82,14 @@ export type AISDKModel = {
  */
 export type SupportedModelName =
   | BedrockModels
+  | DeepSeekModels
   | OpenAIModels
   | VertexModels
   | GoogleAIModels
-  | AnthropicModels;
+  | AnthropicModels
+  | NvidiaNimModels
+  | LMStudioModels
+  | LlamaCppModels;
 
 /**
  * Extract provider names from enum
@@ -59,12 +107,22 @@ export type ProviderStatus = {
   error?: string;
   responseTime?: number;
   model?: string;
+  /**
+   * Subscription information for providers that support subscription tiers
+   * (e.g., Anthropic Claude with Pro/Max/Team/Enterprise subscriptions)
+   */
+  subscription?: SubscriptionInfo;
+  /**
+   * The authentication method currently in use for this provider
+   */
+  authMethod?: AnthropicAuthMethod;
 };
 
 /**
- * Provider error information
+ * Structural type for provider errors from external sources.
+ * For throwing errors, use the ProviderError class from errors.ts.
  */
-export type ProviderError = Error & {
+export type ProviderErrorLike = Error & {
   code?: string | number;
   statusCode?: number;
   provider?: string;
@@ -87,6 +145,168 @@ export type AWSCredentialConfig = {
   enableDebugLogging?: boolean;
   /** Optional service endpoint override (e.g., VPC/Gov endpoints) */
   endpoint?: string;
+};
+
+/**
+ * Per-provider credential overrides for generate() / stream() calls.
+ *
+ * When set on `NeurolinkConstructorConfig.credentials`, applies as the default
+ * for all calls from that NeuroLink instance. When set on
+ * `GenerateOptions.credentials` or `StreamOptions.credentials`, overrides the
+ * instance default for that single call.
+ *
+ * Unset providers fall through to environment variables (existing behaviour).
+ */
+export type NeurolinkCredentials = {
+  openai?: { apiKey?: string; baseURL?: string };
+  anthropic?: { apiKey?: string; oauthToken?: string };
+  googleAiStudio?: { apiKey?: string };
+  vertex?: {
+    projectId?: string;
+    location?: string;
+    /** Vertex Express Mode — simplified API-key auth */
+    apiKey?: string;
+    /** Full service-account JSON string */
+    serviceAccountKey?: string;
+    /** Inline service-account fields (alternative to serviceAccountKey) */
+    clientEmail?: string;
+    privateKey?: string;
+  };
+  bedrock?: {
+    accessKeyId?: string;
+    secretAccessKey?: string;
+    sessionToken?: string;
+    region?: string;
+  };
+  sagemaker?: {
+    accessKeyId?: string;
+    secretAccessKey?: string;
+    sessionToken?: string;
+    region?: string;
+    endpoint?: string;
+  };
+  azure?: {
+    apiKey?: string;
+    resourceName?: string;
+    deploymentName?: string;
+    apiVersion?: string;
+    // Force `max_completion_tokens` instead of `max_tokens` (reasoning / o-series
+    // / gpt-5+ deployments reject max_tokens). Deployment names are user-defined,
+    // so set this explicitly when the name doesn't reveal the model. Unset ⇒ a
+    // best-effort deployment-name heuristic is used.
+    useMaxCompletionTokens?: boolean;
+  };
+  mistral?: { apiKey?: string; baseURL?: string };
+  huggingFace?: { apiKey?: string; baseURL?: string };
+  openrouter?: { apiKey?: string; baseURL?: string };
+  litellm?: { apiKey?: string; baseURL?: string };
+  openaiCompatible?: { apiKey?: string; baseURL?: string };
+  ollama?: { baseURL?: string; apiKey?: string };
+  deepseek?: { apiKey?: string; baseURL?: string };
+  nvidiaNim?: { apiKey?: string; baseURL?: string };
+  // apiKey is optional for LM Studio / llama.cpp; use only when running them
+  // behind an auth-proxying reverse-proxy.
+  lmStudio?: { apiKey?: string; baseURL?: string };
+  llamacpp?: { apiKey?: string; baseURL?: string };
+  xai?: { apiKey?: string; baseURL?: string };
+  groq?: { apiKey?: string; baseURL?: string };
+  cohere?: { apiKey?: string; baseURL?: string };
+  together?: { apiKey?: string; baseURL?: string };
+  fireworks?: { apiKey?: string; baseURL?: string };
+  perplexity?: { apiKey?: string; baseURL?: string };
+  cloudflare?: { apiKey?: string; accountId?: string; baseURL?: string };
+  replicate?: { apiToken?: string; baseUrl?: string };
+  voyage?: { apiKey?: string; baseURL?: string };
+  jina?: { apiKey?: string; baseURL?: string };
+  stability?: { apiKey?: string; baseURL?: string };
+  ideogram?: { apiKey?: string; baseURL?: string };
+  recraft?: { apiKey?: string; baseURL?: string };
+};
+
+/**
+ * Voyage AI /embeddings response shape.
+ */
+export type VoyageEmbeddingsResponse = {
+  object: "list";
+  data: { object: "embedding"; embedding: number[]; index: number }[];
+  model: string;
+  usage?: { total_tokens?: number };
+};
+
+/**
+ * Jina AI /embeddings response shape (compatible with OpenAI's shape).
+ */
+export type JinaEmbeddingsResponse = {
+  object?: string;
+  data: { object?: string; embedding: number[]; index: number }[];
+  model?: string;
+  usage?: { total_tokens?: number; prompt_tokens?: number };
+};
+
+/**
+ * Jina AI /rerank response shape.
+ */
+export type JinaRerankResponse = {
+  model?: string;
+  results: {
+    index: number;
+    relevance_score: number;
+    document?: { text?: string };
+  }[];
+  usage?: { total_tokens?: number };
+};
+
+/**
+ * Stability AI /v2beta/stable-image/generate/{model} response shape
+ * (returns either binary directly, or JSON with base64 when Accept is set
+ * to application/json). We always request JSON for uniformity.
+ */
+export type StabilityImageResponse = {
+  image?: string; // base64
+  finish_reason?: "SUCCESS" | "ERROR" | "CONTENT_FILTERED";
+  seed?: number;
+};
+
+/**
+ * Ideogram /api/v1/ideogram-v3/generate response shape.
+ */
+export type IdeogramImageResponse = {
+  created?: string;
+  data: {
+    prompt?: string;
+    resolution?: string;
+    is_image_safe?: boolean;
+    seed?: number;
+    url?: string;
+    style_type?: string;
+  }[];
+};
+
+/**
+ * Recraft /v1/images/generations response shape.
+ */
+export type RecraftImageResponse = {
+  created?: number;
+  data: { url?: string; b64_json?: string; image_id?: string }[];
+};
+
+/**
+ * NVIDIA NIM extra request body parameters passed via `providerOptions.openai.body`.
+ * Lives here (not in providers/nvidiaNim.ts) per CLAUDE.md rule 2.
+ */
+export type NvidiaNimExtraBody = {
+  top_k?: number;
+  min_p?: number;
+  repetition_penalty?: number;
+  min_tokens?: number;
+  chat_template?: string;
+  request_id?: string;
+  ignore_eos?: boolean;
+  chat_template_kwargs?: {
+    thinking?: boolean;
+    enable_thinking?: boolean;
+    reasoning_budget?: number;
+  };
 };
 
 /**
@@ -252,6 +472,16 @@ export type ProviderCapabilities = {
   supportsAudio: boolean;
   maxTokens?: number;
   supportedModels: string[];
+  /**
+   * Whether the provider supports subscription-based features and tier management
+   * When true, the provider can adapt behavior based on subscription tier
+   */
+  subscriptionAware?: boolean;
+  /**
+   * List of authentication methods supported by this provider
+   * e.g., ["api_key", "oauth", "session_token", "environment"]
+   */
+  supportedAuthMethods?: string[];
 };
 
 /**
@@ -271,8 +501,177 @@ export type IndividualProviderConfig = {
   timeout?: number;
   retries?: number;
   model?: string;
+  /**
+   * The subscription tier for the provider (e.g., Claude Pro, Max, Team, Enterprise)
+   * Used to determine rate limits, available features, and pricing
+   */
+  subscriptionTier?: ClaudeSubscriptionTier;
+  /**
+   * The authentication method to use for the provider
+   * Supports API key, OAuth, session token, or environment variable
+   */
+  authMethod?: AnthropicAuthMethod;
+  /**
+   * Detailed authentication configuration including credentials and options
+   */
+  authConfig?: AnthropicAuthConfig;
+  /**
+   * Whether to enable beta features for the provider
+   * Beta features may be unstable or subject to change
+   */
+  enableBetaFeatures?: boolean;
   [key: string]: unknown;
 };
+
+/**
+ * Anthropic-specific provider configuration
+ *
+ * @description Extends the base provider configuration with Anthropic-specific
+ * options for OAuth, subscription management, and beta features.
+ */
+export type AnthropicProviderConfig = IndividualProviderConfig & {
+  /**
+   * The subscription tier for Claude access
+   */
+  subscriptionTier?: ClaudeSubscriptionTier;
+
+  /**
+   * The authentication method to use
+   */
+  authMethod?: AnthropicAuthMethod;
+
+  /**
+   * Whether to enable beta features
+   */
+  enableBetaFeatures?: boolean;
+
+  /**
+   * OAuth token for OAuth authentication.
+   * Required when authMethod is "oauth".
+   */
+  oauthToken?: OAuthToken;
+
+  /**
+   * OAuth configuration for OAuth-based authentication
+   */
+  oauthConfig?: {
+    /**
+     * OAuth client ID for the application
+     */
+    clientId?: string;
+
+    /**
+     * OAuth redirect URI for the callback
+     */
+    redirectUri?: string;
+
+    /**
+     * OAuth scopes to request
+     */
+    scopes?: string[];
+
+    /**
+     * OAuth authorization endpoint URL
+     */
+    authorizationEndpoint?: string;
+
+    /**
+     * OAuth token endpoint URL
+     */
+    tokenEndpoint?: string;
+  };
+};
+
+/**
+ * Type guard to check if a configuration is an AnthropicProviderConfig
+ *
+ * @param config - The configuration object to check
+ * @returns True if the configuration is an AnthropicProviderConfig
+ *
+ * @example
+ * ```typescript
+ * const config = getProviderConfig();
+ * if (isAnthropicConfig(config)) {
+ *   // TypeScript knows config is AnthropicProviderConfig here
+ *   console.log(config.subscriptionTier);
+ *   console.log(config.oauthConfig?.clientId);
+ * }
+ * ```
+ */
+export function isAnthropicConfig(
+  config: unknown,
+): config is AnthropicProviderConfig {
+  if (config === null || config === undefined) {
+    return false;
+  }
+
+  if (typeof config !== "object") {
+    return false;
+  }
+
+  const configObj = config as Record<string, unknown>;
+
+  // Check for Anthropic-specific properties
+  // A config is considered Anthropic if it has:
+  // 1. An authMethod that is a valid AnthropicAuthMethod, OR
+  // 2. A subscriptionTier that is a valid ClaudeSubscriptionTier, OR
+  // 3. An oauthConfig object
+
+  const validAuthMethods = ["api_key", "oauth"];
+  const validSubscriptionTiers = [
+    "free",
+    "pro",
+    "max",
+    "max_5",
+    "max_20",
+    "api",
+  ];
+
+  // Check for authMethod
+  if (
+    configObj.authMethod !== undefined &&
+    typeof configObj.authMethod === "string" &&
+    validAuthMethods.includes(configObj.authMethod)
+  ) {
+    return true;
+  }
+
+  // Check for subscriptionTier
+  if (
+    configObj.subscriptionTier !== undefined &&
+    typeof configObj.subscriptionTier === "string" &&
+    validSubscriptionTiers.includes(configObj.subscriptionTier)
+  ) {
+    return true;
+  }
+
+  // Check for oauthConfig
+  if (
+    configObj.oauthConfig !== undefined &&
+    typeof configObj.oauthConfig === "object" &&
+    configObj.oauthConfig !== null
+  ) {
+    return true;
+  }
+
+  // Check for authConfig (AnthropicAuthConfig)
+  if (
+    configObj.authConfig !== undefined &&
+    typeof configObj.authConfig === "object" &&
+    configObj.authConfig !== null
+  ) {
+    const authConfig = configObj.authConfig as Record<string, unknown>;
+    if (
+      authConfig.method !== undefined &&
+      typeof authConfig.method === "string" &&
+      validAuthMethods.includes(authConfig.method)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
 
 /**
  * Configuration options for provider validation
@@ -284,6 +683,11 @@ export type ProviderConfigOptions = {
   description: string;
   instructions: string[];
   fallbackEnvVars?: string[]; // For providers with multiple possible env vars
+  // For local providers (LM Studio, llama.cpp) where the envVarName points at
+  // a base URL with a working default rather than a required credential.
+  // When true, validateApiKey()/validateApiKeyEnhanced() return the env value
+  // (or empty string) instead of throwing when it's unset.
+  optional?: boolean;
 };
 
 // ============================================================================
@@ -310,6 +714,10 @@ export type AIProvider = {
     analysisSchema?: ValidationSchema,
   ): Promise<EnhancedGenerateResult | null>;
 
+  embed(text: string, modelName?: string): Promise<number[]>;
+
+  embedMany(texts: string[], modelName?: string): Promise<number[][]>;
+
   // Tool execution setup - consolidated from NeuroLink SDK
   setupToolExecutor(
     sdk: {
@@ -318,6 +726,31 @@ export type AIProvider = {
     },
     functionTag: string,
   ): void;
+
+  /**
+   * Propagate trace context from NeuroLink SDK for parent-child span hierarchy.
+   * Use this method instead of accessing `_traceContext` directly.
+   */
+  setTraceContext(ctx: { traceId: string; parentSpanId: string } | null): void;
+
+  /**
+   * Whether this provider supports native tool/function calling for the
+   * current model. Implemented by BaseProvider (default true); overridden by
+   * providers with model-dependent or absent tool support (ollama,
+   * huggingface, image providers). Optional for compile compatibility with
+   * external AIProvider implementations — callers treat absence as `true`.
+   */
+  supportsTools?(): boolean;
+
+  /**
+   * Ensure runtime-discovered model limits (context window, output-token
+   * ceiling) are registered before budget math runs. Implemented by
+   * BaseProvider (default no-op); providers with a discovery source override
+   * it (LiteLLM `/model/info`). Must never reject — discovery failure
+   * degrades to static defaults. Optional for compile compatibility with
+   * external AIProvider implementations — callers treat absence as no-op.
+   */
+  ensureModelLimits?(): Promise<void>;
 };
 
 /**
@@ -349,23 +782,6 @@ export type ProviderFactory = (
   providerName?: string,
   sdk?: unknown,
 ) => Promise<unknown>;
-
-/**
- * Provider constructor type
- */
-export type ProviderConstructor = {
-  new (modelName?: string, providerName?: string, sdk?: unknown): unknown;
-};
-
-/**
- * Provider registration entry
- */
-export type ProviderRegistration = {
-  name: string;
-  constructor: ProviderConstructor | ProviderFactory;
-  capabilities?: ProviderCapabilities;
-  defaultConfig?: IndividualProviderConfig;
-};
 
 /**
  * Configuration options for the provider registry
@@ -614,6 +1030,13 @@ export type GenAIModelsAPI = {
     contents: Array<{ role: string; parts: unknown[] }>;
     config?: Record<string, unknown>;
   }) => Promise<GenAIGenerateContentResponse>;
+  embedContent: (params: {
+    model: string;
+    contents: string | string[];
+    config?: Record<string, unknown>;
+  }) => Promise<{
+    embeddings?: Array<{ values?: number[] }>;
+  }>;
 };
 
 /**
@@ -625,14 +1048,63 @@ export type GenAIClient = {
 };
 
 /**
+ * HTTP options for Google GenAI SDK
+ * Allows custom fetch implementation for proxy support
+ */
+export type GoogleGenAIHttpOptions = {
+  /** Custom fetch implementation for proxy support */
+  fetch?: typeof fetch;
+};
+
+/**
  * Google GenAI constructor type
  * Supports both API key (Google AI Studio) and Vertex AI configurations
  */
 export type GoogleGenAIClass = new (
   cfg:
-    | { apiKey: string }
-    | { vertexai: boolean; project: string; location: string },
+    | { apiKey: string; httpOptions?: GoogleGenAIHttpOptions }
+    | {
+        vertexai: boolean;
+        project: string;
+        location: string;
+        httpOptions?: GoogleGenAIHttpOptions;
+      },
 ) => GenAIClient;
+
+// ============================================================================
+// Google Vertex AI Provider Types
+// ============================================================================
+
+/**
+ * Google Vertex AI provider settings for native SDK configuration
+ * Used with @google/genai SDK in vertexai mode
+ *
+ * Note: Authentication is handled via environment variables (GOOGLE_APPLICATION_CREDENTIALS)
+ * or the temporary credentials file approach, not through these settings fields.
+ */
+export type GoogleVertexProviderSettings = {
+  /** Google Cloud project ID */
+  project: string;
+  /** Google Cloud region/location (e.g., 'us-central1') */
+  location: string;
+  /** Optional custom fetch implementation */
+  fetch?: typeof fetch;
+};
+
+/**
+ * Anthropic Vertex AI settings for Claude models on Vertex
+ * Used with @anthropic-ai/vertex-sdk
+ */
+export type AnthropicVertexSettings = {
+  /** Google Cloud project ID */
+  projectId: string;
+  /** Google Cloud region for Anthropic models (e.g., 'us-east5') */
+  region: string;
+  /** SDK request timeout in milliseconds */
+  timeout?: number;
+  /** SDK-internal retry budget (transport retries are the orchestrator's job) */
+  maxRetries?: number;
+};
 
 // ============================================================================
 // OpenAI Compatible Provider Types
@@ -648,42 +1120,6 @@ export type ModelsResponse = {
     created?: number;
     owned_by?: string;
   }>;
-};
-
-// ============================================================================
-// Ollama Provider Types
-// ============================================================================
-
-/**
- * Ollama tool call structure
- */
-export type OllamaToolCall = {
-  id: string;
-  type: "function";
-  function: {
-    name: string;
-    arguments: string;
-  };
-};
-
-/**
- * Ollama tool result structure
- */
-export type OllamaToolResult = {
-  tool_call_id: string;
-  content: string;
-};
-
-/**
- * Ollama message structure for conversation and tool execution
- */
-export type OllamaMessage = {
-  role: "system" | "user" | "assistant" | "tool";
-  content:
-    | string
-    | Array<{ type: string; text?: string; [key: string]: unknown }>;
-  tool_calls?: OllamaToolCall[];
-  images?: string[];
 };
 
 /**
@@ -1249,6 +1685,27 @@ export type ProviderHealthStatusOptions = {
   recommendations: string[];
 };
 
+// ============================================================================
+// Language Model Adapter Types
+// ============================================================================
+
+/**
+ * Structural type that captures what AI SDK's `streamText` / `generateText`
+ * actually invoke at runtime on a model object.
+ *
+ * `SageMakerLanguageModel` satisfies this type. Consumers can cast
+ * `new SageMakerLanguageModel(...)` to `LanguageModel` via this
+ * intermediate type, avoiding `as unknown as LanguageModel`.
+ */
+export type SageMakerAsLanguageModel = {
+  readonly specificationVersion: string;
+  readonly provider: string;
+  readonly modelId: string;
+  readonly supportedUrls: Record<string, RegExp[]>;
+  doGenerate(options: Record<string, unknown>): Promise<unknown>;
+  doStream(options: Record<string, unknown>): Promise<unknown>;
+};
+
 export type ProviderHealthCheckOptions = {
   timeout?: number;
   includeConnectivityTest?: boolean;
@@ -1266,7 +1723,7 @@ export type ProviderHealthCheckOptions = {
  */
 export namespace BedrockTypes {
   // Based on AWS SDK Bedrock types
-  export type Client = {
+  export type BedrockClient = {
     send(command: unknown): Promise<unknown>;
     config: {
       region?: string;
@@ -1289,7 +1746,7 @@ export namespace BedrockTypes {
  */
 export namespace MistralTypes {
   // Based on Mistral SDK types
-  export type Client = {
+  export type MistralClient = {
     chat?: {
       complete?: (options: unknown) => Promise<unknown>;
       stream?: (options: unknown) => AsyncIterable<unknown>;
@@ -1378,3 +1835,441 @@ export type OpenRouterProviderCache = {
   toolCapableModels: Set<string>;
   capabilitiesCached: boolean;
 };
+
+// =============================================================================
+// GOOGLE NATIVE GEMINI 3 TYPES (moved from providers/googleNativeGemini3.ts)
+// =============================================================================
+
+/** A single function declaration for the Gemini native SDK. */
+export type NativeFunctionDeclaration = {
+  name: string;
+  description: string;
+  parametersJsonSchema?: Record<string, unknown>;
+};
+
+/** The tools config array expected by the @google/genai SDK. */
+export type NativeToolsConfig = Array<{
+  functionDeclarations: NativeFunctionDeclaration[];
+}>;
+
+/**
+ * Return value of buildNativeToolDeclarations.
+ *
+ * `originalNameMap` lets callers translate a Google-safe (sanitized,
+ * suffix-disambiguated) tool name back to the original identifier the
+ * SDK consumer registered. Sanitized names are transport-only — they
+ * MUST be hidden from tool-call metadata exposed to consumers.
+ */
+export type NativeToolDeclarationsResult = {
+  toolsConfig: NativeToolsConfig;
+  executeMap: Map<string, Tool["execute"]>;
+  originalNameMap: Map<string, string>;
+};
+
+/** A single function call returned by the Gemini model. */
+export type NativeFunctionCall = {
+  name: string;
+  args: Record<string, unknown>;
+};
+
+/** A single function response to feed back into the conversation. */
+export type NativeFunctionResponse = {
+  functionResponse: { name: string; response: unknown };
+};
+
+/** Result from collectStreamChunks. */
+export type CollectedChunkResult = {
+  rawResponseParts: unknown[];
+  stepFunctionCalls: NativeFunctionCall[];
+  inputTokens: number;
+  outputTokens: number;
+  /**
+   * Gemini cached-content tokens (overlapping: included in promptTokenCount).
+   * Surfaced so the call site can subtract from input and bill at cacheRead
+   * rate. Subtraction happens at the call site, not in the collector.
+   */
+  cacheReadTokens?: number;
+  /** Cache creation tokens (symmetry; Gemini does not emit this). */
+  cacheCreationTokens?: number;
+  /**
+   * Gemini thinking tokens (usageMetadata.thoughtsTokenCount). Billed at the
+   * output rate but NOT included in candidatesTokenCount — Gemini reports
+   * totalTokenCount = prompt + candidates + thoughts.
+   */
+  reasoningTokens?: number;
+};
+
+/** Push-based text channel for incremental streaming. */
+export type TextChannel = {
+  /** Push a text chunk to the consumer. */
+  push: (text: string) => void;
+  /** Signal that no more chunks will arrive. */
+  close: () => void;
+  /** Signal that the producer encountered a fatal error. */
+  error: (err: unknown) => void;
+  /** Async iterable consumed by the StreamResult. */
+  iterable: AsyncIterable<{ content: string }>;
+};
+
+// =============================================================================
+// PROVIDER TYPE UTILS (moved from providers/providerTypeUtils.ts)
+// =============================================================================
+
+/** Language model object shape (LanguageModelV2/V3). */
+export type LanguageModelObject = {
+  readonly modelId: string;
+  readonly provider: string;
+};
+
+/** Step finish event shape for multi-step generation. */
+export type StepFinishEvent = {
+  readonly toolCalls: ReadonlyArray<unknown>;
+  readonly toolResults: ReadonlyArray<unknown>;
+  readonly text: string;
+  readonly finishReason: string;
+  readonly usage: { inputTokens?: number; outputTokens?: number };
+  [key: string]: unknown;
+};
+
+/**
+ * Represents an AI SDK Tool that may carry a legacy `parameters` field
+ * (from AI SDK v3/v4) in addition to the current `inputSchema`.
+ */
+export type ToolWithLegacyParams = {
+  description?: string;
+  inputSchema?: unknown;
+  execute?: (...args: unknown[]) => unknown;
+  /** Legacy field from AI SDK v3/v4 */
+  parameters?: unknown;
+};
+
+// =============================================================================
+// PROVIDER FACTORY (from factories/providerFactory.ts)
+// =============================================================================
+
+/**
+ * Provider constructor interface - supports both sync constructors and async
+ * factory functions.
+ */
+export type ProviderConstructor =
+  | {
+      new (
+        modelName?: string,
+        providerName?: string,
+        sdk?: NeuroLink,
+        region?: string,
+        credentials?: UnknownRecord,
+      ): AIProvider;
+    }
+  | ((
+      modelName?: string,
+      providerName?: string,
+      sdk?: NeuroLink,
+      region?: string,
+      credentials?: UnknownRecord,
+    ) => Promise<AIProvider>);
+
+/** Provider registration entry held by ProviderFactory. */
+export type ProviderRegistration = {
+  constructor: ProviderConstructor;
+  defaultModel?: string;
+  aliases?: string[];
+};
+
+// =============================================================================
+// IMAGE GEN (from image-gen/ImageGenService.ts)
+// =============================================================================
+
+/** Minimal NeuroLink-like instance accepted by the image generation service. */
+export type NeuroLinkInstance = {
+  generate: (options: Record<string, unknown>) => Promise<unknown>;
+};
+
+// =============================================================================
+// SAGEMAKER DETECTION (from providers/sagemaker/detection.ts)
+// =============================================================================
+
+/** Model type detection result. */
+export type ModelDetectionResult = {
+  type: StreamingCapability["modelType"];
+  confidence: number;
+  evidence: string[];
+  suggestedConfig?: Partial<SageMakerModelConfig>;
+};
+
+/** Endpoint health and metadata information. */
+export type EndpointHealth = {
+  status: "healthy" | "unhealthy" | "unknown";
+  responseTime: number;
+  metadata?: Record<string, unknown>;
+  modelInfo?: {
+    name?: string;
+    version?: string;
+    framework?: string;
+    architecture?: string;
+  };
+};
+
+/** Configuration object for a detection test wrapper. */
+export type DetectionTestConfig = {
+  test: () => Promise<void>;
+  index: number;
+  testName: string;
+  endpointName: string;
+  semaphore: {
+    acquire(): Promise<void>;
+    release(): void;
+  };
+  incrementRateLimit: () => void;
+  maxRateLimitRetries: number;
+  rateLimitState: { count: number };
+};
+
+/** Configuration object for parallel detection test execution. */
+export type ParallelDetectionConfig = {
+  maxConcurrentTests: number;
+  maxRateLimitRetries: number;
+  initialRateLimitCount: number;
+};
+
+// =============================================================================
+// SAGEMAKER DIAGNOSTICS (from providers/sagemaker/diagnostics.ts)
+// =============================================================================
+
+/** Individual SageMaker diagnostic result. */
+export type DiagnosticResult = {
+  name: string;
+  category: "configuration" | "connectivity" | "streaming";
+  status: "pass" | "fail" | "warning";
+  message: string;
+  details?: string;
+  recommendation?: string;
+};
+
+/** Aggregated SageMaker diagnostic report. */
+export type DiagnosticReport = {
+  overallStatus: "healthy" | "issues" | "critical";
+  results: DiagnosticResult[];
+  summary: {
+    total: number;
+    passed: number;
+    failed: number;
+    warnings: number;
+  };
+};
+
+// =============================================================================
+// SAGEMAKER LANGUAGE MODEL (from providers/sagemaker/language-model.ts)
+// =============================================================================
+
+/** SageMaker tool_call item in the OpenAI-compatible payload shape. */
+export type SageMakerOpenAIToolCall = {
+  type: "function";
+  id: string;
+  function: {
+    name: string;
+    arguments: string;
+  };
+};
+
+// =============================================================================
+// GOOGLE AI STUDIO LIVE AUDIO (from providers/googleAiStudio.ts)
+// =============================================================================
+
+/**
+ * Event pushed through the Google AI Studio voice session's internal queue
+ * while audio chunks stream back from the Gemini Live API.
+ */
+export type GoogleLiveAudioQueueItem =
+  | { type: "audio"; audio: import("./stream.js").AudioChunk }
+  | { type: "end" }
+  | { type: "error"; error: unknown };
+
+// =============================================================================
+// GOOGLE VERTEX NATIVE PARTS (from providers/googleVertex.ts)
+// =============================================================================
+
+/**
+ * Single part inside a Google Vertex "native" (non-AI-SDK) generateContent
+ * payload — either inline text or an inline base64 data blob.
+ *
+ * Despite the "Vertex" prefix, the shape is identical for the Google AI
+ * Studio native path (`@google/genai` SDK), so AI Studio re-uses this type.
+ */
+export type VertexNativePart =
+  | { text: string }
+  | { inlineData: { mimeType: string; data: string } };
+
+/**
+ * Part variants that ride the native Gemini agentic tool loop in addition to
+ * the plain `VertexNativePart` content shapes: model-issued function calls
+ * replayed into history, and the function responses (plus wrap-up nudge text
+ * parts) sent back on the next user turn. Mirrors the optional
+ * `functionCall` / `functionResponse` members of the @google/genai SDK's
+ * `Part` type, so loop contents stay directly assignable to the SDK payload.
+ */
+export type VertexNativeLoopPart =
+  | VertexNativePart
+  | { functionCall: { name: string; args: Record<string, unknown> } }
+  | { functionResponse: { name: string; response: Record<string, unknown> } };
+
+/**
+ * Subset of `GenerateOptions["input"]` consumed by the shared Gemini-native
+ * multimodal-parts builder. Kept narrow so the helper doesn't depend on the
+ * full `GenerateOptions` shape. The `images` field mirrors the public
+ * `GenerateOptions["input"].images` shape so the helper accepts the same
+ * value SDK callers pass in (plain Buffer/string or `ImageWithAltText`).
+ */
+export type GeminiMultimodalInput = {
+  text?: string;
+  pdfFiles?: Array<Buffer | string>;
+  images?: Array<Buffer | string | { data: Buffer | string; altText?: string }>;
+};
+
+/**
+ * Internal helpers used by the conversation-history builder in
+ * providers/googleVertex.ts to merge interleaved tool call / result turns.
+ */
+export type VertexToolStep = {
+  type: "tool_step";
+  callParts: unknown[];
+  resultParts: unknown[];
+};
+
+export type VertexRegularSegment = {
+  type: "regular";
+  role: string;
+  parts: unknown[];
+};
+
+export type VertexSegment = VertexToolStep | VertexRegularSegment;
+
+/**
+ * Function declaration shape accepted by the @google/genai SDK when tools are
+ * attached to a Vertex generateContent call.
+ */
+export type VertexGenaiFunctionDeclaration = {
+  name: string;
+  description: string;
+  parametersJsonSchema?: Record<string, unknown>;
+};
+
+// =============================================================================
+// VERTEX ANTHROPIC (from providers/googleVertex.ts Claude-on-Vertex path)
+// =============================================================================
+
+/**
+ * Message payload passed to the Anthropic Vertex SDK — mirrors the Anthropic
+ * Messages API shape (role + structured content blocks).
+ */
+/**
+ * Anthropic ephemeral prompt-cache breakpoint marker. Placed on a content
+ * block / tool / system block to make the rendered prefix up to that point a
+ * cache breakpoint. Vertex has NO automatic caching, so these explicit markers
+ * are the only way the conversation prefix is cached across turns.
+ */
+export type VertexAnthropicCacheControl = { type: "ephemeral" };
+
+export type VertexAnthropicMessage = {
+  role: "user" | "assistant";
+  content:
+    | string
+    | Array<
+        | {
+            type: "text";
+            text: string;
+            cache_control?: VertexAnthropicCacheControl;
+          }
+        | {
+            type: "image";
+            source: { type: "base64"; media_type: string; data: string };
+            cache_control?: VertexAnthropicCacheControl;
+          }
+        | {
+            type: "document";
+            source: { type: "base64"; media_type: string; data: string };
+            cache_control?: VertexAnthropicCacheControl;
+          }
+        | {
+            type: "tool_use";
+            id: string;
+            name: string;
+            input: unknown;
+            cache_control?: VertexAnthropicCacheControl;
+          }
+        | {
+            type: "tool_result";
+            tool_use_id: string;
+            content: string;
+            cache_control?: VertexAnthropicCacheControl;
+          }
+        | {
+            type: "thinking";
+            thinking: string;
+            cache_control?: VertexAnthropicCacheControl;
+          }
+        | {
+            type: "redacted_thinking";
+            data: string;
+            cache_control?: VertexAnthropicCacheControl;
+          }
+      >;
+};
+
+/**
+ * System prompt block form accepted by the Anthropic Vertex SDK. Used instead
+ * of a bare string when a `cache_control` breakpoint must ride on the system
+ * prompt (a string `system` cannot carry one).
+ */
+export type VertexAnthropicSystemBlock = {
+  type: "text";
+  text: string;
+  cache_control?: VertexAnthropicCacheControl;
+};
+
+/** Tool definition accepted by the Anthropic Vertex SDK. */
+export type VertexAnthropicTool = {
+  name: string;
+  description: string;
+  input_schema: {
+    type: "object";
+    properties?: Record<string, unknown>;
+    required?: string[];
+  };
+  cache_control?: VertexAnthropicCacheControl;
+};
+
+/** Input to `applyVertexAnthropicCacheBreakpoints`. */
+export type VertexAnthropicCacheInput = {
+  system?: string;
+  tools?: VertexAnthropicTool[];
+  messages: VertexAnthropicMessage[];
+  /**
+   * Cap on how many of the most-recent messages receive a rolling history
+   * breakpoint. Defaults to "use the remaining budget". Two or more gives
+   * cross-turn continuity and resilience against Anthropic's 20-block cache
+   * lookback window on tool-heavy turns.
+   */
+  maxHistoryBreakpoints?: number;
+};
+
+/** Output of `applyVertexAnthropicCacheBreakpoints` — a cache-annotated request. */
+export type VertexAnthropicCacheOutput = {
+  system?: string | VertexAnthropicSystemBlock[];
+  tools?: VertexAnthropicTool[];
+  messages: VertexAnthropicMessage[];
+};
+
+/**
+ * Content block variants returned by the Anthropic Vertex SDK during streaming
+ * and generation — used to narrow responses before handing tool calls back.
+ */
+export type VertexAnthropicContentBlock =
+  | { type: "text"; text: string }
+  | {
+      type: "tool_use";
+      id: string;
+      name: string;
+      input: Record<string, unknown>;
+    }
+  | { type: "tool_result"; tool_use_id: string; content: string };

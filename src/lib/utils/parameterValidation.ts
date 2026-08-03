@@ -4,27 +4,24 @@
  */
 
 import type { AIProviderName } from "../constants/enums.js";
+import { VIDEO_ERROR_CODES } from "../constants/videoErrors.js";
 import { SYSTEM_LIMITS } from "../core/constants.js";
 import type {
   GenerateOptions,
   TextGenerationOptions,
-} from "../types/generateTypes.js";
-import type { NeuroLinkMCPTool } from "../types/mcpTypes.js";
-import type { VideoOutputOptions } from "../types/multimodal.js";
-import type {
+  NeuroLinkMCPTool,
+  VideoOutputOptions,
+  StreamOptions,
+  EnhancedValidationResult,
+  AudienceOption,
   PPTOutputOptions,
   ThemeOption,
-  AudienceOption,
   ToneOption,
-} from "../types/pptTypes.js";
-import type { StreamOptions } from "../types/streamTypes.js";
-import type { EnhancedValidationResult } from "../types/tools.js";
-import type {
   StandardRecord,
   StringArray,
   ValidationSchema,
-} from "../types/typeAliases.js";
-import { ErrorFactory, NeuroLinkError } from "./errorHandling.js";
+} from "../types/index.js";
+import { ErrorFactory, type NeuroLinkError } from "./errorHandling.js";
 import { isNonNullObject } from "./typeUtils.js";
 
 // ============================================================================
@@ -411,10 +408,24 @@ export function validateTextGenerationOptions(
 
   const opts = options as Partial<TextGenerationOptions>;
 
-  // Validate prompt
-  const promptError = validateRequiredString(opts.prompt, "prompt", 1);
-  if (promptError) {
-    errors.push(promptError);
+  // Modality dispatch (output.mode === 'video' | 'avatar' | 'music') carries
+  // its own typed prompt inside `output.{video|avatar|music}`. The textual
+  // prompt is irrelevant for these modes, so skip the prompt-required check.
+  // Same exemption applies for STT-driven flows where `input.text` is
+  // synthesized from transcription downstream.
+  const outputMode = (opts as { output?: { mode?: string } }).output?.mode;
+  const isMediaModalityMode =
+    outputMode === "video" || outputMode === "avatar" || outputMode === "music";
+  const hasSttAudio = !!(
+    opts as { stt?: { enabled?: boolean; audio?: unknown } }
+  ).stt?.audio;
+
+  // Validate prompt (skipped for modality dispatch + STT-driven flows)
+  if (!isMediaModalityMode && !hasSttAudio) {
+    const promptError = validateRequiredString(opts.prompt, "prompt", 1);
+    if (promptError) {
+      errors.push(promptError);
+    }
   }
 
   if (opts.prompt && opts.prompt.length > SYSTEM_LIMITS.MAX_PROMPT_LENGTH) {
@@ -740,7 +751,11 @@ function toValidationError(error: NeuroLinkError): ValidationError {
  * Valid video generation options
  */
 const VALID_VIDEO_RESOLUTIONS = ["720p", "1080p"] as const;
-const VALID_VIDEO_LENGTHS = [4, 6, 8] as const;
+// Cross-provider literal whitelist: Vertex Veo uses 4 / 6 / 8 s, Kling and
+// Runway use 5 / 10 s. The handler-level adapter is the source of truth
+// for per-provider rejection (e.g. Runway 400 for length=4); this gate
+// just rejects obviously invalid integers.
+const VALID_VIDEO_LENGTHS = [4, 5, 6, 8, 10] as const;
 const VALID_VIDEO_ASPECT_RATIOS = ["9:16", "16:9"] as const;
 const MAX_VIDEO_PROMPT_LENGTH = 500;
 const MAX_VIDEO_IMAGE_SIZE = 10 * 1024 * 1024; // 10MB
@@ -971,6 +986,152 @@ export function validateVideoGenerationInput(
   if (errors.length === 0 && warnings.length === 0) {
     suggestions.push(
       "Video generation takes 60-180 seconds. Consider setting a longer timeout.",
+    );
+  }
+
+  return { isValid: errors.length === 0, errors, warnings, suggestions };
+}
+
+// ============================================================================
+// DIRECTOR MODE VALIDATION
+// ============================================================================
+
+const MIN_DIRECTOR_SEGMENTS = 2;
+const MAX_DIRECTOR_SEGMENTS = 10;
+const VALID_TRANSITION_DURATIONS = [4, 6, 8] as const;
+
+/**
+ * Validate Director Mode input: segments, transition prompts, and durations.
+ *
+ * @param options - GenerateOptions with input.segments and output.director
+ * @returns EnhancedValidationResult with errors, warnings, and suggestions
+ */
+export function validateDirectorModeInput(
+  options: GenerateOptions,
+): EnhancedValidationResult {
+  const errors: ValidationError[] = [];
+  const warnings: string[] = [];
+  const suggestions: StringArray = [];
+
+  const segments = options.input?.segments;
+
+  if (!segments || !Array.isArray(segments)) {
+    errors.push(
+      new ValidationError(
+        "Director Mode requires an input.segments array",
+        "input.segments",
+        VIDEO_ERROR_CODES.DIRECTOR_SEGMENT_MISMATCH,
+      ),
+    );
+    return { isValid: false, errors, warnings, suggestions };
+  }
+
+  if (
+    segments.length < MIN_DIRECTOR_SEGMENTS ||
+    segments.length > MAX_DIRECTOR_SEGMENTS
+  ) {
+    errors.push(
+      new ValidationError(
+        `Director Mode requires ${MIN_DIRECTOR_SEGMENTS}-${MAX_DIRECTOR_SEGMENTS} segments, got ${segments.length}`,
+        "input.segments",
+        segments.length > MAX_DIRECTOR_SEGMENTS
+          ? VIDEO_ERROR_CODES.DIRECTOR_SEGMENT_LIMIT_EXCEEDED
+          : VIDEO_ERROR_CODES.DIRECTOR_SEGMENT_MISMATCH,
+      ),
+    );
+    return { isValid: false, errors, warnings, suggestions };
+  }
+
+  // Validate each segment
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (!seg || typeof seg !== "object") {
+      errors.push(
+        new ValidationError(
+          `Segment ${i} must be an object with prompt and image`,
+          `input.segments[${i}]`,
+          VIDEO_ERROR_CODES.DIRECTOR_SEGMENT_MISMATCH,
+        ),
+      );
+      continue;
+    }
+    if (
+      !seg.prompt ||
+      typeof seg.prompt !== "string" ||
+      seg.prompt.trim().length === 0
+    ) {
+      errors.push(
+        new ValidationError(
+          `Segment ${i} requires a non-empty prompt`,
+          `input.segments[${i}].prompt`,
+          VIDEO_ERROR_CODES.DIRECTOR_SEGMENT_MISMATCH,
+        ),
+      );
+    }
+    if (seg.image === undefined || seg.image === null) {
+      errors.push(
+        new ValidationError(
+          `Segment ${i} requires a valid image (Buffer, URL, path, or ImageWithAltText)`,
+          `input.segments[${i}].image`,
+          VIDEO_ERROR_CODES.DIRECTOR_SEGMENT_MISMATCH,
+        ),
+      );
+    }
+  }
+
+  // Validate director options
+  const director = options.output?.director;
+  const expectedTransitions = segments.length - 1;
+
+  if (director?.transitionPrompts) {
+    if (director.transitionPrompts.length !== expectedTransitions) {
+      errors.push(
+        new ValidationError(
+          `Expected ${expectedTransitions} transition prompts, got ${director.transitionPrompts.length}`,
+          "output.director.transitionPrompts",
+          VIDEO_ERROR_CODES.DIRECTOR_SEGMENT_MISMATCH,
+        ),
+      );
+    }
+  }
+
+  if (director?.transitionDurations) {
+    if (director.transitionDurations.length !== expectedTransitions) {
+      errors.push(
+        new ValidationError(
+          `Expected ${expectedTransitions} transition durations, got ${director.transitionDurations.length}`,
+          "output.director.transitionDurations",
+          VIDEO_ERROR_CODES.DIRECTOR_SEGMENT_MISMATCH,
+        ),
+      );
+    } else {
+      for (let i = 0; i < director.transitionDurations.length; i++) {
+        const d = director.transitionDurations[i];
+        if (!VALID_TRANSITION_DURATIONS.includes(d)) {
+          errors.push(
+            new ValidationError(
+              `Invalid transition duration at index ${i}: ${d}. Use 4, 6, or 8`,
+              `output.director.transitionDurations[${i}]`,
+              VIDEO_ERROR_CODES.DIRECTOR_INVALID_TRANSITION_DURATION,
+            ),
+          );
+        }
+      }
+    }
+  }
+
+  // Validate video output options if provided
+  if (options.output?.video) {
+    const videoError = validateVideoOutputOptions(options.output.video);
+    if (videoError) {
+      errors.push(toValidationError(videoError));
+    }
+  }
+
+  if (errors.length === 0) {
+    const totalCalls = segments.length + expectedTransitions;
+    suggestions.push(
+      `Director Mode will make ${totalCalls} API calls (${segments.length} clips + ${expectedTransitions} transitions). Ensure adequate timeout.`,
     );
   }
 

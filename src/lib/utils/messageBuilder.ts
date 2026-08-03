@@ -1,19 +1,6 @@
-/**
- * Message Builder Utility
- * Centralized logic for building message arrays from TextGenerationOptions
- * Enhanced with multimodal support for images
- */
-
-import type {
-  CoreAssistantMessage,
-  CoreMessage,
-  CoreSystemMessage,
-  CoreUserMessage,
-  FilePart,
-  ImagePart,
-  TextPart,
-} from "ai";
 import { existsSync, readFileSync, statSync } from "fs";
+import { readFile as readFileAsync, stat as statAsync } from "fs/promises";
+import { basename } from "path";
 import { getGlobalDispatcher, interceptors, request } from "undici";
 import {
   MultimodalLogger,
@@ -29,23 +16,38 @@ import {
   FILE_READ_BUDGET_PERCENT,
 } from "../context/fileTokenBudget.js";
 import type { FileReferenceRegistry } from "../files/fileReferenceRegistry.js";
-import { SIZE_TIER_THRESHOLDS } from "../files/types.js";
+import { isCSVContent, SIZE_TIER_THRESHOLDS } from "../types/index.js";
 import type {
   ChatMessage,
+  Content,
+  CSVContent,
+  FileInput,
+  FileWithMetadata,
+  GenerateOptions,
+  ImageWithAltText,
   MessageContent,
   MultimodalChatMessage,
-} from "../types/conversation.js";
-import type { FileWithMetadata } from "../types/fileTypes.js";
-import type { GenerateOptions } from "../types/generateTypes.js";
-import type { TextGenerationOptions } from "../types/index.js";
-import type { Content, ImageWithAltText } from "../types/multimodal.js";
-import type { StreamOptions } from "../types/streamTypes.js";
+  StreamOptions,
+  TextGenerationOptions,
+} from "../types/index.js";
+import { tracers, ATTR, withSpan } from "../telemetry/index.js";
+import { ErrorFactory, NeuroLinkError, withTimeout } from "./errorHandling.js";
 import { FileDetector } from "./fileDetector.js";
 import { getImageCache } from "./imageCache.js";
+import { ImageProcessor, imageUtils } from "./imageProcessor.js";
 import { logger } from "./logger.js";
 import { PDFImageConverter, PDFProcessor } from "./pdfProcessor.js";
 import { urlDownloadRateLimiter } from "./rateLimiter.js";
 import { estimateTokens } from "./tokenEstimation.js";
+import type {
+  AssistantModelMessage,
+  ModelMessage,
+  SystemModelMessage,
+  UserModelMessage,
+  FilePart,
+  ImagePart,
+  TextPart,
+} from "../types/index.js";
 
 // ---------------------------------------------------------------------------
 // SDK-7: Lightweight file-type inference helpers for budget estimation
@@ -323,8 +325,8 @@ function isValidContentItem(
   item: unknown,
 ): item is
   | { type: "text"; text: string }
-  | { type: "image"; image: string; mimeType?: string }
-  | { type: "file"; data: Buffer; mimeType: string } {
+  | { type: "image"; image: string; mediaType?: string }
+  | { type: "file"; data: Buffer; mediaType: string } {
   if (!item || typeof item !== "object") {
     return false;
   }
@@ -361,7 +363,7 @@ function convertContentItem(
 ):
   | TextPart
   | ImagePart
-  | { type: "file"; data: Buffer; mimeType: string }
+  | { type: "file"; data: Buffer; mediaType: string }
   | null {
   if (!isValidContentItem(item)) {
     return null;
@@ -383,7 +385,7 @@ function convertContentItem(
     return {
       type: "image",
       image: contentItem.image,
-      ...(contentItem.mimeType && { mimeType: contentItem.mimeType }),
+      ...(contentItem.mimeType && { mediaType: contentItem.mimeType }),
     } satisfies ImagePart;
   }
 
@@ -395,7 +397,7 @@ function convertContentItem(
     return {
       type: "file",
       data: contentItem.data,
-      mimeType: contentItem.mimeType,
+      mediaType: contentItem.mimeType,
     };
   }
 
@@ -403,14 +405,14 @@ function convertContentItem(
 }
 
 /**
- * Type-safe conversion from MultimodalChatMessage[] to CoreMessage[]
- * Filters out invalid content and ensures strict CoreMessage contract compliance
+ * Type-safe conversion from MultimodalChatMessage[] to ModelMessage[]
+ * Filters out invalid content and ensures strict ModelMessage contract compliance
  */
-export function convertToCoreMessages(
+export function convertToModelMessages(
   messages: MultimodalChatMessage[],
-): CoreMessage[] {
+): ModelMessage[] {
   return messages
-    .map((msg): CoreMessage | null => {
+    .map((msg): ModelMessage | null => {
       // Validate role
       if (!isValidRole(msg.role)) {
         logger.warn("Invalid message role found, skipping", { role: msg.role });
@@ -424,17 +426,17 @@ export function convertToCoreMessages(
           return {
             role: "system",
             content: msg.content,
-          } satisfies CoreSystemMessage;
+          } satisfies SystemModelMessage;
         } else if (msg.role === "user") {
           return {
             role: "user",
             content: msg.content,
-          } satisfies CoreUserMessage;
+          } satisfies UserModelMessage;
         } else if (msg.role === "assistant") {
           return {
             role: "assistant",
             content: msg.content,
-          } satisfies CoreAssistantMessage;
+          } satisfies AssistantModelMessage;
         }
       }
 
@@ -457,24 +459,22 @@ export function convertToCoreMessages(
           return {
             role: "user",
             content: validContent,
-          } satisfies CoreUserMessage;
+          } satisfies UserModelMessage;
         } else if (msg.role === "assistant") {
           // Assistant messages only support text content, filter out images
           const textOnlyContent = validContent.filter(
             (item) => item.type === "text",
           );
           if (textOnlyContent.length === 0) {
-            // If no text content, convert to empty string
-            return {
-              role: "assistant",
-              content: "",
-            } satisfies CoreAssistantMessage;
+            // No text content (e.g., only images/files) — skip message
+            // to avoid sending empty content to providers like Claude
+            return null;
           } else if (textOnlyContent.length === 1) {
             // Single text item, use string content
             return {
               role: "assistant",
               content: textOnlyContent[0].text,
-            } satisfies CoreAssistantMessage;
+            } satisfies AssistantModelMessage;
           } else {
             // Multiple text items, concatenate them
             const combinedText = textOnlyContent
@@ -483,7 +483,7 @@ export function convertToCoreMessages(
             return {
               role: "assistant",
               content: combinedText,
-            } satisfies CoreAssistantMessage;
+            } satisfies AssistantModelMessage;
           }
         } else {
           // System messages cannot have multimodal content, convert to text
@@ -492,7 +492,7 @@ export function convertToCoreMessages(
           return {
             role: "system",
             content: textContent,
-          } satisfies CoreSystemMessage;
+          } satisfies SystemModelMessage;
         }
       }
 
@@ -502,19 +502,22 @@ export function convertToCoreMessages(
       });
       return null;
     })
-    .filter((msg): msg is CoreMessage => msg !== null);
+    .filter((msg): msg is ModelMessage => msg !== null);
 }
 
 /**
- * Convert ChatMessage to CoreMessage for AI SDK compatibility
+ * Convert ChatMessage to ModelMessage for AI SDK compatibility
  */
-function toCoreMessage(message: ChatMessage): CoreMessage | null {
+function toModelMessage(message: ChatMessage): ModelMessage | null {
   // Only include messages with roles supported by AI SDK
   if (
     message.role === "user" ||
     message.role === "assistant" ||
     message.role === "system"
   ) {
+    if (message.content.trim() === "") {
+      return null;
+    }
     return {
       role: message.role,
       content: message.content,
@@ -571,14 +574,15 @@ function shouldUseStructuredOutput(options: {
 
 /**
  * Log structural metadata about a composed message array without logging content.
- * Per-message breakdown is behind logger.debug() to avoid production spam.
+ * Only logs a compact summary (role counts, total chars, estimated tokens).
+ * Per-message breakdown is intentionally omitted to avoid log noise
+ * (~600 lines per retry cascade with many messages).
  */
 function logMessageComposition(
   messages: Array<{ role: string; content: unknown }>,
   requestId?: string,
 ): void {
-  // Skip entirely if neither info nor debug is enabled
-  if (!logger.shouldLog("info")) {
+  if (!logger.shouldLog("debug")) {
     return;
   }
 
@@ -586,46 +590,18 @@ function logMessageComposition(
   let totalChars = 0;
 
   for (const msg of messages) {
-    // Avoid JSON.stringify on multimodal content for the info-level summary;
-    // accurate per-message breakdown (with sizes) is computed only when debug
-    // logging is active (see below).
     const chars = typeof msg.content === "string" ? msg.content.length : 0;
     roles[msg.role] = (roles[msg.role] || 0) + 1;
     totalChars += chars;
   }
 
-  logger.info("[MessageBuilder] Composed", {
+  logger.debug("[MessageBuilder] Composed", {
     requestId,
     totalMessages: messages.length,
     roles,
     totalChars,
     estimatedTokens: Math.ceil(totalChars / 4),
   });
-
-  if (logger.shouldLog("debug")) {
-    const breakdown = messages.map((msg, i) => {
-      let chars: number;
-      if (typeof msg.content === "string") {
-        chars = msg.content.length;
-      } else {
-        try {
-          chars = JSON.stringify(msg.content).length;
-        } catch {
-          chars = String(msg.content).length;
-        }
-      }
-      return {
-        index: i,
-        role: msg.role,
-        chars,
-        estimatedTokens: Math.ceil(chars / 4),
-      };
-    });
-    logger.debug("[MessageBuilder] Per-message breakdown", {
-      requestId,
-      breakdown,
-    });
-  }
 }
 
 /**
@@ -636,8 +612,8 @@ function logMessageComposition(
  */
 export async function buildMessagesArray(
   options: TextGenerationOptions | StreamOptions,
-): Promise<CoreMessage[]> {
-  const messages: CoreMessage[] = [];
+): Promise<ModelMessage[]> {
+  const messages: ModelMessage[] = [];
 
   // Check if conversation history exists
   const hasConversationHistory =
@@ -668,10 +644,10 @@ export async function buildMessagesArray(
   }
 
   // Add conversation history if available
-  // Convert ChatMessages to CoreMessages and filter out tool messages
+  // Convert ChatMessages to ModelMessages and filter out tool messages
   if (hasConversationHistory && options.conversationMessages) {
     for (const chatMessage of options.conversationMessages) {
-      const coreMessage = toCoreMessage(chatMessage);
+      const coreMessage = toModelMessage(chatMessage);
       if (coreMessage) {
         messages.push(coreMessage);
       }
@@ -721,9 +697,13 @@ export async function buildMessagesArray(
             }
           }
 
-          csvSection += buildCSVToolInstructions(filePath);
-
+          // Put the actual CSV content BEFORE the tool instructions —
+          // buildCSVToolInstructions references "the CSV data shown above"
+          // and the trailing position keeps that reference accurate.
+          // Vertex Gemini misreads CSV-only prompts as "no files attached"
+          // when the NOTE-then-data order makes the reference dangle.
           csvSection += result.content;
+          csvSection += buildCSVToolInstructions(filePath);
           csvContent += csvSection;
           logger.info(`[CSV] ✅ Processed: ${filename}`, result.metadata);
         } catch (error) {
@@ -742,6 +722,7 @@ export async function buildMessagesArray(
             maxSize: 50 * 1024 * 1024,
             allowedTypes: ["csv"],
             csvOptions: csvOptions,
+            mimetypeHint: isFileWithMetadata(file) ? file.mimetype : undefined,
           });
 
           if (result.type === "csv") {
@@ -796,6 +777,7 @@ function enforceFileBudget(
   provider: string,
   model: string,
 ): void {
+  options.input ??= {};
   if (!options.input.files || options.input.files.length === 0) {
     return;
   }
@@ -841,10 +823,13 @@ function enforceFileBudget(
   );
 
   if (budgetResult.excluded.length > 0) {
-    const includedNames = new Set(budgetResult.included.map((f) => f.name));
+    const includedIndices = new Set(
+      budgetResult.included.map((f) => {
+        return budgetFiles.findIndex((bf) => bf.name === f.name);
+      }),
+    );
     options.input.files = options.input.files.filter((_file, idx) => {
-      const entry = budgetFiles[idx];
-      return includedNames.has(entry.name);
+      return includedIndices.has(idx);
     });
     options.input.text =
       (options.input.text || "") + "\n\n" + budgetResult.notices.join("\n");
@@ -866,9 +851,10 @@ function appendDetectedFileResult(
     metadata?: Record<string, unknown>;
     images?: Array<Buffer | string | ImageWithAltText>;
   },
-  file: AnyFileInput,
+  file: FileInput,
   options: GenerateOptions,
 ): void {
+  options.input ??= {};
   const filename = extractFilename(file);
 
   if (result.type === "csv") {
@@ -880,8 +866,11 @@ function appendDetectedFileResult(
         csvSection += metadataText + `\n\n`;
       }
     }
-    csvSection += buildCSVToolInstructions(filePath);
+    // Put the actual CSV content BEFORE the tool instructions —
+    // buildCSVToolInstructions references "the CSV data shown above" and
+    // the trailing position keeps that reference accurate.
     csvSection += result.content;
+    csvSection += buildCSVToolInstructions(filePath);
     options.input.text += csvSection;
     logger.info(`[FileDetector] ✅ CSV: ${filename}`);
   } else if (result.type === "svg") {
@@ -984,96 +973,214 @@ function appendDetectedFileResult(
 }
 
 /**
+ * Fold the `audioFiles` / `videoFiles` aliases into the unified `files` array.
+ *
+ * #284 gave audio and video their own input fields, but neither has a
+ * dedicated processor — both are meant to travel through the same
+ * auto-detecting `files` pipeline that already understands "audio"/"video"
+ * FileDetector results (see `appendDetectedFileResult`). The fold used to live
+ * inline in `buildMultimodalMessagesArray`, which meant any path that bypassed
+ * that builder never performed it and dropped the files silently: the model
+ * received the prompt alone and answered as though nothing were attached
+ * (#1259). GoogleVertex's native SDK path and `buildMultimodalOptions`
+ * (Bedrock) are both such paths, so the fold has to be callable from them.
+ *
+ * The aliases are cleared once merged, which makes the call idempotent: a
+ * provider override and the shared builder can both call this on the same
+ * options object without attaching every file twice.
+ *
+ * Mutates in place, matching `processUnifiedFilesArray` below — downstream
+ * stages all read `options.input.files`.
+ */
+export function mergeMediaFileAliases<TFile>(input: {
+  // Generic in the `files` element type: callers' arrays also admit
+  // FileWithMetadata, and narrowing to Buffer | string here would force an
+  // assertion at every call site rather than fixing the type.
+  files?: Array<TFile | Buffer | string>;
+  audioFiles?: Array<Buffer | string>;
+  videoFiles?: Array<Buffer | string>;
+}): void {
+  if (!input.audioFiles?.length && !input.videoFiles?.length) {
+    return;
+  }
+  input.files = [
+    ...(input.files ?? []),
+    ...(input.audioFiles ?? []),
+    ...(input.videoFiles ?? []),
+  ];
+  input.audioFiles = undefined;
+  input.videoFiles = undefined;
+}
+
+/**
  * Process the unified files array with auto-detection.
  * Handles lazy file registration, full processing, and preview injection.
+ *
+ * Exported so providers that bypass BaseProvider.generate() (e.g.
+ * GoogleVertex's native @google/genai path) can still preprocess
+ * `input.files` — without this, mimetype-hint and text-file inputs
+ * would silently never reach the model on those paths.
  */
-async function processUnifiedFilesArray(
+export async function processUnifiedFilesArray(
   options: GenerateOptions,
   maxSize: number,
   provider: string,
 ): Promise<void> {
+  options.input ??= {};
   if (!options.input.files || options.input.files.length === 0) {
     return;
   }
 
-  logger.info(
-    `[FileDetector] Processing ${options.input.files.length} file(s) with auto-detection`,
-  );
+  const totalFiles = options.input.files.length;
+  const files = options.input.files;
 
-  options.input.text = options.input.text || "";
+  return withSpan(
+    {
+      name: "neurolink.file.process_all",
+      tracer: tracers.file,
+      attributes: {
+        [ATTR.FILE_TOTAL_COUNT]: totalFiles,
+        [ATTR.NL_PROVIDER]: provider,
+      },
+    },
+    async (span) => {
+      logger.info(
+        `[NEUROLINK] Processing ${totalFiles} file(s) with auto-detection`,
+      );
 
-  const fileRegistry = options.fileRegistry as
-    | FileReferenceRegistry
-    | undefined;
+      // `options.input` was guaranteed non-null by the `??= {}` guard at the
+      // top of processUnifiedFilesArray; re-assert here so TypeScript is happy
+      // inside this withSpan closure (it doesn't track mutations across closures).
+      options.input ??= {};
+      const inp2 = options.input;
+      inp2.text = inp2.text || "";
+      let includedCount = 0;
 
-  for (let fileIdx = 0; fileIdx < options.input.files.length; fileIdx++) {
-    const file = options.input.files[fileIdx];
-    try {
-      // ─── Lazy file registration path ──────────────────────────────
-      const fileSize = fileRegistry ? getFileSize(file) : 0;
-      if (fileRegistry && fileSize > SIZE_TIER_THRESHOLDS.TINY_MAX) {
-        const registered = await tryRegisterFileReference(
-          file,
-          fileSize,
-          fileRegistry,
-          fileIdx,
-        );
-        if (registered) {
-          continue;
+      const fileRegistry = options.fileRegistry as
+        | FileReferenceRegistry
+        | undefined;
+
+      for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
+        const file = files[fileIdx];
+        const filename = extractFilename(file, fileIdx);
+        try {
+          // ─── Lazy file registration path ──────────────────────────────
+          const fileSize = fileRegistry ? getFileSize(file) : 0;
+          if (fileRegistry && fileSize > SIZE_TIER_THRESHOLDS.TINY_MAX) {
+            const registered = await tryRegisterFileReference(
+              file,
+              fileSize,
+              fileRegistry,
+              fileIdx,
+            );
+            if (registered) {
+              logger.info(
+                `[NEUROLINK] File lazily registered: ${filename} (${fileSize} bytes) — deferred processing`,
+              );
+              includedCount++;
+              continue;
+            }
+          }
+
+          // ─── Full processing path (current behavior) ──────────────────
+          const genericFileMaxSize = Math.max(maxSize, 100 * 1024 * 1024);
+          const rawFileInput = isFileWithMetadata(file) ? file.buffer : file;
+          // Forward the caller's mimetype hint (Slack/Curator-style
+          // extension-less buffers) so the eager path classifies correctly
+          // for tiny files — the lazy registry path has its own hint wiring.
+          const fileMimetypeHint = isFileWithMetadata(file)
+            ? file.mimetype
+            : undefined;
+          const result = await FileDetector.detectAndProcess(rawFileInput, {
+            maxSize: genericFileMaxSize,
+            allowedTypes: [
+              "csv",
+              "image",
+              "pdf",
+              "svg",
+              "video",
+              "audio",
+              "archive",
+              "xlsx",
+              "docx",
+              "pptx",
+              "text",
+              "unknown",
+            ],
+            csvOptions: options.csvOptions,
+            provider: provider,
+            mimetypeHint: fileMimetypeHint,
+          });
+
+          appendDetectedFileResult(result, file, options);
+          includedCount++;
+
+          // Log what content type was added to the message
+          const contentType = result.type === "image" ? "image" : "text";
+          logger.info(
+            `[NEUROLINK] File added to message: ${filename} as ${contentType} (type: ${result.type})`,
+          );
+        } catch (error) {
+          const errMsg = error instanceof Error ? error.message : String(error);
+          // #273: don't silently drop a failed file — log, then throw so the
+          // caller learns the file couldn't be processed (matches the explicit
+          // pdf/csv paths' fail-loud behavior).
+          logger.error(
+            `[NEUROLINK] File processing failed: ${filename} — reason: ${errMsg}`,
+          );
+          throw ErrorFactory.fileProcessingFailed(
+            filename,
+            error instanceof Error ? error : new Error(errMsg),
+          );
         }
       }
 
-      // ─── Full processing path (current behavior) ──────────────────
-      const genericFileMaxSize = Math.max(maxSize, 100 * 1024 * 1024);
-      const rawFileInput = isFileWithMetadata(file) ? file.buffer : file;
-      const result = await FileDetector.detectAndProcess(rawFileInput, {
-        maxSize: genericFileMaxSize,
-        allowedTypes: [
-          "csv",
-          "image",
-          "pdf",
-          "svg",
-          "video",
-          "audio",
-          "archive",
-          "xlsx",
-          "docx",
-          "pptx",
-          "text",
-          "unknown",
-        ],
-        csvOptions: options.csvOptions,
-        provider: provider,
-      });
+      span.setAttribute(ATTR.FILE_INCLUDED_COUNT, includedCount);
 
-      appendDetectedFileResult(result, file, options);
-    } catch (error) {
-      logger.error(`[FileDetector] ❌ Failed to process file:`, error);
-    }
-  }
-
-  // After processing all files, inject previews for any lazily-registered files
-  if (fileRegistry && fileRegistry.size > 0) {
-    const previewText = await fileRegistry.generatePromptPreview();
-    if (previewText) {
-      options.input.text = (options.input.text || "") + previewText;
-      logger.info(
-        `[FileDetector] Injected previews for ${fileRegistry.size} lazily-registered file(s)`,
-      );
-    }
-    const registeredFiles = fileRegistry.list();
-    for (const ref of registeredFiles) {
-      if (ref.extractedImages && ref.extractedImages.length > 0) {
-        options.input.images = [
-          ...(options.input.images || []),
-          ...ref.extractedImages,
-        ];
-        logger.info(
-          `[FileDetector] Injected ${ref.extractedImages.length} extracted images from "${ref.filename}"`,
-        );
+      // After processing all files, inject previews for any lazily-registered files
+      if (fileRegistry && fileRegistry.size > 0) {
+        const previewText = await fileRegistry.generatePromptPreview();
+        if (previewText) {
+          inp2.text = (inp2.text || "") + previewText;
+          logger.info(
+            `[FileDetector] Injected previews for ${fileRegistry.size} lazily-registered file(s)`,
+          );
+        }
+        const registeredFiles = fileRegistry.list();
+        for (const ref of registeredFiles) {
+          if (ref.extractedImages && ref.extractedImages.length > 0) {
+            inp2.images = [...(inp2.images || []), ...ref.extractedImages];
+            logger.info(
+              `[FileDetector] Injected ${ref.extractedImages.length} extracted images from "${ref.filename}"`,
+            );
+          }
+        }
       }
-    }
-  }
+
+      logger.info(
+        `[NEUROLINK] File processing complete: ${includedCount}/${totalFiles} files included in message`,
+      );
+
+      // Augment options.systemPrompt with file-handling guidance so providers
+      // that bypass the message-builder's system message and read
+      // `options.systemPrompt` directly (e.g. GoogleVertex's native @google/genai
+      // path uses `config.systemInstruction = options.systemPrompt`) still see
+      // the "treat inlined CSV/PDF as the actual file" guidance. Without this,
+      // Vertex Gemini 2.5 reliably responds with "no files attached" even
+      // though the CSV content is fully embedded in the user prompt.
+      if (includedCount > 0) {
+        const filePromptAugmentation = `\n\nIMPORTANT FILE HANDLING INSTRUCTIONS:
+- The full content of the user's local file(s) is INLINED in this message under "## CSV Data from ..." / "## PDF Data from ..." / "## File: ..." headings — it is the actual file the user is asking about.
+- TREAT THE INLINED CONTENT AS IF IT WERE AN ATTACHMENT. Do NOT respond with "no files attached" or ask the user to re-upload — the data is already here.
+- DO NOT use GitHub tools (get_file_contents, search_code, etc.) for local files - they only work for remote repository files.
+- Analyze the inlined file content directly without attempting to fetch or read files using tools.`;
+        const existingSystem = (options.systemPrompt || "").trim();
+        options.systemPrompt = existingSystem
+          ? `${existingSystem}${filePromptAugmentation}`
+          : filePromptAugmentation.trim();
+      }
+    },
+  );
 }
 
 /**
@@ -1082,6 +1189,7 @@ async function processUnifiedFilesArray(
 async function processExplicitCsvFiles(
   options: GenerateOptions,
 ): Promise<void> {
+  options.input ??= {};
   if (!options.input.csvFiles || options.input.csvFiles.length === 0) {
     return;
   }
@@ -1112,15 +1220,23 @@ async function processExplicitCsvFiles(
         }
       }
 
-      csvSection += buildCSVToolInstructions(filePath);
+      // Put the actual CSV content BEFORE the tool instructions —
+      // buildCSVToolInstructions references "the CSV data shown above"
+      // and the trailing position keeps that reference accurate.
       csvSection += result.content;
+      csvSection += buildCSVToolInstructions(filePath);
       options.input.text += csvSection;
       logger.info(`[CSV] ✅ Processed: ${filename}`);
     } catch (error) {
-      logger.error(`[CSV] ❌ Failed:`, error);
       const filename = extractFilename(csvFile, i);
-      options.input.text += `\n\n## CSV Data Error: Failed to process "${filename}"`;
-      options.input.text += `\nReason: ${error instanceof Error ? error.message : "Unknown error"}`;
+      const errMsg = error instanceof Error ? error.message : String(error);
+      // #273: fail loud instead of embedding the error into the prompt text
+      // (which the model would then "analyze"). Log, then throw.
+      logger.error(`[CSV] ❌ Failed to process ${filename}: ${errMsg}`);
+      throw ErrorFactory.csvProcessingFailed(
+        filename,
+        error instanceof Error ? error : new Error(errMsg),
+      );
     }
   }
 }
@@ -1133,6 +1249,7 @@ function enforcePostProcessingBudget(
   provider: string,
   model: string,
 ): void {
+  options.input ??= {};
   if (!options.input.text) {
     return;
   }
@@ -1187,12 +1304,21 @@ async function processExplicitPdfFiles(
   maxSize: number,
   provider: string,
 ): Promise<
-  Array<{ buffer: Buffer; filename: string; pageCount?: number | null }>
+  Array<{
+    buffer: Buffer;
+    filename: string;
+    pageCount?: number | null;
+    password?: string;
+    maxCanvasPixels?: number;
+  }>
 > {
+  options.input ??= {};
   const pdfFiles: Array<{
     buffer: Buffer;
     filename: string;
     pageCount?: number | null;
+    password?: string;
+    maxCanvasPixels?: number;
   }> = [];
 
   if (!options.input.pdfFiles || options.input.pdfFiles.length === 0) {
@@ -1219,6 +1345,12 @@ async function processExplicitPdfFiles(
           buffer: result.content,
           filename,
           pageCount: result.metadata?.estimatedPages ?? null,
+          // #258: carry the password so the image-fallback conversion can
+          // decrypt an encrypted PDF for providers without native PDF support.
+          password: options.pdfOptions?.password,
+          // #260: carry the per-page canvas-pixel ceiling so the caller can
+          // raise (or lower) the memory guard for the image-fallback render.
+          maxCanvasPixels: options.pdfOptions?.maxCanvasPixels,
         });
         logger.info(
           `[PDF] ✅ Queued for multimodal: ${filename} (${result.metadata?.estimatedPages ?? "unknown"} pages)`,
@@ -1227,6 +1359,51 @@ async function processExplicitPdfFiles(
     } catch (error) {
       logger.error(`[PDF] ❌ Failed to process ${filename}:`, error);
       throw error;
+    }
+  }
+
+  // #309: enforce the provider's page/size ceilings across ALL PDFs, not just
+  // per-file. N files each just under the single-file limit can still blow past
+  // it in aggregate (e.g. three 40-page PDFs → 120 pages for a 100-page API).
+  const aggregateConfig = PDFProcessor.getProviderConfig(provider);
+  if (aggregateConfig && pdfFiles.length > 1) {
+    // A null pageCount (accurate count unavailable — see
+    // PDFProcessor.getAccuratePageCount) is treated as 0 in the sum below,
+    // which can undercount the aggregate and let a combined request over
+    // the provider's page limit slip through silently. Enforcement still
+    // runs against the known sum — a PDF with an unknown count must not
+    // fail the request outright — but the gap itself must not be silent.
+    const unknownPageCountFiles = pdfFiles.filter(
+      (f) => f.pageCount === null || f.pageCount === undefined,
+    );
+    const totalPages = pdfFiles.reduce((sum, f) => sum + (f.pageCount ?? 0), 0);
+    const totalMB =
+      pdfFiles.reduce((sum, f) => sum + f.buffer.length, 0) / (1024 * 1024);
+    if (unknownPageCountFiles.length > 0) {
+      // Filenames are caller-controlled and may be full paths carrying
+      // PII/internal directory segments — log only the basename.
+      const unknownFileNames = unknownPageCountFiles
+        .map((f) => (f.filename ? basename(f.filename) : "<unnamed file>"))
+        .join(", ");
+      logger.warn(
+        `[PDF] Aggregate page-limit check across ${pdfFiles.length} PDFs could only be ` +
+          `partially verified: ${unknownPageCountFiles.length} file(s) have an unknown ` +
+          `page count (${unknownFileNames}), so the known total (${totalPages}) may ` +
+          `undercount the true combined page count.`,
+      );
+    }
+    if (totalPages > aggregateConfig.maxPages) {
+      throw new Error(
+        `[PDF] Combined page count across ${pdfFiles.length} PDFs (${totalPages}) exceeds the ` +
+          `${aggregateConfig.maxPages}-page limit for ${provider}. ` +
+          `Split the request or reduce the number of PDFs.`,
+      );
+    }
+    if (totalMB > aggregateConfig.maxSizeMB) {
+      throw new Error(
+        `[PDF] Combined size across ${pdfFiles.length} PDFs (${totalMB.toFixed(2)}MB) exceeds the ` +
+          `${aggregateConfig.maxSizeMB}MB limit for ${provider}.`,
+      );
     }
   }
 
@@ -1241,6 +1418,7 @@ function buildMultimodalSystemPrompt(
   options: GenerateOptions,
   hasPDFFiles: boolean,
 ): string {
+  options.input ??= {};
   let systemPrompt = options.systemPrompt?.trim() || "";
 
   const hasConversationHistory =
@@ -1253,10 +1431,11 @@ function buildMultimodalSystemPrompt(
     systemPrompt = `${systemPrompt.trim()}${STRUCTURED_OUTPUT_INSTRUCTIONS}`;
   }
 
+  const inp = options.input;
   const hasCSVFiles =
-    (options.input.csvFiles && options.input.csvFiles.length > 0) ||
-    (options.input.files &&
-      options.input.files.some((f) =>
+    (inp.csvFiles && inp.csvFiles.length > 0) ||
+    (inp.files &&
+      inp.files.some((f) =>
         typeof f === "string" ? f.toLowerCase().endsWith(".csv") : false,
       ));
 
@@ -1270,7 +1449,8 @@ function buildMultimodalSystemPrompt(
     }
 
     systemPrompt += `\n\nIMPORTANT FILE HANDLING INSTRUCTIONS:
-- File content (${fileTypes.join(", ")}, images) is already processed and included in this message
+- The full content of the user's local ${fileTypes.join(", ")} (and any images) is INLINED in this message under the "## CSV Data from ..." / "## PDF Data from ..." headings — it is the actual file the user is asking about.
+- TREAT THE INLINED CONTENT AS IF IT WERE AN ATTACHMENT. Do NOT respond with "no files attached" or ask the user to re-upload — the data is already here.
 - DO NOT use GitHub tools (get_file_contents, search_code, etc.) for local files - they only work for remote repository files
 - Analyze the provided file content directly without attempting to fetch or read files using tools
 - GitHub MCP tools are ONLY for remote repository operations, not local filesystem access
@@ -1289,6 +1469,19 @@ export async function buildMultimodalMessagesArray(
   provider: string,
   model: string,
 ): Promise<MultimodalChatMessage[]> {
+  // Media-only callers (avatar / music / video) may omit `input` entirely.
+  // Normalise to an empty object so all sub-functions can access input.*
+  // without defensive null checks on every field access.
+  if (!options.input) {
+    options.input = {};
+  }
+  // After normalisation `input` is guaranteed non-undefined. Capture it in a
+  // local const so TypeScript sees the definite (non-optional) type in the
+  // rest of this function, avoiding 60+ "possibly undefined" errors.
+  const inp = options.input;
+
+  mergeMediaFileAliases(inp);
+
   // Compute provider-specific max PDF size once for consistent validation
   const pdfConfig = PDFProcessor.getProviderConfig(provider);
   const maxSize = pdfConfig
@@ -1312,22 +1505,35 @@ export async function buildMultimodalMessagesArray(
 
   // Check if this is a multimodal request
   const hasImages =
-    (options.input.images && options.input.images.length > 0) ||
-    (options.input.content &&
-      options.input.content.some((c) => c.type === "image"));
+    (inp.images && inp.images.length > 0) ||
+    (inp.content && inp.content.some((c) => c.type === "image"));
 
-  const hasPDFs = pdfFiles.length > 0;
+  // A PDF supplied only via input.content (type: "pdf", no explicit
+  // input.pdfFiles and no image alongside it) must still route through the
+  // multimodal path below — otherwise it silently falls through to the
+  // text-only branch and the PDF (and any pdfOptions) never reaches
+  // convertContentToProviderFormat at all.
+  const hasPDFs =
+    pdfFiles.length > 0 ||
+    !!(inp.content && inp.content.some((c) => c.type === "pdf"));
 
   // If no images or PDFs, use standard message building and convert to MultimodalChatMessage[]
   if (!hasImages && !hasPDFs) {
-    if (options.input.csvFiles) {
-      options.input.csvFiles = [];
+    // #289: CSV content[] items don't need vision, so they never reach the
+    // multimodal converter below — process them into the prompt text here
+    // (otherwise a `content: [{type:"csv"}]`-only request silently drops it).
+    const csvContentItems = inp.content?.filter(isCSVContent) ?? [];
+    if (csvContentItems.length > 0) {
+      inp.text = await appendCsvContentToText(csvContentItems, inp.text ?? "");
     }
-    if (options.input.pdfFiles) {
-      options.input.pdfFiles = [];
+    if (inp.csvFiles) {
+      inp.csvFiles = [];
     }
-    if (options.input.files) {
-      options.input.files = [];
+    if (inp.pdfFiles) {
+      inp.pdfFiles = [];
+    }
+    if (inp.files) {
+      inp.files = [];
     }
 
     const standardMessages = await buildMessagesArray(
@@ -1354,11 +1560,11 @@ export async function buildMultimodalMessagesArray(
 
   const messages: MultimodalChatMessage[] = [];
 
-  // Build enhanced system prompt
-  const systemPrompt = buildMultimodalSystemPrompt(
-    options,
-    pdfFiles.length > 0,
-  );
+  // Build enhanced system prompt. Gate on the same `hasPDFs` predicate used
+  // for routing above — a PDF supplied only via input.content (no explicit
+  // input.pdfFiles) must still get the "treat inlined content as an
+  // attachment" instruction, or the model can claim no files were attached.
+  const systemPrompt = buildMultimodalSystemPrompt(options, hasPDFs);
 
   if (systemPrompt.trim()) {
     messages.push({
@@ -1374,37 +1580,89 @@ export async function buildMultimodalMessagesArray(
   const hasConversationHistory =
     options.conversationHistory && options.conversationHistory.length > 0;
   if (hasConversationHistory && options.conversationHistory) {
-    options.conversationHistory.forEach((msg) => {
-      messages.push({
-        role: msg.role as "user" | "assistant" | "system",
-        content: msg.content,
-      });
-    });
+    for (const msg of options.conversationHistory) {
+      // Filter out tool_call and tool_result roles — only user/assistant/system are valid for AI providers
+      if (
+        msg.role === "user" ||
+        msg.role === "assistant" ||
+        msg.role === "system"
+      ) {
+        const providerOptions = (
+          msg as { providerOptions?: Record<string, unknown> }
+        ).providerOptions;
+
+        // Sanitize assistant array content: strip tool_use/tool_result blocks
+        // that providers cannot handle. If an assistant message ends up empty
+        // after stripping, skip it to avoid sending content: "" to Claude.
+        // Only assistant messages need this — user messages may contain valid
+        // image/file blocks that must pass through unchanged.
+        let sanitizedContent: unknown = msg.content;
+        if (msg.role === "assistant" && Array.isArray(msg.content)) {
+          const textParts = (msg.content as unknown[]).filter(
+            (item: unknown) =>
+              !!item &&
+              typeof item === "object" &&
+              (item as Record<string, unknown>).type === "text" &&
+              typeof (item as Record<string, unknown>).text === "string",
+          );
+          if (textParts.length === 0) {
+            // All content was tool_use/tool_result/non-text — skip message
+            continue;
+          }
+          // Check if any retained text part carries providerOptions
+          // (e.g. Anthropic cache_control). If so, preserve them as
+          // array content to avoid losing per-block metadata.
+          const hasItemProviderOptions = textParts.some(
+            (item: unknown) =>
+              !!(item as Record<string, unknown>).providerOptions,
+          );
+          if (hasItemProviderOptions) {
+            sanitizedContent = textParts;
+          } else {
+            sanitizedContent =
+              textParts.length === 1
+                ? (textParts[0] as { text: string }).text
+                : textParts
+                    .map((p: unknown) => (p as { text: string }).text)
+                    .join(" ");
+          }
+        }
+
+        // Skip empty string content to avoid Claude API rejection
+        if (sanitizedContent === "") {
+          continue;
+        }
+
+        messages.push({
+          role: msg.role,
+          content: sanitizedContent as typeof msg.content,
+          ...(providerOptions && { providerOptions }),
+        });
+      }
+    }
   }
 
   // Handle multimodal content
   try {
     let userContent: string | unknown;
 
-    if (options.input.content && options.input.content.length > 0) {
+    if (inp.content && inp.content.length > 0) {
       userContent = await convertContentToProviderFormat(
-        options.input.content,
+        inp.content,
         provider,
         model,
+        options.pdfOptions,
       );
-    } else if (
-      (options.input.images && options.input.images.length > 0) ||
-      pdfFiles.length > 0
-    ) {
+    } else if ((inp.images && inp.images.length > 0) || pdfFiles.length > 0) {
       userContent = await convertMultimodalToProviderFormat(
-        options.input.text,
-        options.input.images || [],
+        inp.text ?? "",
+        inp.images || [],
         pdfFiles,
         provider,
         model,
       );
     } else {
-      userContent = options.input.text;
+      userContent = inp.text;
     }
 
     if (typeof userContent === "string") {
@@ -1428,10 +1686,63 @@ export async function buildMultimodalMessagesArray(
       provider,
       model,
       hasImages,
-      imageCount: options.input.images?.length || 0,
+      imageCount: inp.images?.length || 0,
     });
     throw error;
   }
+}
+
+/**
+ * Timeout for detecting/parsing an in-memory CSV `content[]` buffer (#325
+ * review, round 2). Bounds a stalled detector rather than blocking the
+ * request indefinitely.
+ */
+const CSV_CONTENT_DETECTION_TIMEOUT_MS = 30_000;
+
+/**
+ * #289: process CSV `content[]` items into appended prompt text. CSV is
+ * delivered to the model as text (like the explicit `csvFiles` path), so this
+ * is shared by both the no-vision gate and the multimodal converter.
+ */
+async function appendCsvContentToText(
+  csvItems: CSVContent[],
+  baseText: string,
+): Promise<string> {
+  let text = baseText;
+  for (const csv of csvItems) {
+    const raw = csv.data;
+    if (raw === undefined) {
+      continue;
+    }
+    // #325: raw CSV text (e.g. "a,b\n1,2") is not base64 — decoding it as
+    // base64 silently corrupts the content. Only treat the string as base64
+    // when it actually validates as such; otherwise treat it as literal
+    // UTF-8 CSV text, matching how Buffer inputs are already handled as-is.
+    const buffer =
+      typeof raw === "string"
+        ? imageUtils.isValidBase64(raw)
+          ? Buffer.from(raw, "base64")
+          : Buffer.from(raw, "utf-8")
+        : raw;
+    const name = csv.metadata?.filename || "data.csv";
+    // #325 review (round 2): a stalled/hung detector must not block the
+    // request indefinitely — wrap with the project's standard withTimeout.
+    const result = await withTimeout(
+      FileDetector.detectAndProcess(buffer, {
+        allowedTypes: ["csv"],
+        csvOptions: {
+          maxRows: csv.metadata?.maxRows,
+          formatStyle: csv.metadata?.formatStyle,
+        },
+      }),
+      CSV_CONTENT_DETECTION_TIMEOUT_MS,
+      new Error(
+        `Timed out processing CSV content "${name}" after ${CSV_CONTENT_DETECTION_TIMEOUT_MS}ms`,
+      ),
+    );
+    text += `${text ? "\n\n" : ""}## CSV Data from ${name}\n${result.content}`;
+  }
+  return text;
 }
 
 /**
@@ -1441,26 +1752,53 @@ async function convertContentToProviderFormat(
   content: Content[],
   provider: string,
   _model: string,
+  pdfOptions?: GenerateOptions["pdfOptions"],
 ): Promise<unknown> {
   const textContent = content.find((c) => c.type === "text");
   const imageContent = content.filter((c) => c.type === "image");
+  const pdfContent = content.filter((c) => c.type === "pdf");
+  const csvContent = content.filter(isCSVContent);
 
-  if (!textContent) {
-    throw new Error(
-      "Multimodal content must include at least one text element",
-    );
+  // Allow empty text when multimodal content is present (enables image-only or PDF-only queries)
+  let text = textContent?.text || "";
+
+  // #289: CSV content[] items were silently dropped — fold each into the text.
+  if (csvContent.length > 0) {
+    text = await appendCsvContentToText(csvContent, text);
   }
 
-  if (imageContent.length === 0) {
-    return textContent.text;
+  const hasMultimodal = imageContent.length > 0 || pdfContent.length > 0;
+
+  // Validate that we have at least some content
+  if (!hasMultimodal && !text) {
+    throw new Error("Content must include either text or multimodal content");
+  }
+
+  // Text-only case (CSV has already been folded into `text`)
+  if (imageContent.length === 0 && pdfContent.length === 0) {
+    return text;
   }
 
   // Extract images as Buffer | string array
   const images = imageContent.map((img) => img.data);
 
-  return await convertSimpleImagesToProviderFormat(
-    textContent.text,
+  // Extract PDFs in the expected format
+  const pdfFiles = pdfContent.map((pdf) => ({
+    buffer:
+      typeof pdf.data === "string" ? Buffer.from(pdf.data, "base64") : pdf.data,
+    filename: pdf.metadata?.filename || "document.pdf",
+    pageCount: pdf.metadata?.pages ?? null,
+    // #258/#260: carry password + canvas-pixel ceiling so a PDF supplied via
+    // the advanced `input.content` array gets the same decryption/memory
+    // guard as the `input.pdfFiles` path (see `processExplicitPdfFiles`).
+    password: pdfOptions?.password,
+    maxCanvasPixels: pdfOptions?.maxCanvasPixels,
+  }));
+
+  return await convertMultimodalToProviderFormat(
+    text,
     images,
+    pdfFiles,
     provider,
     _model,
   );
@@ -1470,7 +1808,10 @@ async function convertContentToProviderFormat(
  * Check if a string is an internet URL
  */
 function isInternetUrl(input: string): boolean {
-  return input.startsWith("http://") || input.startsWith("https://");
+  // Scheme is case-insensitive (RFC 3986) — "HTTPS://..." must still be a URL,
+  // not fall through to the file-path branch and produce a confusing error.
+  const lower = input.toLowerCase();
+  return lower.startsWith("http://") || lower.startsWith("https://");
 }
 
 /**
@@ -1517,20 +1858,23 @@ async function downloadImageFromUrl(url: string): Promise<string> {
       );
     }
 
-    // Read the response body
+    // Read the response body, enforcing the size cap INCREMENTALLY: a
+    // misbehaving/malicious server on a user-supplied URL must not be able to
+    // force unbounded memory growth by streaming gigabytes before we ever
+    // check the total (the previous code concat'd everything first).
+    const maxSize = 10 * 1024 * 1024; // 10MB
     const chunks: Buffer[] = [];
+    let totalSize = 0;
     for await (const chunk of response.body) {
+      totalSize += chunk.length;
+      if (totalSize > maxSize) {
+        throw new Error(
+          `Image too large: exceeds ${maxSize} bytes while downloading from ${url}`,
+        );
+      }
       chunks.push(chunk);
     }
     const buffer = Buffer.concat(chunks);
-
-    // Check file size (limit to 10MB)
-    const maxSize = 10 * 1024 * 1024; // 10MB
-    if (buffer.length > maxSize) {
-      throw new Error(
-        `Image too large: ${buffer.length} bytes (max: ${maxSize} bytes)`,
-      );
-    }
 
     // Convert to base64 data URI
     const base64 = buffer.toString("base64");
@@ -1544,8 +1888,231 @@ async function downloadImageFromUrl(url: string): Promise<string> {
     MultimodalLogger.logError("URL_DOWNLOAD_FAILED", error as Error, { url });
     throw new Error(
       `Failed to download image from ${url}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
     );
   }
+}
+
+/**
+ * Get MIME type from file extension
+ */
+function getMimeTypeFromExtension(filePath: string): string {
+  const ext = filePath.toLowerCase().split(".").pop();
+  switch (ext) {
+    case "png":
+      return "image/png";
+    case "gif":
+      return "image/gif";
+    case "webp":
+      return "image/webp";
+    case "bmp":
+      return "image/bmp";
+    case "tiff":
+    case "tif":
+      return "image/tiff";
+    default:
+      return "image/jpeg";
+  }
+}
+
+/**
+ * Detect MIME type from buffer magic bytes
+ * Returns undefined if format cannot be detected
+ */
+function detectMimeTypeFromBuffer(buffer: Buffer): string | undefined {
+  // JPEG: FF D8 FF
+  if (
+    buffer.length >= 3 &&
+    buffer[0] === 0xff &&
+    buffer[1] === 0xd8 &&
+    buffer[2] === 0xff
+  ) {
+    return "image/jpeg";
+  }
+
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  if (
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47 &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+
+  // GIF: 47 49 46 38 (37|39) 61
+  if (
+    buffer.length >= 6 &&
+    buffer[0] === 0x47 &&
+    buffer[1] === 0x49 &&
+    buffer[2] === 0x46 &&
+    buffer[3] === 0x38 &&
+    (buffer[4] === 0x37 || buffer[4] === 0x39) &&
+    buffer[5] === 0x61
+  ) {
+    return "image/gif";
+  }
+
+  // WebP: 52 49 46 46 ?? ?? ?? ?? 57 45 42 50
+  if (
+    buffer.length >= 12 &&
+    buffer[0] === 0x52 &&
+    buffer[1] === 0x49 &&
+    buffer[2] === 0x46 &&
+    buffer[3] === 0x46 &&
+    buffer[8] === 0x57 &&
+    buffer[9] === 0x45 &&
+    buffer[10] === 0x42 &&
+    buffer[11] === 0x50
+  ) {
+    return "image/webp";
+  }
+
+  // BMP: 42 4D
+  if (buffer.length >= 2 && buffer[0] === 0x42 && buffer[1] === 0x4d) {
+    return "image/bmp";
+  }
+
+  // TIFF: (49 49 2A 00) or (4D 4D 00 2A)
+  if (
+    buffer.length >= 4 &&
+    ((buffer[0] === 0x49 &&
+      buffer[1] === 0x49 &&
+      buffer[2] === 0x2a &&
+      buffer[3] === 0x00) ||
+      (buffer[0] === 0x4d &&
+        buffer[1] === 0x4d &&
+        buffer[2] === 0x00 &&
+        buffer[3] === 0x2a))
+  ) {
+    return "image/tiff";
+  }
+
+  return undefined;
+}
+
+/**
+ * Convert file path to raw base64 string.
+ * Returns raw base64 (not a data: URI) to avoid SSRF validation in AI SDK v6.
+ * Uses async fs so a large/slow-filesystem image never blocks the event loop
+ * while the size guard (below) or the read itself is in flight.
+ */
+async function convertFilePathToBase64(filePath: string): Promise<string> {
+  let stats;
+  try {
+    stats = await statAsync(filePath);
+  } catch (error) {
+    // Only ENOENT means "not found" — EACCES/ELOOP/etc. are real access or
+    // filesystem problems that must not be misreported as a missing file.
+    const code =
+      error instanceof Error
+        ? (error as NodeJS.ErrnoException).code
+        : undefined;
+    if (code === "ENOENT") {
+      throw new Error(`Image file not found: ${filePath}`, { cause: error });
+    }
+    throw new Error(
+      `Cannot access image file ${filePath}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+  if (!stats.isFile()) {
+    throw new Error(`Image path is not a file: ${filePath}`);
+  }
+
+  // #257: check the file size via stat BEFORE reading it into memory, so a
+  // huge image path never triggers an unbounded read + base64 allocation.
+  // Delegates to ImageProcessor's shared guard (no local reimplementation).
+  const context = `image file "${filePath}"`;
+  ImageProcessor.validateSize(stats.size, context);
+  const buffer = await readFileAsync(filePath);
+  // TOCTOU: the file can grow, or a symlink can be swapped, between the stat
+  // above and this read completing. Re-validate the bytes actually read
+  // (not just the pre-read stat) before the base64 allocation.
+  return ImageProcessor.safeBase64Convert(buffer, context);
+}
+
+/**
+ * Process a single image input and convert to raw base64 format.
+ * IMPORTANT: Returns raw base64 (not a data: URI) to avoid SSRF validation
+ * in Vercel AI SDK v6. The SDK calls `new URL(image)` on string values;
+ * a data: URI is a valid URL, causing the SDK to "download" it and hit
+ * validateDownloadUrl which throws "URL scheme must be http or https, got data:".
+ * Passing raw base64 avoids this because `new URL(base64string)` throws and
+ * the SDK treats the string as inline base64 data instead.
+ */
+async function processImageToBase64(
+  image: Buffer | string,
+  index: number,
+): Promise<{ imageData: string; mimeType: string }> {
+  let imageData: string;
+  let mimeType = "image/jpeg"; // Default mime type
+
+  if (typeof image === "string") {
+    if (image.startsWith("data:")) {
+      // Data URI (including downloaded URLs) - extract mime type and raw base64
+      const match = image.match(/^data:([^;]+);base64,(.+)$/);
+      if (match) {
+        const declaredMime = match[1];
+        // #348: only accept image/* data URIs; reject a non-image MIME before
+        // it reaches a provider API rather than passing it through unchecked.
+        if (!declaredMime.startsWith("image/")) {
+          throw new Error(
+            `Unsupported data URI MIME type for image input at index ${index}: "${declaredMime}" (expected image/*)`,
+          );
+        }
+        mimeType = declaredMime;
+        imageData = match[2]; // Raw base64 only — NOT the full data: URI
+      } else {
+        // #270: a malformed data: URI must fail loudly, not silently pass the
+        // raw string through as if it were valid base64 (which corrupts the
+        // request and surfaces as an opaque provider error later).
+        throw new Error(
+          `Malformed image data URI at index ${index} (expected "data:<image/...>;base64,<data>")`,
+        );
+      }
+    } else if (isInternetUrl(image)) {
+      // This should not happen as URLs are processed separately
+      throw new Error(`Unprocessed URL found in actualImages: ${image}`);
+    } else {
+      // File path string - convert to raw base64
+      try {
+        imageData = await convertFilePathToBase64(image);
+        mimeType = getMimeTypeFromExtension(image);
+      } catch (error) {
+        MultimodalLogger.logError("FILE_PATH_CONVERSION", error as Error, {
+          index,
+          filePath: image,
+        });
+        // Preserve typed errors (e.g. IMAGE_TOO_LARGE) as-is — don't flatten
+        // them into a generic Error and lose the error `code` for callers.
+        if (error instanceof NeuroLinkError) {
+          throw error;
+        }
+        throw new Error(
+          `Failed to convert file path to base64: ${image}. ${error}`,
+          { cause: error },
+        );
+      }
+    }
+  } else {
+    // Buffer - convert to raw base64 with proper MIME type detection
+    const detectedMimeType = detectMimeTypeFromBuffer(image);
+    if (detectedMimeType) {
+      mimeType = detectedMimeType;
+    }
+    // #257: guard the buffer size before the unbounded base64 conversion.
+    // Delegates to ImageProcessor's shared guard (no local reimplementation).
+    ImageProcessor.validateBufferSize(image, `image input at index ${index}`);
+    imageData = image.toString("base64");
+  }
+
+  return { imageData, mimeType };
 }
 
 /**
@@ -1561,6 +2128,9 @@ async function convertSimpleImagesToProviderFormat(
   provider: string,
   _model: string,
 ): Promise<Array<TextPart | ImagePart>> {
+  // Validate image count against provider-specific limits before processing
+  ProviderImageAdapter.validateImageCount(images.length, provider, _model);
+
   // For Vercel AI SDK, we need to return the content in the standard format
   // The Vercel AI SDK will handle provider-specific formatting internally
 
@@ -1622,83 +2192,18 @@ async function convertSimpleImagesToProviderFormat(
     { type: "text", text: enhancedText },
   ];
 
-  // Process all images (including downloaded URLs) for Vercel AI SDK
-  actualImages.forEach(({ data: image }, index) => {
+  // Process all images (including downloaded URLs) for Vercel AI SDK.
+  // Sequential for...of (not Promise.all) to preserve image ordering and
+  // keep the original forEach's one-at-a-time error semantics.
+  for (const [index, { data: image }] of actualImages.entries()) {
     try {
-      // Vercel AI SDK expects { type: 'image', image: Buffer | string, mimeType?: string }
-      // For Vertex AI, we need to include mimeType
-      let imageData: string;
-      let mimeType = "image/jpeg"; // Default mime type
-
-      if (typeof image === "string") {
-        if (image.startsWith("data:")) {
-          // Data URI (including downloaded URLs) - extract mime type and use directly
-          const match = image.match(/^data:([^;]+);base64,(.+)$/);
-          if (match) {
-            mimeType = match[1];
-            imageData = image; // Keep as data URI for Vercel AI SDK
-          } else {
-            imageData = image;
-          }
-        } else if (isInternetUrl(image)) {
-          // This should not happen as URLs are processed separately above
-          // But handle it gracefully just in case
-          throw new Error(`Unprocessed URL found in actualImages: ${image}`);
-        } else {
-          // File path string - convert to base64 data URI
-          try {
-            if (existsSync(image)) {
-              const buffer = readFileSync(image);
-              const base64 = buffer.toString("base64");
-
-              // Detect mime type from file extension
-              const ext = image.toLowerCase().split(".").pop();
-              switch (ext) {
-                case "png":
-                  mimeType = "image/png";
-                  break;
-                case "gif":
-                  mimeType = "image/gif";
-                  break;
-                case "webp":
-                  mimeType = "image/webp";
-                  break;
-                case "bmp":
-                  mimeType = "image/bmp";
-                  break;
-                case "tiff":
-                case "tif":
-                  mimeType = "image/tiff";
-                  break;
-                default:
-                  mimeType = "image/jpeg";
-                  break;
-              }
-
-              imageData = `data:${mimeType};base64,${base64}`;
-            } else {
-              throw new Error(`Image file not found: ${image}`);
-            }
-          } catch (error) {
-            MultimodalLogger.logError("FILE_PATH_CONVERSION", error as Error, {
-              index,
-              filePath: image,
-            });
-            throw new Error(
-              `Failed to convert file path to base64: ${image}. ${error}`,
-            );
-          }
-        }
-      } else {
-        // Buffer - convert to base64 data URI
-        const base64 = image.toString("base64");
-        imageData = `data:${mimeType};base64,${base64}`;
-      }
+      // Use helper function to process image and reduce nesting depth
+      const { imageData, mimeType } = await processImageToBase64(image, index);
 
       content.push({
         type: "image" as const,
         image: imageData,
-        mimeType: mimeType, // Add mimeType for Vertex AI compatibility
+        mimeType: mimeType,
       } as ImagePart);
     } catch (error) {
       MultimodalLogger.logError("ADD_IMAGE_TO_CONTENT", error as Error, {
@@ -1707,7 +2212,7 @@ async function convertSimpleImagesToProviderFormat(
       });
       throw error;
     }
-  });
+  }
 
   return content;
 }
@@ -1722,6 +2227,8 @@ async function convertMultimodalToProviderFormat(
     buffer: Buffer;
     filename: string;
     pageCount?: number | null;
+    password?: string;
+    maxCanvasPixels?: number;
   }>,
   provider: string,
   model: string,
@@ -1760,7 +2267,7 @@ async function convertMultimodalToProviderFormat(
         return {
           type: "file" as const,
           data: pdf.buffer,
-          mimeType: "application/pdf",
+          mediaType: "application/pdf",
         };
       }),
     );
@@ -1778,6 +2285,10 @@ async function convertMultimodalToProviderFormat(
           {
             scale: 2.0, // High quality for OCR/analysis
             maxPages: 20, // Limit pages to prevent token overflow
+            ...(pdf.password ? { password: pdf.password } : {}), // #258
+            ...(pdf.maxCanvasPixels
+              ? { maxCanvasPixels: pdf.maxCanvasPixels }
+              : {}), // #260
           },
         );
 
@@ -1785,11 +2296,11 @@ async function convertMultimodalToProviderFormat(
           `[PDF→Image] ✅ Converted ${pdf.filename}: ${conversionResult.pageCount} page(s) → images`,
         );
 
-        // Add each page as an ImagePart
+        // Add each page as an ImagePart (raw base64, not data: URI — see SSRF note above)
         conversionResult.images.forEach((base64Image, pageIndex) => {
           content.push({
             type: "image" as const,
-            image: `data:image/png;base64,${base64Image}`,
+            image: base64Image,
             mimeType: "image/png",
           } as ImagePart);
 
@@ -1811,10 +2322,21 @@ async function convertMultimodalToProviderFormat(
           `[PDF→Image] ❌ Failed to convert ${pdf.filename}: ${errorMessage}`,
         );
 
+        // #258: password errors are already actionable typed errors — re-throw
+        // them unwrapped so the "supply a password" guidance isn't buried.
+        const code = (error as { code?: string })?.code;
+        if (
+          code === "PDF_PASSWORD_REQUIRED" ||
+          code === "PDF_INCORRECT_PASSWORD"
+        ) {
+          throw error;
+        }
+
         // Re-throw so the user knows PDF processing failed
         throw new Error(
           `PDF to image conversion failed for ${pdf.filename}: ${errorMessage}. ` +
             `Provider ${provider} doesn't support native PDFs and image conversion failed.`,
+          { cause: error },
         );
       }
     }
@@ -1823,13 +2345,10 @@ async function convertMultimodalToProviderFormat(
   return content;
 }
 
-/** Union type for file inputs: raw Buffer, path/URL string, or object with metadata */
-type AnyFileInput = Buffer | string | FileWithMetadata;
-
 /**
  * Type guard for FileWithMetadata objects.
  */
-function isFileWithMetadata(file: AnyFileInput): file is FileWithMetadata {
+function isFileWithMetadata(file: FileInput): file is FileWithMetadata {
   return (
     typeof file === "object" &&
     !Buffer.isBuffer(file) &&
@@ -1842,7 +2361,7 @@ function isFileWithMetadata(file: AnyFileInput): file is FileWithMetadata {
  * Extract filename from file input.
  * Supports Buffers (generic name), strings (path/URL), and FileWithMetadata objects.
  */
-function extractFilename(file: AnyFileInput, index: number = 0): string {
+function extractFilename(file: FileInput, index: number = 0): string {
   if (isFileWithMetadata(file)) {
     return file.filename;
   }
@@ -1869,7 +2388,7 @@ function extractFilename(file: AnyFileInput, index: number = 0): string {
  * For strings that are file paths: returns the stat size.
  * For URLs/data URIs: returns a rough estimate from string length.
  */
-function getFileSize(file: AnyFileInput): number {
+function getFileSize(file: FileInput): number {
   if (isFileWithMetadata(file)) {
     return file.buffer.length;
   }
@@ -1894,7 +2413,7 @@ function getFileSize(file: AnyFileInput): number {
  * For file paths: reads the file.
  * For URLs/data URIs: returns null (not supported for lazy registration).
  */
-async function getFileBuffer(file: AnyFileInput): Promise<Buffer | null> {
+async function getFileBuffer(file: FileInput): Promise<Buffer | null> {
   if (isFileWithMetadata(file)) {
     return file.buffer;
   }
@@ -1915,9 +2434,7 @@ async function getFileBuffer(file: AnyFileInput): Promise<Buffer | null> {
 /**
  * Determine the source type of a file input.
  */
-function getFileSource(
-  file: AnyFileInput,
-): "buffer" | "path" | "url" | "datauri" {
+function getFileSource(file: FileInput): "buffer" | "path" | "url" | "datauri" {
   if (isFileWithMetadata(file)) {
     return "buffer";
   }
@@ -1944,7 +2461,7 @@ function getFileSource(
  * fall through to full processing).
  */
 async function tryRegisterFileReference(
-  file: AnyFileInput,
+  file: FileInput,
   fileSize: number,
   registry: FileReferenceRegistry,
   index: number = 0,
@@ -1955,7 +2472,14 @@ async function tryRegisterFileReference(
       return false;
     }
     const filename = extractFilename(file, index);
-    await registry.register(buffer, getFileSource(file), { filename });
+    const mimetype =
+      typeof file === "object" && !Buffer.isBuffer(file)
+        ? file.mimetype
+        : undefined;
+    await registry.register(buffer, getFileSource(file), {
+      filename,
+      mimetype,
+    });
     logger.info(
       `[FileDetector] Registered "${filename}" (${(fileSize / 1024).toFixed(0)} KB) ` +
         `as lazy reference — skipping upfront processing`,

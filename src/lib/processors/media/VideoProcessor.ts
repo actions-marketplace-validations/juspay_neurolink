@@ -10,8 +10,9 @@
  * The extracted content is formatted as text + images that can be sent to any
  * AI provider for analysis.
  *
- * Uses fluent-ffmpeg for video processing and sharp for frame resizing.
- * Requires ffmpeg/ffprobe to be available (via ffmpeg-static or system PATH).
+ * Uses mediabunny (pure TypeScript) for metadata extraction, with fluent-ffmpeg
+ * as a fallback for unsupported formats. Requires ffmpeg for keyframe/subtitle
+ * extraction (via ffmpeg-static or system PATH).
  *
  * Key features:
  * - Adaptive keyframe extraction intervals based on video duration
@@ -43,11 +44,7 @@
  * ```
  */
 
-/// <reference path="./ffprobe-static.d.ts" />
-
 import { randomUUID } from "crypto";
-import type { FfprobeData, FfprobeStream } from "fluent-ffmpeg";
-import ffmpegCommand from "fluent-ffmpeg";
 import { createWriteStream, existsSync, promises as fs } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -55,14 +52,63 @@ import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 
 import { BaseFileProcessor } from "../base/BaseFileProcessor.js";
+import { formatMediaDuration } from "../../utils/mediaDuration.js";
 import type {
+  FfprobeData,
+  FfprobeStream,
   FileInfo,
-  FileProcessingResult,
-  ProcessedFileBase,
+  ProcessedVideo,
+  ProcessorFileProcessingResult,
   ProcessOptions,
-} from "../base/types.js";
+} from "../../types/index.js";
 import { SIZE_LIMITS_MB } from "../config/index.js";
 import { FileErrorCode } from "../errors/index.js";
+import { tracers, ATTR, withSpan } from "../../telemetry/index.js";
+import { logger } from "../../utils/logger.js";
+
+// fluent-ffmpeg's default export is callable + has static methods — avoid caching
+// the module type (it confuses TS); Node's module cache handles dedup.
+async function loadFluentFfmpeg() {
+  try {
+    const mod = await import(/* @vite-ignore */ "fluent-ffmpeg");
+    return mod.default;
+  } catch (err) {
+    const e = err instanceof Error ? (err as NodeJS.ErrnoException) : null;
+    if (
+      e?.code === "ERR_MODULE_NOT_FOUND" &&
+      e.message.includes("fluent-ffmpeg")
+    ) {
+      throw new Error(
+        'Video processing requires the "fluent-ffmpeg" package. Install it with:\n  pnpm add fluent-ffmpeg',
+        { cause: err },
+      );
+    }
+    throw err;
+  }
+}
+
+let _mediabunny: typeof import("mediabunny") | null = null;
+async function loadMediaBunny() {
+  if (_mediabunny) {
+    return _mediabunny;
+  }
+  try {
+    _mediabunny = await import(/* @vite-ignore */ "mediabunny");
+    return _mediabunny;
+  } catch (err) {
+    const e = err instanceof Error ? (err as NodeJS.ErrnoException) : null;
+    if (
+      e?.code === "ERR_MODULE_NOT_FOUND" &&
+      e.message.includes("mediabunny")
+    ) {
+      throw new Error(
+        'Video processing requires the "mediabunny" package. Install it with:\n  pnpm add mediabunny',
+        { cause: err },
+      );
+    }
+    throw err;
+  }
+}
 
 // =============================================================================
 // FFMPEG PATH INITIALIZATION
@@ -75,8 +121,12 @@ import { FileErrorCode } from "../errors/index.js";
 let ffmpegPathInitialized = false;
 
 /**
- * Initialize ffmpeg and ffprobe binary paths.
- * Tries ffmpeg-static/ffprobe-static first, falls back to system binaries in PATH.
+ * Initialize ffmpeg binary paths.
+ * Tries ffmpeg-static first, falls back to system binary in PATH.
+ *
+ * Note: ffprobe-static has been removed. Metadata probing now uses mediabunny
+ * (pure TypeScript) as the primary method, with ffprobe as a fallback only when
+ * mediabunny cannot handle the format (e.g., AVI, FLV).
  *
  * This is called lazily on the first processFile() invocation so that the module
  * can be imported without side effects.
@@ -97,90 +147,17 @@ async function initFfmpegPaths(): Promise<void> {
     const ffmpegStatic = await import("ffmpeg-static");
     const ffmpegPath: unknown = ffmpegStatic.default;
     if (typeof ffmpegPath === "string" && existsSync(ffmpegPath)) {
-      ffmpegCommand.setFfmpegPath(ffmpegPath);
+      const ff = await loadFluentFfmpeg();
+      ff.setFfmpegPath(ffmpegPath);
     }
   } catch {
     // Use system ffmpeg (already in PATH)
-  }
-
-  // Try ffprobe-static first, fall back to system ffprobe
-  try {
-    const ffprobeStatic: Record<string, unknown> = (await import(
-      "ffprobe-static"
-    )) as Record<string, unknown>;
-    // Direct path property (CommonJS default)
-    if (
-      typeof ffprobeStatic["path"] === "string" &&
-      existsSync(ffprobeStatic["path"] as string)
-    ) {
-      ffmpegCommand.setFfprobePath(ffprobeStatic["path"] as string);
-    } else if (
-      ffprobeStatic["default"] &&
-      typeof ffprobeStatic["default"] === "object" &&
-      typeof (ffprobeStatic["default"] as Record<string, unknown>)["path"] ===
-        "string"
-    ) {
-      const probePath = (ffprobeStatic["default"] as Record<string, string>)[
-        "path"
-      ];
-      if (existsSync(probePath)) {
-        ffmpegCommand.setFfprobePath(probePath);
-      }
-    }
-  } catch {
-    // Use system ffprobe (already in PATH)
   }
 }
 
 // =============================================================================
 // TYPES
 // =============================================================================
-
-/**
- * Processed video result.
- * Extends ProcessedFileBase with video-specific fields including metadata,
- * extracted keyframes, subtitle text, and a pre-formatted textContent block
- * suitable for sending to an LLM.
- */
-export type ProcessedVideo = ProcessedFileBase & {
-  /** Pre-formatted text description for the LLM (metadata + subtitles summary) */
-  textContent: string;
-  /** Extracted keyframes as JPEG buffers (resized to max 768px dimension) */
-  keyframes: Buffer[];
-  /** Video metadata extracted via ffprobe */
-  metadata: {
-    /** Duration in seconds */
-    duration: number;
-    /** Human-readable duration (e.g., "2m 30s") */
-    durationFormatted: string;
-    /** Video width in pixels */
-    width: number;
-    /** Video height in pixels */
-    height: number;
-    /** Video codec name (e.g., "h264", "vp9") */
-    codec: string;
-    /** Frames per second */
-    fps: number;
-    /** Video bitrate in bits/second */
-    bitrate: number;
-    /** Audio codec name if present */
-    audioCodec?: string;
-    /** Number of audio channels */
-    audioChannels?: number;
-    /** Audio sample rate in Hz */
-    audioSampleRate?: number;
-    /** Number of subtitle tracks found */
-    subtitleTracks: number;
-    /** Original file size in bytes */
-    fileSize: number;
-  };
-  /** Extracted subtitle text (combined from all subtitle tracks) */
-  subtitleText?: string;
-  /** Whether any keyframes were successfully extracted */
-  hasKeyframes: boolean;
-  /** Number of keyframes extracted */
-  frameCount: number;
-};
 
 // =============================================================================
 // CONSTANTS
@@ -331,7 +308,7 @@ export class VideoProcessor extends BaseFileProcessor<ProcessedVideo> {
       keyframes: [],
       metadata: {
         duration: 0,
-        durationFormatted: "0s",
+        durationFormatted: formatMediaDuration(0),
         width: 0,
         height: 0,
         codec: "unknown",
@@ -369,155 +346,253 @@ export class VideoProcessor extends BaseFileProcessor<ProcessedVideo> {
   override async processFile(
     fileInfo: FileInfo,
     options?: ProcessOptions,
-  ): Promise<FileProcessingResult<ProcessedVideo>> {
-    // Ensure ffmpeg paths are initialized before any processing
-    await initFfmpegPaths();
+  ): Promise<ProcessorFileProcessingResult<ProcessedVideo>> {
+    const filename = this.getFilename(fileInfo);
+    const sizeBytes = fileInfo.size || fileInfo.buffer?.length || 0;
 
-    // Temp directory for this processing run
-    const tempDir = join(tmpdir(), `neurolink-video-${randomUUID()}`);
-    let tempCreated = false;
-
-    try {
-      // Step 1: Validate file type and size
-      const validationResult = this.validateFileWithResult(fileInfo);
-      if (!validationResult.success) {
-        return { success: false, error: validationResult.error };
-      }
-
-      // Step 2: Get file buffer
-      let buffer: Buffer;
-
-      if (fileInfo.buffer) {
-        buffer = fileInfo.buffer;
-      } else if (fileInfo.url) {
-        const downloadResult = await this.downloadFileWithRetry(
-          fileInfo,
-          options,
-        );
-        if (!downloadResult.success) {
-          return { success: false, error: downloadResult.error };
-        }
-        if (!downloadResult.data) {
-          return {
-            success: false,
-            error: this.createError(FileErrorCode.DOWNLOAD_FAILED, {
-              reason: "Download succeeded but returned no data",
-            }),
-          };
-        }
-        buffer = downloadResult.data;
-
-        // Validate actual downloaded size
-        if (!this.validateFileSize(buffer.length)) {
-          return {
-            success: false,
-            error: this.createError(FileErrorCode.FILE_TOO_LARGE, {
-              sizeMB: (buffer.length / (1024 * 1024)).toFixed(2),
-              maxMB: this.config.maxSizeMB,
-              type: this.config.fileTypeName,
-            }),
-          };
-        }
-      } else {
-        return {
-          success: false,
-          error: this.createError(FileErrorCode.DOWNLOAD_FAILED, {
-            reason: "No buffer or URL provided for file",
-          }),
-        };
-      }
-
-      // Step 3: Write buffer to temp file (ffmpeg needs a file path)
-      await fs.mkdir(tempDir, { recursive: true });
-      tempCreated = true;
-
-      const extension = this.getExtensionFromFileInfo(fileInfo);
-      const tempVideoPath = join(tempDir, `input${extension}`);
-      await this.writeBufferToFile(buffer, tempVideoPath);
-
-      // Step 4: Extract metadata via ffprobe
-      const probeResult = await this.probeVideo(tempVideoPath);
-      if (!probeResult.success) {
-        return {
-          success: false,
-          error: this.createError(FileErrorCode.PROCESSING_FAILED, {
-            fileType: "video",
-            reason: probeResult.error,
-          }),
-        };
-      }
-      const probeData = probeResult.data as NonNullable<
-        typeof probeResult.data
-      >;
-      const metadata = this.buildMetadata(probeData, buffer.length);
-
-      // Step 5: Extract keyframes
-      let keyframes: Buffer[] = [];
-      try {
-        keyframes = await this.extractKeyframes(
-          tempVideoPath,
-          tempDir,
-          metadata.duration,
-        );
-      } catch {
-        // Non-fatal: continue without keyframes if extraction fails
-        // (e.g., audio-only file in a video container)
-      }
-
-      // Step 6: Extract subtitles
-      let subtitleText: string | undefined;
-      if (metadata.subtitleTracks > 0) {
-        try {
-          subtitleText = await this.extractSubtitles(tempVideoPath, tempDir);
-        } catch {
-          // Non-fatal: continue without subtitles if extraction fails
-        }
-      }
-
-      // Step 7: Build textContent for LLM
-      const textContent = this.buildTextContent(
-        metadata,
-        keyframes.length,
-        subtitleText,
-        this.getFilename(fileInfo),
-      );
-
-      // Step 8: Return structured result
-      return {
-        success: true,
-        data: {
-          buffer,
-          mimetype: fileInfo.mimetype || "video/mp4",
-          size: fileInfo.size,
-          filename: this.getFilename(fileInfo),
-          textContent,
-          keyframes,
-          metadata,
-          subtitleText,
-          hasKeyframes: keyframes.length > 0,
-          frameCount: keyframes.length,
+    return withSpan(
+      {
+        name: "neurolink.file.video.process",
+        tracer: tracers.file,
+        attributes: {
+          [ATTR.FILE_NAME]: filename,
+          [ATTR.FILE_MIMETYPE]: fileInfo.mimetype || "video/mp4",
+          [ATTR.FILE_SIZE_BYTES]: sizeBytes,
         },
-      };
-    } catch (error) {
-      return {
-        success: false,
-        error: this.createError(
-          FileErrorCode.PROCESSING_FAILED,
-          {
-            fileType: "video",
-            error: error instanceof Error ? error.message : String(error),
-          },
-          error instanceof Error ? error : undefined,
-        ),
-      };
-    } finally {
-      // Step 8: Clean up temp files
-      if (tempCreated) {
-        await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {
-          // Ignore cleanup errors - temp files will be cleaned by OS eventually
-        });
-      }
-    }
+      },
+      async (span) => {
+        logger.info(
+          `[NEUROLINK] Video processing started: ${filename} (${(sizeBytes / (1024 * 1024)).toFixed(2)} MB, ${fileInfo.mimetype || "video/mp4"})`,
+        );
+
+        // Ensure ffmpeg paths are initialized before any processing
+        await initFfmpegPaths();
+
+        // Temp directory for this processing run
+        const tempDir = join(tmpdir(), `neurolink-video-${randomUUID()}`);
+        let tempCreated = false;
+
+        try {
+          // Step 1: Validate file type and size
+          const validationResult = this.validateFileWithResult(fileInfo);
+          if (!validationResult.success) {
+            const validationErrMsg =
+              validationResult.error?.message || "Validation failed";
+            span.setAttribute(ATTR.FILE_SUCCESS, false);
+            span.setAttribute(ATTR.FILE_ERROR, validationErrMsg);
+            logger.warn(
+              `[NEUROLINK] Video skipped/failed: ${filename} — reason: ${validationErrMsg}`,
+            );
+            return { success: false, error: validationResult.error };
+          }
+
+          // Step 2: Get file buffer
+          let buffer: Buffer;
+
+          if (fileInfo.buffer) {
+            buffer = fileInfo.buffer;
+          } else if (fileInfo.url) {
+            const downloadResult = await this.downloadFileWithRetry(
+              fileInfo,
+              options,
+            );
+            if (!downloadResult.success) {
+              const downloadErrMsg =
+                downloadResult.error?.message || "Download failed";
+              span.setAttribute(ATTR.FILE_SUCCESS, false);
+              span.setAttribute(ATTR.FILE_ERROR, downloadErrMsg);
+              logger.warn(
+                `[NEUROLINK] Video skipped/failed: ${filename} — reason: ${downloadErrMsg}`,
+              );
+              return { success: false, error: downloadResult.error };
+            }
+            if (!downloadResult.data) {
+              const errMsg = "Download succeeded but returned no data";
+              span.setAttribute(ATTR.FILE_SUCCESS, false);
+              span.setAttribute(ATTR.FILE_ERROR, errMsg);
+              logger.warn(
+                `[NEUROLINK] Video skipped/failed: ${filename} — reason: ${errMsg}`,
+              );
+              return {
+                success: false,
+                error: this.createError(FileErrorCode.DOWNLOAD_FAILED, {
+                  reason: errMsg,
+                }),
+              };
+            }
+            buffer = downloadResult.data;
+
+            // Validate actual downloaded size
+            if (!this.validateFileSize(buffer.length)) {
+              const errMsg = `File too large: ${(buffer.length / (1024 * 1024)).toFixed(2)} MB (max: ${this.config.maxSizeMB} MB)`;
+              span.setAttribute(ATTR.FILE_SUCCESS, false);
+              span.setAttribute(ATTR.FILE_ERROR, errMsg);
+              logger.warn(
+                `[NEUROLINK] Video skipped/failed: ${filename} — reason: ${errMsg}`,
+              );
+              return {
+                success: false,
+                error: this.createError(FileErrorCode.FILE_TOO_LARGE, {
+                  sizeMB: (buffer.length / (1024 * 1024)).toFixed(2),
+                  maxMB: this.config.maxSizeMB,
+                  type: this.config.fileTypeName,
+                }),
+              };
+            }
+          } else {
+            const errMsg = "No buffer or URL provided for file";
+            span.setAttribute(ATTR.FILE_SUCCESS, false);
+            span.setAttribute(ATTR.FILE_ERROR, errMsg);
+            logger.warn(
+              `[NEUROLINK] Video skipped/failed: ${filename} — reason: ${errMsg}`,
+            );
+            return {
+              success: false,
+              error: this.createError(FileErrorCode.DOWNLOAD_FAILED, {
+                reason: errMsg,
+              }),
+            };
+          }
+
+          // Step 3: Write buffer to temp file (ffmpeg needs a file path)
+          await fs.mkdir(tempDir, { recursive: true });
+          tempCreated = true;
+
+          const extension = this.getExtensionFromFileInfo(fileInfo);
+          const tempVideoPath = join(tempDir, `input${extension}`);
+          await this.writeBufferToFile(buffer, tempVideoPath);
+
+          // Step 4: Extract metadata — try mediabunny first (pure TS, no binary),
+          // fall back to ffprobe for formats mediabunny doesn't support (AVI, FLV, WMV).
+          let metadata: ProcessedVideo["metadata"] | undefined;
+          const mediabunnyResult =
+            await this.probeVideoWithMediabunny(tempVideoPath);
+          if (mediabunnyResult.success && mediabunnyResult.data) {
+            metadata = { ...mediabunnyResult.data, fileSize: buffer.length };
+          } else {
+            // Fall back to ffprobe (requires system ffprobe to be available)
+            const probeResult = await this.probeVideo(tempVideoPath);
+            if (probeResult.success && probeResult.data) {
+              metadata = this.buildMetadata(probeResult.data, buffer.length);
+            }
+          }
+
+          if (!metadata) {
+            metadata = {
+              duration: 0,
+              durationFormatted: "unknown",
+              width: 0,
+              height: 0,
+              codec: "unknown",
+              fps: 0,
+              bitrate: 0,
+              subtitleTracks: 0,
+              fileSize: buffer.length,
+            };
+          }
+
+          // Record video-specific metadata on span
+          span.setAttribute(ATTR.VIDEO_DURATION_SEC, metadata.duration);
+          span.setAttribute(ATTR.VIDEO_WIDTH, metadata.width);
+          span.setAttribute(ATTR.VIDEO_HEIGHT, metadata.height);
+          span.setAttribute(ATTR.VIDEO_CODEC, metadata.codec);
+          span.setAttribute(
+            ATTR.VIDEO_HAS_SUBTITLES,
+            metadata.subtitleTracks > 0,
+          );
+
+          // Step 5: Extract keyframes
+          let keyframes: Buffer[] = [];
+          try {
+            keyframes = await this.extractKeyframes(
+              tempVideoPath,
+              tempDir,
+              metadata.duration,
+            );
+          } catch {
+            // Non-fatal: continue without keyframes if extraction fails
+            // (e.g., audio-only file in a video container)
+            logger.warn(
+              `[NEUROLINK] Video keyframe extraction failed for ${filename}, continuing without keyframes`,
+            );
+          }
+
+          span.setAttribute(ATTR.VIDEO_KEYFRAMES_EXTRACTED, keyframes.length);
+
+          // Step 6: Extract subtitles
+          let subtitleText: string | undefined;
+          if (metadata.subtitleTracks > 0) {
+            try {
+              subtitleText = await this.extractSubtitles(
+                tempVideoPath,
+                tempDir,
+              );
+            } catch {
+              // Non-fatal: continue without subtitles if extraction fails
+            }
+          }
+
+          // Step 7: Build textContent for LLM
+          const textContent = this.buildTextContent(
+            metadata,
+            keyframes.length,
+            subtitleText,
+            this.getFilename(fileInfo),
+          );
+
+          span.setAttribute(ATTR.VIDEO_TEXT_CONTENT_LENGTH, textContent.length);
+          span.setAttribute(ATTR.FILE_OUTPUT_LENGTH, textContent.length);
+          span.setAttribute(ATTR.FILE_SUCCESS, true);
+
+          logger.info(
+            `[NEUROLINK] Video processed: ${filename} → ${textContent.length} bytes text + ${keyframes.length} keyframes ` +
+              `(${metadata.durationFormatted}, ${metadata.width}x${metadata.height}, ${metadata.codec})`,
+          );
+
+          // Step 8: Return structured result
+          return {
+            success: true,
+            data: {
+              buffer,
+              mimetype: fileInfo.mimetype || "video/mp4",
+              size: fileInfo.size,
+              filename: this.getFilename(fileInfo),
+              textContent,
+              keyframes,
+              metadata,
+              subtitleText,
+              hasKeyframes: keyframes.length > 0,
+              frameCount: keyframes.length,
+            },
+          };
+        } catch (error) {
+          const errMsg = error instanceof Error ? error.message : String(error);
+          span.setAttribute(ATTR.FILE_SUCCESS, false);
+          span.setAttribute(ATTR.FILE_ERROR, errMsg);
+          logger.error(
+            `[NEUROLINK] Video processing failed: ${filename} — ${errMsg}`,
+          );
+          return {
+            success: false,
+            error: this.createError(
+              FileErrorCode.PROCESSING_FAILED,
+              {
+                fileType: "video",
+                error: errMsg,
+              },
+              error instanceof Error ? error : undefined,
+            ),
+          };
+        } finally {
+          // Step 8: Clean up temp files
+          if (tempCreated) {
+            await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {
+              // Ignore cleanup errors - temp files will be cleaned by OS eventually
+            });
+          }
+        }
+      },
+    );
   }
 
   // ===========================================================================
@@ -530,9 +605,10 @@ export class VideoProcessor extends BaseFileProcessor<ProcessedVideo> {
    * @param filePath - Path to the video file
    * @returns Success result with probe data or error message
    */
-  private probeVideo(
+  private async probeVideo(
     filePath: string,
   ): Promise<{ success: boolean; data?: FfprobeData; error?: string }> {
+    const ffmpeg = await loadFluentFfmpeg();
     return new Promise((resolve) => {
       const timeoutId = setTimeout(() => {
         resolve({
@@ -541,7 +617,7 @@ export class VideoProcessor extends BaseFileProcessor<ProcessedVideo> {
         });
       }, VIDEO_CONFIG.FFPROBE_TIMEOUT_MS);
 
-      ffmpegCommand.ffprobe(filePath, (err, data) => {
+      ffmpeg.ffprobe(filePath, (err, data) => {
         clearTimeout(timeoutId);
         if (err) {
           resolve({
@@ -553,6 +629,69 @@ export class VideoProcessor extends BaseFileProcessor<ProcessedVideo> {
         }
       });
     });
+  }
+
+  /**
+   * Probe a video file using mediabunny (pure TypeScript, no native binary).
+   * Falls back to ffprobe if mediabunny fails or doesn't support the format.
+   */
+  private async probeVideoWithMediabunny(filePath: string): Promise<{
+    success: boolean;
+    data?: ProcessedVideo["metadata"];
+    error?: string;
+  }> {
+    const mb = await loadMediaBunny();
+    let input: InstanceType<typeof mb.Input> | undefined;
+    try {
+      input = new mb.Input({
+        source: new mb.FilePathSource(filePath),
+        formats: [...mb.ALL_FORMATS],
+      });
+
+      const duration = await input.computeDuration();
+      const videoTrack = await input.getPrimaryVideoTrack();
+      const audioTrack = await input.getPrimaryAudioTrack();
+      const allTracks = await input.getTracks();
+      const subtitleTracks = allTracks.filter(
+        (t) => !t.isVideoTrack() && !t.isAudioTrack(),
+      );
+
+      // Get FPS from video track packet stats (sample a small number of packets)
+      let fps = 0;
+      if (videoTrack) {
+        try {
+          const stats = await videoTrack.computePacketStats(120);
+          fps = Math.round(stats.averagePacketRate * 100) / 100;
+        } catch {
+          // FPS unavailable — non-fatal
+        }
+      }
+
+      return {
+        success: true,
+        data: {
+          duration: duration ?? 0,
+          durationFormatted: this.formatDuration(duration ?? 0),
+          width: videoTrack?.displayWidth ?? 0,
+          height: videoTrack?.displayHeight ?? 0,
+          codec: videoTrack?.codec ?? "unknown",
+          fps,
+          bitrate: 0,
+          audioCodec: audioTrack?.codec ?? undefined,
+          audioChannels: audioTrack?.numberOfChannels,
+          audioSampleRate: audioTrack?.sampleRate,
+          subtitleTracks: subtitleTracks.length,
+          fileSize: 0,
+        },
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: `mediabunny failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    } finally {
+      input?.dispose();
+    }
   }
 
   /**
@@ -722,12 +861,13 @@ export class VideoProcessor extends BaseFileProcessor<ProcessedVideo> {
    * @param outputDir - Directory to write frame files
    * @param timestamps - Array of timestamps in seconds
    */
-  private runFfmpegFrameExtraction(
+  private async runFfmpegFrameExtraction(
     videoPath: string,
     outputDir: string,
     timestamps: number[],
     intervalSec: number,
   ): Promise<void> {
+    const ff = await loadFluentFfmpeg();
     return new Promise((resolve, reject) => {
       // Improved select expression to pick exactly one frame per interval
       // instead of multiple frames within a 0.5s window.
@@ -741,7 +881,7 @@ export class VideoProcessor extends BaseFileProcessor<ProcessedVideo> {
         );
       }, VIDEO_CONFIG.FFMPEG_TIMEOUT_MS);
 
-      ffmpegCommand(videoPath)
+      ff(videoPath)
         .outputOptions([
           "-vf",
           `select='${selectExpr}',scale='min(${VIDEO_CONFIG.FRAME_MAX_DIMENSION}\\,iw):-2'`,
@@ -809,6 +949,7 @@ export class VideoProcessor extends BaseFileProcessor<ProcessedVideo> {
   ): Promise<string | undefined> {
     const subtitlePath = join(tempDir, "subtitles.srt");
 
+    const ffSub = await loadFluentFfmpeg();
     await new Promise<void>((resolve, reject) => {
       const timeoutId = setTimeout(() => {
         reject(
@@ -818,7 +959,7 @@ export class VideoProcessor extends BaseFileProcessor<ProcessedVideo> {
         );
       }, VIDEO_CONFIG.FFMPEG_TIMEOUT_MS);
 
-      ffmpegCommand(videoPath)
+      ffSub(videoPath)
         .outputOptions(["-map", "0:s:0", "-c:s", "srt"])
         .output(subtitlePath)
         .on("end", () => {
@@ -972,30 +1113,16 @@ export class VideoProcessor extends BaseFileProcessor<ProcessedVideo> {
   /**
    * Format a duration in seconds to a human-readable string.
    *
+   * Delegates to the shared formatter so audio and video agree — see
+   * `formatMediaDuration`. Rounding replaces the previous truncation, so a
+   * 2.6s clip now reads "3s" rather than "2s" and matches what the audio
+   * side reports for the same stream.
+   *
    * @param seconds - Duration in seconds
    * @returns Formatted string (e.g., "1h 23m 45s")
    */
   private formatDuration(seconds: number): string {
-    if (seconds <= 0) {
-      return "0s";
-    }
-
-    const hours = Math.floor(seconds / 3600);
-    const minutes = Math.floor((seconds % 3600) / 60);
-    const secs = Math.floor(seconds % 60);
-
-    const parts: string[] = [];
-    if (hours > 0) {
-      parts.push(`${hours}h`);
-    }
-    if (minutes > 0) {
-      parts.push(`${minutes}m`);
-    }
-    if (secs > 0 || parts.length === 0) {
-      parts.push(`${secs}s`);
-    }
-
-    return parts.join(" ");
+    return formatMediaDuration(seconds);
   }
 
   /**
@@ -1235,6 +1362,6 @@ export function isVideoFile(mimetype: string, filename: string): boolean {
 export async function processVideo(
   fileInfo: FileInfo,
   options?: ProcessOptions,
-): Promise<FileProcessingResult<ProcessedVideo>> {
+): Promise<ProcessorFileProcessingResult<ProcessedVideo>> {
   return videoProcessor.processFile(fileInfo, options);
 }

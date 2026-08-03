@@ -17,7 +17,8 @@ import { createProxyFetch } from "../proxy/proxyFetch.js";
 import type {
   ProviderHealthCheckOptions,
   ProviderHealthStatusOptions,
-} from "$lib/types/providers.js";
+} from "../types/index.js";
+import { DEFAULT_OLLAMA_MODEL } from "../providers/ollama/constants.js";
 
 export class ProviderHealthChecker {
   private static healthCache = new Map<
@@ -114,7 +115,11 @@ export class ProviderHealthChecker {
 
     try {
       // 1. Check environment configuration
-      await this.checkEnvironmentConfiguration(providerName, healthStatus);
+      await this.checkEnvironmentConfiguration(
+        providerName,
+        healthStatus,
+        timeout,
+      );
 
       // 2. Check API key validity (basic format validation)
       await this.checkApiKeyValidity(providerName, healthStatus);
@@ -187,6 +192,7 @@ export class ProviderHealthChecker {
   private static async checkEnvironmentConfiguration(
     providerName: AIProviderName,
     healthStatus: ProviderHealthStatusOptions,
+    timeout: number,
   ): Promise<void> {
     const requiredEnvVars = this.getRequiredEnvironmentVariables(providerName);
 
@@ -237,7 +243,7 @@ export class ProviderHealthChecker {
     }
 
     // Provider-specific configuration checks
-    await this.checkProviderSpecificConfig(providerName, healthStatus);
+    await this.checkProviderSpecificConfig(providerName, healthStatus, timeout);
   }
 
   /**
@@ -320,7 +326,8 @@ export class ProviderHealthChecker {
     // Providers that don't use API keys directly
     if (
       providerName === AIProviderName.OLLAMA ||
-      providerName === AIProviderName.BEDROCK
+      providerName === AIProviderName.BEDROCK ||
+      providerName === AIProviderName.LITELLM
     ) {
       healthStatus.hasApiKey = true;
       return;
@@ -369,36 +376,39 @@ export class ProviderHealthChecker {
       return;
     }
 
+    const headers = {
+      "User-Agent": "NeuroLink-HealthCheck/1.0",
+      ...this.getConnectivityHeaders(providerName),
+    };
+
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeout);
 
-      const proxyFetch = createProxyFetch();
-      let response = await proxyFetch(endpoint, {
-        method: "HEAD",
-        signal: controller.signal,
-        headers: {
-          "User-Agent": "NeuroLink-HealthCheck/1.0",
-        },
-      });
-
-      // Fallback to GET if HEAD returns 405 (Method Not Allowed) for restrictive gateways
-      if (response.status === 405) {
-        response = await proxyFetch(endpoint, {
-          method: "GET",
+      try {
+        const proxyFetch = createProxyFetch();
+        let response = await proxyFetch(endpoint, {
+          method: "HEAD",
           signal: controller.signal,
-          headers: {
-            "User-Agent": "NeuroLink-HealthCheck/1.0",
-          },
+          headers,
         });
-      }
 
-      clearTimeout(timeoutId);
+        // Fallback to GET if HEAD returns 405 (Method Not Allowed) for restrictive gateways
+        if (response.status === 405) {
+          response = await proxyFetch(endpoint, {
+            method: "GET",
+            signal: controller.signal,
+            headers,
+          });
+        }
 
-      if (!response.ok) {
-        healthStatus.configurationIssues.push(
-          `Connectivity test failed: HTTP ${response.status}`,
-        );
+        if (!response.ok) {
+          healthStatus.configurationIssues.push(
+            `Connectivity test failed: HTTP ${response.status}`,
+          );
+        }
+      } finally {
+        clearTimeout(timeoutId);
       }
     } catch (error) {
       const errorMessage =
@@ -451,6 +461,18 @@ export class ProviderHealthChecker {
     }
   }
 
+  private static getConnectivityHeaders(
+    providerName: AIProviderName,
+  ): Record<string, string> {
+    if (providerName === AIProviderName.LITELLM) {
+      return {
+        Authorization: `Bearer ${process.env.LITELLM_API_KEY || "sk-anything"}`,
+      };
+    }
+
+    return {};
+  }
+
   /**
    * Check model availability (if possible without making API calls)
    */
@@ -473,7 +495,7 @@ export class ProviderHealthChecker {
             `    • claude-sonnet-4@20250514, claude-opus-4@20250514\n` +
             `    • claude-3-5-sonnet-20241022, claude-3-5-haiku-20241022\n` +
             `    • claude-3-sonnet-20240229, claude-3-haiku-20240307, claude-3-opus-20240229\n` +
-            `  Implementation: Uses @ai-sdk/google-vertex with dual provider setup\n` +
+            `  Implementation: Uses native SDKs (@google/genai for Gemini, @anthropic-ai/vertex-sdk for Claude)\n` +
             `  Authentication: Requires Google Cloud project with Vertex AI API enabled\n` +
             `  Note: Anthropic models require Anthropic integration in your Google Cloud project`,
         );
@@ -510,6 +532,8 @@ export class ProviderHealthChecker {
         return [];
       case AIProviderName.AZURE:
         return ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"];
+      case AIProviderName.LITELLM:
+        return [];
       case AIProviderName.OLLAMA:
         return []; // Ollama typically doesn't require API keys
       default:
@@ -536,8 +560,10 @@ export class ProviderHealthChecker {
         return "AWS_ACCESS_KEY_ID";
       case AIProviderName.AZURE:
         return "AZURE_OPENAI_API_KEY";
+      case AIProviderName.LITELLM:
+        return "LITELLM_API_KEY";
       case AIProviderName.OLLAMA:
-        return "OLLAMA_API_BASE";
+        return "OLLAMA_BASE_URL";
       default:
         return "";
     }
@@ -569,6 +595,8 @@ export class ProviderHealthChecker {
         return apiKey.length >= API_KEY_LENGTHS.AWS_ACCESS_KEY; // AWS access key length
       case AIProviderName.AZURE:
         return apiKey.length >= API_KEY_LENGTHS.AZURE_MIN; // Azure OpenAI API key length
+      case AIProviderName.LITELLM:
+        return apiKey.length > 0;
       case AIProviderName.OLLAMA:
         return true; // Ollama usually doesn't require specific format
       default:
@@ -593,8 +621,10 @@ export class ProviderHealthChecker {
         return null; // Complex authentication required
       case AIProviderName.BEDROCK:
         return null; // AWS endpoints vary by region
+      case AIProviderName.LITELLM:
+        return this.getLiteLLMModelsUrl();
       case AIProviderName.OLLAMA:
-        return "http://localhost:11434/api/version";
+        return this.getOllamaTagsUrl();
       default:
         return null;
     }
@@ -606,6 +636,7 @@ export class ProviderHealthChecker {
   private static async checkProviderSpecificConfig(
     providerName: AIProviderName,
     healthStatus: ProviderHealthStatusOptions,
+    timeout: number,
   ): Promise<void> {
     switch (providerName) {
       case AIProviderName.VERTEX:
@@ -617,8 +648,11 @@ export class ProviderHealthChecker {
       case AIProviderName.AZURE:
         await this.checkAzureConfig(healthStatus);
         break;
+      case AIProviderName.LITELLM:
+        await this.checkLiteLLMConfig(healthStatus, timeout);
+        break;
       case AIProviderName.OLLAMA:
-        await this.checkOllamaConfig(healthStatus);
+        await this.checkOllamaConfig(healthStatus, timeout);
         break;
     }
   }
@@ -892,19 +926,258 @@ export class ProviderHealthChecker {
     }
   }
 
+  private static getLiteLLMBaseUrl(): string {
+    return process.env.LITELLM_BASE_URL || "http://localhost:4000";
+  }
+
+  private static getLiteLLMModelsUrl(): string {
+    return new URL("/v1/models", this.getLiteLLMBaseUrl()).toString();
+  }
+
+  private static getConfiguredLiteLLMModel(): string {
+    return process.env.LITELLM_MODEL || "openai/gpt-4o-mini";
+  }
+
+  private static getOllamaBaseUrl(): string {
+    return (
+      process.env.OLLAMA_BASE_URL ||
+      process.env.OLLAMA_API_BASE ||
+      "http://localhost:11434"
+    );
+  }
+
+  private static getOllamaTagsUrl(): string {
+    return new URL("/api/tags", this.getOllamaBaseUrl()).toString();
+  }
+
+  private static getConfiguredOllamaModel(): string {
+    return process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL;
+  }
+
+  private static async fetchJsonWithTimeout(
+    url: string,
+    options: {
+      timeout?: number;
+      headers?: Record<string, string>;
+    } = {},
+  ): Promise<unknown> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      options.timeout ?? this.DEFAULT_TIMEOUT,
+    );
+
+    try {
+      const proxyFetch = createProxyFetch();
+      const response = await proxyFetch(url, {
+        method: "GET",
+        headers: options.headers,
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      return await response.json();
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  private static normalizeModelList(models: unknown[]): string[] {
+    return models
+      .map((entry) => {
+        if (typeof entry === "string") {
+          return entry;
+        }
+        if (
+          entry &&
+          typeof entry === "object" &&
+          "id" in entry &&
+          typeof (entry as { id?: unknown }).id === "string"
+        ) {
+          return (entry as { id: string }).id;
+        }
+        if (
+          entry &&
+          typeof entry === "object" &&
+          "name" in entry &&
+          typeof (entry as { name?: unknown }).name === "string"
+        ) {
+          return (entry as { name: string }).name;
+        }
+        return null;
+      })
+      .filter((model): model is string => typeof model === "string");
+  }
+
+  private static hasRequestedModel(
+    availableModels: string[],
+    requestedModel: string,
+  ): boolean {
+    const normalizedRequestedModel = requestedModel.trim();
+    const requiresExactMatch = /@/.test(normalizedRequestedModel);
+
+    return availableModels.some(
+      (model) =>
+        model === normalizedRequestedModel ||
+        (!requiresExactMatch &&
+          (model.startsWith(`${normalizedRequestedModel}:`) ||
+            model.startsWith(`${normalizedRequestedModel}@`))),
+    );
+  }
+
+  private static async getOllamaAvailableModels(
+    timeout: number = 2000,
+  ): Promise<string[]> {
+    const payload = (await this.fetchJsonWithTimeout(this.getOllamaTagsUrl(), {
+      timeout,
+    })) as { models?: unknown[] };
+    return this.normalizeModelList(payload.models ?? []);
+  }
+
+  private static async getLiteLLMAvailableModels(
+    timeout: number = 2000,
+  ): Promise<string[]> {
+    const payload = (await this.fetchJsonWithTimeout(
+      this.getLiteLLMModelsUrl(),
+      {
+        timeout,
+        headers: {
+          Authorization: `Bearer ${process.env.LITELLM_API_KEY || "sk-anything"}`,
+          "Content-Type": "application/json",
+        },
+      },
+    )) as { data?: unknown[] };
+    return this.normalizeModelList(payload.data ?? []);
+  }
+
+  private static async checkOllamaAvailability(options: {
+    model: string;
+    timeout?: number;
+  }): Promise<{ available: boolean; reason?: string; models: string[] }> {
+    try {
+      const models = await this.getOllamaAvailableModels(options.timeout);
+      if (!this.hasRequestedModel(models, options.model)) {
+        return {
+          available: false,
+          reason: `Configured Ollama model '${options.model}' is not installed`,
+          models,
+        };
+      }
+
+      return { available: true, models };
+    } catch (error) {
+      return {
+        available: false,
+        reason: error instanceof Error ? error.message : String(error),
+        models: [],
+      };
+    }
+  }
+
+  private static async checkLiteLLMAvailability(options: {
+    model: string;
+    timeout?: number;
+  }): Promise<{ available: boolean; reason?: string; models: string[] }> {
+    try {
+      const models = await this.getLiteLLMAvailableModels(options.timeout);
+      if (models.length === 0) {
+        return {
+          available: false,
+          reason: "LiteLLM returned an empty model list",
+          models,
+        };
+      }
+
+      if (!this.hasRequestedModel(models, options.model)) {
+        return {
+          available: false,
+          reason: `Configured LiteLLM model '${options.model}' is not exposed by the proxy`,
+          models,
+        };
+      }
+
+      return { available: true, models };
+    } catch (error) {
+      return {
+        available: false,
+        reason: error instanceof Error ? error.message : String(error),
+        models: [],
+      };
+    }
+  }
+
+  private static async checkLiteLLMConfig(
+    healthStatus: ProviderHealthStatusOptions,
+    timeout: number = this.DEFAULT_TIMEOUT,
+  ): Promise<void> {
+    const liteLLMBase = this.getLiteLLMBaseUrl();
+    if (!liteLLMBase.startsWith("http")) {
+      healthStatus.isConfigured = false;
+      healthStatus.configurationIssues.push("Invalid LITELLM_BASE_URL format");
+      healthStatus.recommendations.push(
+        "Set LITELLM_BASE_URL to a valid URL (e.g., http://localhost:4000)",
+      );
+      return;
+    }
+
+    const availability = await this.checkLiteLLMAvailability({
+      model: this.getConfiguredLiteLLMModel(),
+      timeout,
+    });
+
+    if (!availability.available) {
+      healthStatus.isConfigured = false;
+      healthStatus.configurationIssues.push(
+        `LiteLLM runtime check failed: ${availability.reason ?? "unknown error"}`,
+      );
+      healthStatus.recommendations.push(
+        "Start the LiteLLM proxy and ensure the configured model is available from /v1/models",
+      );
+      return;
+    }
+
+    healthStatus.isConfigured = true;
+  }
+
   /**
    * Check Ollama configuration
    */
   private static async checkOllamaConfig(
     healthStatus: ProviderHealthStatusOptions,
+    timeout: number = this.DEFAULT_TIMEOUT,
   ): Promise<void> {
-    const ollamaBase = process.env.OLLAMA_API_BASE || "http://localhost:11434";
+    const ollamaBase = this.getOllamaBaseUrl();
     if (!ollamaBase.startsWith("http")) {
-      healthStatus.configurationIssues.push("Invalid OLLAMA_API_BASE format");
-      healthStatus.recommendations.push(
-        "Set OLLAMA_API_BASE to a valid URL (e.g., http://localhost:11434)",
+      healthStatus.isConfigured = false;
+      healthStatus.configurationIssues.push(
+        "Invalid OLLAMA_BASE_URL format (OLLAMA_API_BASE is still accepted as a legacy alias)",
       );
+      healthStatus.recommendations.push(
+        "Set OLLAMA_BASE_URL to a valid URL (e.g., http://localhost:11434). OLLAMA_API_BASE remains supported as a legacy alias.",
+      );
+      return;
     }
+
+    const availability = await this.checkOllamaAvailability({
+      model: this.getConfiguredOllamaModel(),
+      timeout,
+    });
+
+    if (!availability.available) {
+      healthStatus.isConfigured = false;
+      healthStatus.configurationIssues.push(
+        `Ollama runtime check failed: ${availability.reason ?? "unknown error"}`,
+      );
+      healthStatus.recommendations.push(
+        "Start Ollama and install the configured model before using Ollama as a fallback provider",
+      );
+      return;
+    }
+
+    healthStatus.isConfigured = true;
   }
 
   /**
@@ -954,8 +1227,21 @@ export class ProviderHealthChecker {
         return [BedrockModels.CLAUDE_3_SONNET, BedrockModels.CLAUDE_3_HAIKU];
       case AIProviderName.AZURE:
         return [OpenAIModels.GPT_4O, OpenAIModels.GPT_4O_MINI, "gpt-35-turbo"];
-      case AIProviderName.OLLAMA:
-        return ["llama3.2:latest", "llama3.1:latest", "mistral:latest"];
+      case AIProviderName.LITELLM:
+        return [
+          "openai/gpt-4o-mini",
+          "anthropic/claude-3-haiku",
+          "google/gemini-2.5-flash",
+        ];
+      case AIProviderName.OLLAMA: {
+        const envModel = process.env.OLLAMA_MODEL;
+        const defaults = [
+          "llama3.2:latest",
+          "llama3.1:latest",
+          "mistral:latest",
+        ];
+        return envModel ? [envModel, ...defaults] : defaults;
+      }
       default:
         return [];
     }
@@ -1057,20 +1343,18 @@ export class ProviderHealthChecker {
 
     try {
       // 1. Check SDK module availability
-      logger.debug(
-        "Checking @ai-sdk/google-vertex/anthropic module availability",
-      );
-      const anthropicModule = await import("@ai-sdk/google-vertex/anthropic");
+      logger.debug("Checking @anthropic-ai/vertex-sdk module availability");
+      const anthropicModule = await import("@anthropic-ai/vertex-sdk");
 
       result.hasCreateVertexAnthropic =
-        typeof anthropicModule.createVertexAnthropic === "function";
-      result.hasCorrectTypes = true; // Types are bundled with the function
+        typeof anthropicModule.AnthropicVertex === "function";
+      result.hasCorrectTypes = true; // Types are bundled with the class
 
       if (!result.hasCreateVertexAnthropic) {
         result.troubleshooting.push(
-          "📦 Update @ai-sdk/google-vertex to latest version with Anthropic support",
-          "🔄 Run: npm install @ai-sdk/google-vertex@latest",
-          "📖 See: https://sdk.vercel.ai/providers/ai-sdk-providers/google-vertex#anthropic-models",
+          "📦 Install @anthropic-ai/vertex-sdk for Claude on Vertex AI support",
+          "🔄 Run: npm install @anthropic-ai/vertex-sdk",
+          "📖 See: https://docs.anthropic.com/en/api/claude-on-vertex-ai",
         );
         return result;
       }
@@ -1245,7 +1529,7 @@ export class ProviderHealthChecker {
         `🐛 Error: ${error instanceof Error ? error.message : String(error)}`,
         "",
         "🔧 Troubleshooting steps:",
-        "1. Update @ai-sdk/google-vertex to latest version",
+        "1. Verify @google-cloud/vertexai and @anthropic-ai/vertex-sdk are properly installed",
         "2. Verify Google Cloud authentication setup",
         "3. Check project ID and region configuration",
         "4. Enable Vertex AI API in Google Cloud Console",
@@ -1590,6 +1874,53 @@ export class ProviderHealthChecker {
     }
   }
 
+  static async checkFallbackProviderAvailability(
+    providerName: string,
+    model: string,
+  ): Promise<{ available: boolean; reason?: string }> {
+    const provider = providerName as AIProviderName;
+
+    if (provider === AIProviderName.OLLAMA) {
+      const availability = await this.checkOllamaAvailability({
+        model,
+        timeout: 2000,
+      });
+      return {
+        available: availability.available,
+        reason: availability.reason,
+      };
+    }
+
+    if (provider === AIProviderName.LITELLM) {
+      const availability = await this.checkLiteLLMAvailability({
+        model,
+        timeout: 2000,
+      });
+      return {
+        available: availability.available,
+        reason: availability.reason,
+      };
+    }
+
+    try {
+      const health = await this.checkProviderHealth(provider, {
+        includeConnectivityTest: false,
+        cacheResults: true,
+        maxCacheAge: 15_000,
+        timeout: 2000,
+      });
+      return {
+        available: health.isHealthy,
+        reason: health.error || health.configurationIssues[0] || health.warning,
+      };
+    } catch (error) {
+      return {
+        available: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
   /**
    * Get the best healthy provider from a list of options (NON-BLOCKING)
    * Prioritizes healthy providers over configured but unhealthy ones
@@ -1597,12 +1928,14 @@ export class ProviderHealthChecker {
    */
   static async getBestHealthyProvider(
     preferredProviders: string[] = [
+      "litellm",
+      "ollama",
       "openai",
       "anthropic",
       "vertex",
+      "google-ai",
       "bedrock",
       "azure",
-      "google-ai",
     ],
   ): Promise<string | null> {
     const healthStatuses = await this.checkAllProvidersHealth({
@@ -1655,6 +1988,7 @@ export class ProviderHealthChecker {
       AIProviderName.OPENAI,
       AIProviderName.BEDROCK,
       AIProviderName.AZURE,
+      AIProviderName.LITELLM,
       AIProviderName.OLLAMA,
     ];
 

@@ -394,13 +394,18 @@ export async function testComplexZodSchemaMultiProvider(
   const providerName = providerOverride || "vertex";
   const modelName = modelOverride || undefined;
 
-  // Check if this is a Gemini MODEL - Gemini cannot use tools + JSON schema together
+  // Check if this is a Gemini MODEL - Gemini cannot use tools + JSON schema together.
   // This is a documented Gemini limitation, not a bug in the SDK.
-  // Note: provider name alone is not sufficient - Vertex can run Claude too.
+  // When an explicit model is provided, we check its name. When no model is given,
+  // google-ai, googleAiStudio, and vertex all default to a Gemini model, so we
+  // treat them as Gemini. If someone passes e.g. --provider=vertex --model=claude-*,
+  // the modelName check will NOT match "gemini" and the test will correctly run.
   const isGeminiModel =
     modelName?.toLowerCase().includes("gemini") ||
     (!modelName &&
-      (providerName === "google-ai" || providerName === "googleAiStudio"));
+      (providerName === "google-ai" ||
+        providerName === "googleAiStudio" ||
+        providerName === "vertex"));
 
   if (isGeminiModel) {
     logTest(
@@ -419,7 +424,7 @@ export async function testComplexZodSchemaMultiProvider(
   ];
   const results: {
     provider: string;
-    model: string;
+    model: string | undefined;
     success: boolean;
     error?: string;
   }[] = [];
@@ -557,6 +562,7 @@ DO NOT hallucinate data. ALL metrics, campaign IDs, and account information must
       } catch (parseError) {
         throw new Error(
           `Failed to parse JSON from result.content: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
+          { cause: parseError },
         );
       }
 
@@ -564,8 +570,13 @@ DO NOT hallucinate data. ALL metrics, campaign IDs, and account information must
       const validation = MetaAdsAnalysisOutputSchema.safeParse(parsedOutput);
 
       if (!validation.success) {
-        const errorDetails = validation.error.errors
-          .map((e) => `${e.path.join(".")}: ${e.message}`)
+        type ZodIssue = { path?: Array<string | number>; message: string };
+        const zodError = validation.error as {
+          errors?: ZodIssue[];
+          issues?: ZodIssue[];
+        };
+        const errorDetails = (zodError.errors || zodError.issues || [])
+          .map((e: ZodIssue) => `${(e.path || []).join(".")}: ${e.message}`)
           .join("; ");
 
         logTest(

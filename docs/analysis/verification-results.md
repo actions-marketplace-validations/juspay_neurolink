@@ -1,5 +1,11 @@
 # 🔍 NeuroLink Comprehensive Verification Results
 
+> **⚠️ HISTORICAL DOCUMENT (August 2025)**
+>
+> This audit was conducted when NeuroLink shipped 9 providers. At audit time, v9.62.0 (May 2026) shipped 24 providers including DeepSeek, NVIDIA NIM, LM Studio, llama.cpp, plus voice (TTS/STT/realtime). References to "9 providers" or "8/9 working" in this file reflect the state at time of analysis.
+>
+> For current capabilities see [README on GitHub](https://github.com/juspay/neurolink/blob/main/README.md) and [Provider Capabilities Audit](https://github.com/juspay/neurolink/blob/main/docs/reference/provider-capabilities-audit.md).
+
 **Started**: August 3, 2025  
 **Status**: IN PROGRESS  
 **Current Phase**: Phase 1 - Documentation Inventory  
@@ -436,7 +442,7 @@ console.log("Active servers:", status.totalServers);
 - `neurolink mcp list [--status]` - List configured servers
 - `neurolink mcp test <server>` - Test connectivity
 - `neurolink mcp remove <server>` - Remove servers
-- `neurolink mcp exec <server> <tool>` - Execute tools (Coming Soon)
+- `neurolink mcp exec <server> <tool>` - Execute tools (planned for a future release)
 
 #### Available MCP Servers Claims:
 

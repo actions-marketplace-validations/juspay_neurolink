@@ -558,7 +558,7 @@ const pricing = {
     inputTokenPrice: 0.0015,
     outputTokenPrice: 0.002,
   },
-  "claude-3-5-sonnet": {
+  "claude-sonnet-4-6": {
     inputTokenPrice: 0.003,
     outputTokenPrice: 0.015,
   },
@@ -827,9 +827,9 @@ console.log(result2.experimental_providerMetadata?.neurolink?.cache);
 **Advanced: Redis-Backed Cache:**
 
 ```typescript
-import Redis from "ioredis";
+import { createClient, type RedisClientType } from "redis";
 
-const createRedisCachingMiddleware = (redisClient: Redis) => {
+const createRedisCachingMiddleware = (redisClient: RedisClientType) => {
   return {
     metadata: {
       id: "redis-cache",
@@ -849,7 +849,7 @@ const createRedisCachingMiddleware = (redisClient: Redis) => {
       const result = await doGenerate();
 
       // Store in Redis with TTL
-      await redisClient.setex(cacheKey, 3600, JSON.stringify(result));
+      await redisClient.set(cacheKey, JSON.stringify(result), { EX: 3600 });
 
       return result;
     },

@@ -1,39 +1,14 @@
-/**
- * On-Demand File Access Tools
- *
- * Exposes file operations as LLM tools via the Vercel AI SDK `tool()` pattern.
- * These tools allow the LLM to access file content lazily — only reading
- * the specific sections, lines, or search results it needs.
- *
- * Tools:
- * - list_attached_files: List all registered files with metadata
- * - read_file_section: Read specific line range with token budget
- * - search_in_file: Search for patterns within a file
- * - get_file_preview: Get the preview/summary of a file
- * - extract_file_content: Targeted extraction for any file type (video frames,
- *     PDF pages, spreadsheet ranges, archive entries, PPTX slides)
- *
- * @module files/fileTools
- */
-
-import { tool } from "ai";
 import { z } from "zod";
 import type { FileReferenceRegistry } from "./fileReferenceRegistry.js";
-
-/**
- * Multi-part tool result content for the Vercel AI SDK.
- * Allows tool results to contain both text and images.
- */
-type ToolResultContentPart =
-  | { type: "text"; text: string }
-  | { type: "image"; data: string; mimeType?: string };
+import { tool } from "../utils/tool.js";
 
 /**
  * Create file access tools bound to a FileReferenceRegistry instance.
  *
  * These tools follow the same pattern as the existing directAgentTools
  * (getCurrentTime, readFile, etc.) in src/lib/agent/directTools.ts.
- * They use `tool()` from the Vercel AI SDK with zod parameter schemas.
+ * They use NeuroLink's `tool()` helper from `../utils/tool.js` with Zod
+ * parameter schemas.
  *
  * @param registry - The FileReferenceRegistry instance to bind to
  * @returns Record of tool name to tool definition
@@ -71,7 +46,7 @@ function createListAttachedFilesTool(registry: FileReferenceRegistry) {
       "Each file has a unique UUID 'id' field — use that ID (or the filename) " +
       "as the file_id parameter in read_file_section, search_in_file, and get_file_preview. " +
       "Always call this first to discover available files.",
-    parameters: z.object({}),
+    inputSchema: z.object({}),
     execute: async () => {
       try {
         const files = registry.list();
@@ -125,7 +100,7 @@ function createReadFileSectionTool(registry: FileReferenceRegistry) {
       "(UUID from list_attached_files, or the exact filename), start line, and end line. " +
       "Uses a token budget to prevent reading too much content at once. " +
       "For large files, read in sections rather than all at once.",
-    parameters: z.object({
+    inputSchema: z.object({
       file_id: z
         .string()
         .describe(
@@ -207,7 +182,7 @@ function createSearchInFileTool(registry: FileReferenceRegistry) {
       "Supports plain text and regex patterns. Returns matching lines " +
       "with context lines before and after each match. " +
       "Use this to find specific content without reading the entire file.",
-    parameters: z.object({
+    inputSchema: z.object({
       file_id: z
         .string()
         .describe(
@@ -282,7 +257,7 @@ function createGetFilePreviewTool(registry: FileReferenceRegistry) {
       "Specify file_id as the UUID from list_attached_files or the exact filename. " +
       "Returns the file's initial preview (first ~2000 chars) or its " +
       "LLM-generated summary if available. Includes file metadata.",
-    parameters: z.object({
+    inputSchema: z.object({
       file_id: z
         .string()
         .describe(
@@ -346,7 +321,7 @@ function createExtractFileContentTool(registry: FileReferenceRegistry) {
       "- TEXT/CODE: Use page_range as line range for targeted reading\n\n" +
       "For video extraction, the result includes images (frames) that will be visible to you. " +
       "Always call list_attached_files first to discover file IDs.",
-    parameters: z.object({
+    inputSchema: z.object({
       file_id: z
         .string()
         .describe("File ID (UUID) or exact filename from list_attached_files"),
@@ -456,23 +431,27 @@ function createExtractFileContentTool(registry: FileReferenceRegistry) {
         };
       }
     },
-    experimental_toToolResultContent: (result) => {
-      const parts: ToolResultContentPart[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    toModelOutput: ({ output }: any) => {
+      const parts: Array<
+        | { type: "text"; text: string }
+        | { type: "image-data"; data: string; mediaType: string }
+      > = [];
 
       // Add text content
-      if (result.text) {
-        parts.push({ type: "text", text: result.text });
-      } else if (result.error) {
-        parts.push({ type: "text", text: `Error: ${result.error}` });
+      if (output.text) {
+        parts.push({ type: "text", text: output.text });
+      } else if (output.error) {
+        parts.push({ type: "text", text: `Error: ${output.error}` });
       }
 
       // Add images as image content parts so the LLM can see them
-      if (result._images && result._images.length > 0) {
-        for (const img of result._images) {
+      if (output._images && output._images.length > 0) {
+        for (const img of output._images) {
           parts.push({
-            type: "image",
+            type: "image-data",
             data: img.toString("base64"),
-            mimeType: "image/jpeg",
+            mediaType: "image/jpeg",
           });
         }
       }
@@ -482,7 +461,7 @@ function createExtractFileContentTool(registry: FileReferenceRegistry) {
         parts.push({ type: "text", text: "(No content extracted)" });
       }
 
-      return parts;
+      return { type: "content" as const, value: parts };
     },
   });
 }

@@ -19,6 +19,23 @@ export enum AIProviderName {
   MISTRAL = "mistral",
   LITELLM = "litellm",
   SAGEMAKER = "sagemaker",
+  DEEPSEEK = "deepseek",
+  NVIDIA_NIM = "nvidia-nim",
+  LM_STUDIO = "lm-studio",
+  LLAMACPP = "llamacpp",
+  XAI = "xai",
+  GROQ = "groq",
+  COHERE = "cohere",
+  TOGETHER_AI = "together-ai",
+  FIREWORKS = "fireworks",
+  PERPLEXITY = "perplexity",
+  CLOUDFLARE = "cloudflare",
+  REPLICATE = "replicate",
+  VOYAGE = "voyage",
+  JINA = "jina",
+  STABILITY = "stability",
+  IDEOGRAM = "ideogram",
+  RECRAFT = "recraft",
   AUTO = "auto",
 }
 
@@ -28,22 +45,39 @@ export enum AIProviderName {
  */
 export enum OpenRouterModels {
   // Anthropic Claude models
-  CLAUDE_3_5_SONNET = "anthropic/claude-3-5-sonnet",
+  CLAUDE_OPUS_4_6 = "anthropic/claude-opus-4.6",
+  CLAUDE_SONNET_4_6 = "anthropic/claude-sonnet-4.6",
+  CLAUDE_SONNET_4_5 = "anthropic/claude-sonnet-4.5",
+  CLAUDE_HAIKU_4_5 = "anthropic/claude-haiku-4.5",
+  CLAUDE_3_7_SONNET = "anthropic/claude-3.7-sonnet",
+  // anthropic/claude-3-5-sonnet was retired by OpenRouter in late 2025 and
+  // is no longer reachable through any of their endpoints, so the entry is
+  // dropped here. Callers should switch to CLAUDE_3_7_SONNET (or a newer
+  // 4.x entry above).
   CLAUDE_3_5_HAIKU = "anthropic/claude-3-5-haiku",
   CLAUDE_3_OPUS = "anthropic/claude-3-opus",
   // OpenAI models
+  GPT_5_2 = "openai/gpt-5.2",
+  GPT_5 = "openai/gpt-5",
   GPT_4O = "openai/gpt-4o",
   GPT_4O_MINI = "openai/gpt-4o-mini",
   GPT_4_TURBO = "openai/gpt-4-turbo",
   // Google models
+  GEMINI_3_1_PRO_PREVIEW = "google/gemini-3.1-pro-preview",
+  GEMINI_3_FLASH_PREVIEW = "google/gemini-3-flash-preview",
+  GEMINI_2_5_FLASH = "google/gemini-2.5-flash",
+  GEMINI_2_5_FLASH_LITE = "google/gemini-2.5-flash-lite",
   GEMINI_2_0_FLASH = "google/gemini-2.0-flash",
-  GEMINI_1_5_PRO = "google/gemini-1.5-pro",
   // Meta Llama models
   LLAMA_3_1_70B = "meta-llama/llama-3.1-70b-instruct",
   LLAMA_3_1_8B = "meta-llama/llama-3.1-8b-instruct",
   // Mistral models
   MISTRAL_LARGE = "mistralai/mistral-large",
   MIXTRAL_8X7B = "mistralai/mixtral-8x7b-instruct",
+  // DeepSeek models
+  DEEPSEEK_R1 = "deepseek/deepseek-r1",
+  // xAI models
+  GROK_4_1_FAST = "xai/grok-4.1-fast",
 }
 
 /**
@@ -54,7 +88,11 @@ export enum BedrockModels {
   // ANTHROPIC CLAUDE MODELS
   // ============================================================================
 
-  // Claude 4.5 Series (Latest - September-November 2025)
+  // Claude 4.6 Series (Latest - February 2026)
+  CLAUDE_4_6_OPUS = "anthropic.claude-opus-4-6-v1:0",
+  CLAUDE_4_6_SONNET = "anthropic.claude-sonnet-4-6",
+
+  // Claude 4.5 Series (September-November 2025)
   CLAUDE_4_5_OPUS = "anthropic.claude-opus-4-5-20251124-v1:0",
   CLAUDE_4_5_SONNET = "anthropic.claude-sonnet-4-5-20250929-v1:0",
   CLAUDE_4_5_HAIKU = "anthropic.claude-haiku-4-5-20251001-v1:0",
@@ -64,14 +102,19 @@ export enum BedrockModels {
   CLAUDE_4_SONNET = "anthropic.claude-sonnet-4-20250514-v1:0",
 
   // Claude 3.7 Series
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_4_6_SONNET instead. */
   CLAUDE_3_7_SONNET = "anthropic.claude-3-7-sonnet-20250219-v1:0",
 
   // Claude 3.5 Series
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_4_6_SONNET instead. */
   CLAUDE_3_5_SONNET = "anthropic.claude-3-5-sonnet-20241022-v1:0",
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_4_6_SONNET instead. */
   CLAUDE_3_5_HAIKU = "anthropic.claude-3-5-haiku-20241022-v1:0",
 
   // Claude 3 Series (Legacy support)
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_4_6_SONNET instead. */
   CLAUDE_3_SONNET = "anthropic.claude-3-sonnet-20240229-v1:0",
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_4_6_SONNET instead. */
   CLAUDE_3_HAIKU = "anthropic.claude-3-haiku-20240307-v1:0",
 
   // ============================================================================
@@ -191,21 +234,86 @@ export enum BedrockModels {
   // AI21 Labs Models
   JAMBA_1_5_LARGE = "ai21.jamba-1-5-large-v1:0",
   JAMBA_1_5_MINI = "ai21.jamba-1-5-mini-v1:0",
+
+  // ============================================================================
+  // NEW PROVIDERS (February 2026)
+  // ============================================================================
+
+  // Writer Models
+  WRITER_PALMYRA_X5 = "writer.palmyra-x5-v1:0",
+  WRITER_PALMYRA_X4 = "writer.palmyra-x4-v1:0",
+
+  // MiniMax Models
+  MINIMAX_M2_1 = "minimax.minimax-m2.1",
+  MINIMAX_M2 = "minimax.minimax-m2",
+
+  // Moonshot AI (Kimi) Models
+  KIMI_K2_THINKING = "moonshot.kimi-k2-thinking",
+  KIMI_K2_5 = "moonshotai.kimi-k2.5",
+
+  // NVIDIA Nemotron Models
+  NVIDIA_NEMOTRON_NANO_3_30B = "nvidia.nemotron-nano-3-30b",
+  NVIDIA_NEMOTRON_NANO_12B_V2 = "nvidia.nemotron-nano-12b-v2",
+  NVIDIA_NEMOTRON_NANO_9B_V2 = "nvidia.nemotron-nano-9b-v2",
+
+  // OpenAI Open Source Models (Apache 2.0)
+  OPENAI_GPT_OSS_120B = "openai.gpt-oss-120b-1:0",
+  OPENAI_GPT_OSS_20B = "openai.gpt-oss-20b-1:0",
+
+  // Z.AI GLM Models
+  GLM_4_7 = "zai.glm-4.7",
+  GLM_4_7_FLASH = "zai.glm-4.7-flash",
+
+  // Cohere Embedding & Reranking
+  COHERE_EMBED_ENGLISH_V3 = "cohere.embed-english-v3",
+  COHERE_EMBED_MULTILINGUAL_V3 = "cohere.embed-multilingual-v3",
+  COHERE_EMBED_V4 = "cohere.embed-v4:0",
+  COHERE_RERANK_V3_5 = "cohere.rerank-v3-5:0",
+
+  // Amazon Rerank
+  AMAZON_RERANK_V1 = "amazon.rerank-v1:0",
+
+  // Mistral Devstral 2
+  DEVSTRAL_2_123B = "mistral.devstral-2-123b",
 }
 
 /**
  * Supported Models for OpenAI
  */
 export enum OpenAIModels {
-  // GPT-5.2 Series (Released December 11, 2025) - Latest flagship models
+  // GPT-5.3 Series (Released February 2026) - Latest coding models
+  GPT_5_3_CODEX = "gpt-5.3-codex",
+
+  // GPT-5.4 Series (Released March 2026) - Latest flagship models
+  GPT_5_4 = "gpt-5.4",
+  GPT_5_4_MINI = "gpt-5.4-mini",
+  GPT_5_4_NANO = "gpt-5.4-nano",
+  GPT_5_4_PRO = "gpt-5.4-pro",
+
+  // GPT-5.2 Series (Released December 11, 2025) - Flagship models
   GPT_5_2 = "gpt-5.2",
   GPT_5_2_CHAT_LATEST = "gpt-5.2-chat-latest",
   GPT_5_2_PRO = "gpt-5.2-pro",
+  GPT_5_2_CODEX = "gpt-5.2-codex",
+
+  // GPT-5.1 Series (Released October 2025)
+  GPT_5_1 = "gpt-5.1",
+  GPT_5_1_CHAT_LATEST = "gpt-5.1-chat-latest",
+  GPT_5_1_CODEX = "gpt-5.1-codex",
+  GPT_5_1_CODEX_MAX = "gpt-5.1-codex-max",
+  GPT_5_1_CODEX_MINI = "gpt-5.1-codex-mini",
 
   // GPT-5 Series (Released August 7, 2025)
   GPT_5 = "gpt-5",
   GPT_5_MINI = "gpt-5-mini",
   GPT_5_NANO = "gpt-5-nano",
+  GPT_5_PRO = "gpt-5-pro",
+  GPT_5_CHAT_LATEST = "gpt-5-chat-latest",
+  GPT_5_CODEX = "gpt-5-codex",
+
+  // GPT Open Source (Apache 2.0 - January 2026, Responses API only)
+  GPT_OSS_120B = "gpt-oss-120b",
+  GPT_OSS_20B = "gpt-oss-20b",
 
   // GPT-4.1 Series (Released April 14, 2025)
   GPT_4_1 = "gpt-4.1",
@@ -222,7 +330,9 @@ export enum OpenAIModels {
   O3_PRO = "o3-pro",
   O4_MINI = "o4-mini",
   O1 = "o1",
+  /** @deprecated Turned off Jul 14, 2025. Use GPT_4_1 or O3. */
   O1_PREVIEW = "o1-preview",
+  /** @deprecated Replaced by o3-mini. */
   O1_MINI = "o1-mini",
 
   // GPT-4 Series (Legacy)
@@ -231,6 +341,11 @@ export enum OpenAIModels {
 
   // Legacy Models
   GPT_3_5_TURBO = "gpt-3.5-turbo",
+
+  // Image Generation Models — routed through executeImageGeneration()
+  GPT_IMAGE_1 = "gpt-image-1",
+  DALL_E_3 = "dall-e-3",
+  DALL_E_2 = "dall-e-2",
 }
 
 /**
@@ -238,7 +353,18 @@ export enum OpenAIModels {
  * Note: Azure uses deployment names, these are model identifiers
  */
 export enum AzureOpenAIModels {
-  // GPT-5.1 Series (Latest - December 2025)
+  // GPT-5.2 Series (Latest - December 2025)
+  GPT_5_2 = "gpt-5.2",
+  GPT_5_2_CHAT = "gpt-5.2-chat",
+  GPT_5_2_PRO = "gpt-5.2-pro",
+  GPT_5_2_CODEX = "gpt-5.2-codex",
+
+  // GPT-5.4 Series (March 2026)
+  GPT_5_4 = "gpt-5.4",
+  GPT_5_4_MINI = "gpt-5.4-mini",
+  GPT_5_4_NANO = "gpt-5.4-nano",
+
+  // GPT-5.1 Series (October 2025)
   GPT_5_1 = "gpt-5.1",
   GPT_5_1_CHAT = "gpt-5.1-chat",
   GPT_5_1_CODEX = "gpt-5.1-codex",
@@ -287,7 +413,11 @@ export enum AzureOpenAIModels {
  * Supported Models for Google Vertex AI
  */
 export enum VertexModels {
-  // Claude 4.5 Series (Latest - December 2025)
+  // Claude 4.6 Series (Latest - February 2026)
+  CLAUDE_4_6_OPUS = "claude-opus-4-6",
+  CLAUDE_4_6_SONNET = "claude-sonnet-4-6",
+
+  // Claude 4.5 Series (September-November 2025)
   CLAUDE_4_5_OPUS = "claude-opus-4-5@20251124",
   CLAUDE_4_5_SONNET = "claude-sonnet-4-5@20250929",
   CLAUDE_4_5_HAIKU = "claude-haiku-4-5@20251001",
@@ -297,47 +427,50 @@ export enum VertexModels {
   CLAUDE_4_0_OPUS = "claude-opus-4@20250514",
 
   // Claude 3.7 Series (February 2025)
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_4_6_SONNET instead. */
   CLAUDE_3_7_SONNET = "claude-3-7-sonnet@20250219",
 
   // Claude 3.5 Series (Still supported)
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_4_6_SONNET instead. */
   CLAUDE_3_5_SONNET = "claude-3-5-sonnet-20241022",
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_4_6_SONNET instead. */
   CLAUDE_3_5_HAIKU = "claude-3-5-haiku-20241022",
 
   // Claude 3 Series (Legacy support)
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_4_6_SONNET instead. */
   CLAUDE_3_SONNET = "claude-3-sonnet-20240229",
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_4_6_SONNET instead. */
   CLAUDE_3_OPUS = "claude-3-opus-20240229",
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_4_6_SONNET instead. */
   CLAUDE_3_HAIKU = "claude-3-haiku-20240307",
 
-  // Gemini 3 Series (Preview)
-  /** Gemini 3 Pro - Base model with adaptive thinking */
-  GEMINI_3_PRO = "gemini-3-pro",
-  /** Gemini 3 Pro Preview - Versioned preview (November 2025) */
-  GEMINI_3_PRO_PREVIEW_11_2025 = "gemini-3-pro-preview-11-2025",
-  /** Gemini 3 Pro Latest - Auto-updated alias (always points to latest preview) */
-  GEMINI_3_PRO_LATEST = "gemini-3-pro-latest",
-  /** Gemini 3 Pro Preview - Generic preview (legacy) */
-  GEMINI_3_PRO_PREVIEW = "gemini-3-pro-preview",
-  /** Gemini 3 Flash - Base model with adaptive thinking */
-  GEMINI_3_FLASH = "gemini-3-flash",
-  /** Gemini 3 Flash Preview - Versioned preview */
-  GEMINI_3_FLASH_PREVIEW = "gemini-3-flash-preview",
-  /** Gemini 3 Flash Latest - Auto-updated alias (always points to latest preview) */
-  GEMINI_3_FLASH_LATEST = "gemini-3-flash-latest",
+  // Gemini 3.1 Series (Released March 2026 — all require -preview suffix)
+  GEMINI_3_1_PRO_PREVIEW = "gemini-3.1-pro-preview",
+  GEMINI_3_1_FLASH_LITE_PREVIEW = "gemini-3.1-flash-lite-preview",
+  GEMINI_3_1_FLASH_IMAGE_PREVIEW = "gemini-3.1-flash-image-preview",
+  GEMINI_3_1_PRO_PREVIEW_CUSTOMTOOLS = "gemini-3.1-pro-preview-customtools",
 
-  // Gemini 2.5 Series (Latest - 2025)
+  // Gemini 3 Series (Preview)
+  GEMINI_3_FLASH_PREVIEW = "gemini-3-flash-preview",
+  GEMINI_3_PRO_IMAGE_PREVIEW = "gemini-3-pro-image-preview",
+  /** @deprecated SHUT DOWN March 9, 2026. Migrate to GEMINI_3_1_PRO_PREVIEW. */
+  GEMINI_3_PRO_PREVIEW = "gemini-3-pro-preview",
+
+  // Gemini 2.5 Series (GA)
   GEMINI_2_5_PRO = "gemini-2.5-pro",
   GEMINI_2_5_FLASH = "gemini-2.5-flash",
   GEMINI_2_5_FLASH_LITE = "gemini-2.5-flash-lite",
   GEMINI_2_5_FLASH_IMAGE = "gemini-2.5-flash-image",
 
-  // Gemini 2.0 Series
+  // Gemini 2.0 Series (Deprecated - retiring Jun 2026)
   GEMINI_2_0_FLASH = "gemini-2.0-flash",
   GEMINI_2_0_FLASH_001 = "gemini-2.0-flash-001",
-  /** Gemini 2.0 Flash Lite - GA, production-ready, cost-optimized */
   GEMINI_2_0_FLASH_LITE = "gemini-2.0-flash-lite",
 
-  // Gemini 1.5 Series (Legacy support)
+  // Gemini 1.5 Series (Retired - returns 404)
+  /** @deprecated SHUT DOWN. Returns 404. Use GEMINI_2_5_FLASH or newer. */
   GEMINI_1_5_PRO = "gemini-1.5-pro-002",
+  /** @deprecated SHUT DOWN. Returns 404. Use GEMINI_2_5_FLASH or newer. */
   GEMINI_1_5_FLASH = "gemini-1.5-flash-002",
 }
 
@@ -345,31 +478,43 @@ export enum VertexModels {
  * Supported Models for Google AI Studio
  */
 export enum GoogleAIModels {
-  // Gemini 3 Series
-  GEMINI_3_PRO_PREVIEW = "gemini-3-pro-preview",
-  GEMINI_3_PRO_IMAGE_PREVIEW = "gemini-3-pro-image-preview",
-  GEMINI_3_FLASH = "gemini-3-flash",
-  GEMINI_3_FLASH_PREVIEW = "gemini-3-flash-preview",
+  // Gemini 3.1 Series (Released March 2026 — all require -preview suffix)
+  GEMINI_3_1_PRO_PREVIEW = "gemini-3.1-pro-preview",
+  GEMINI_3_1_FLASH_LITE_PREVIEW = "gemini-3.1-flash-lite-preview",
+  GEMINI_3_1_FLASH_IMAGE_PREVIEW = "gemini-3.1-flash-image-preview",
+  GEMINI_3_1_PRO_PREVIEW_CUSTOMTOOLS = "gemini-3.1-pro-preview-customtools",
 
-  // Gemini 2.5 Series
+  // Gemini 3 Series (Preview)
+  GEMINI_3_FLASH_PREVIEW = "gemini-3-flash-preview",
+  GEMINI_3_PRO_IMAGE_PREVIEW = "gemini-3-pro-image-preview",
+  /** @deprecated SHUT DOWN March 9, 2026. Migrate to GEMINI_3_1_PRO_PREVIEW. */
+  GEMINI_3_PRO_PREVIEW = "gemini-3-pro-preview",
+
+  // Gemini 2.5 Series (GA)
   GEMINI_2_5_PRO = "gemini-2.5-pro",
   GEMINI_2_5_FLASH = "gemini-2.5-flash",
   GEMINI_2_5_FLASH_LITE = "gemini-2.5-flash-lite",
   GEMINI_2_5_FLASH_IMAGE = "gemini-2.5-flash-image",
-  GEMINI_2_5_FLASH_LIVE = "gemini-2.5-flash-native-audio-preview-09-2025",
+  GEMINI_2_5_FLASH_PREVIEW_TTS = "gemini-2.5-flash-preview-tts",
+  GEMINI_2_5_PRO_PREVIEW_TTS = "gemini-2.5-pro-preview-tts",
 
-  // Gemini 2.0 Series
+  // Gemini 2.0 Series (Deprecated - retiring Jun 2026)
+  /** @deprecated Retiring June 1, 2026. Use GEMINI_2_5_FLASH instead. */
   GEMINI_2_0_FLASH = "gemini-2.0-flash",
   GEMINI_2_0_FLASH_001 = "gemini-2.0-flash-001",
   GEMINI_2_0_FLASH_LITE = "gemini-2.0-flash-lite",
   GEMINI_2_0_FLASH_IMAGE = "gemini-2.0-flash-preview-image-generation",
 
-  // Gemini 1.5 Series (Legacy)
+  // Gemini 1.5 Series (Retired - returns 404)
+  /** @deprecated SHUT DOWN. Returns 404. Use GEMINI_2_5_FLASH or newer. */
   GEMINI_1_5_PRO = "gemini-1.5-pro",
+  /** @deprecated SHUT DOWN. Returns 404. Use GEMINI_2_5_FLASH or newer. */
   GEMINI_1_5_FLASH = "gemini-1.5-flash",
 
   // Embedding Models
   GEMINI_EMBEDDING = "gemini-embedding-001",
+  GEMINI_EMBEDDING_2_PREVIEW = "gemini-embedding-2-preview",
+  /** @deprecated SHUT DOWN Jan 14, 2026. Use GEMINI_EMBEDDING instead. */
   TEXT_EMBEDDING_004 = "text-embedding-004",
 }
 
@@ -377,7 +522,11 @@ export enum GoogleAIModels {
  * Supported Models for Anthropic (Direct API)
  */
 export enum AnthropicModels {
-  // Claude 4.5 Series (Latest - September-November 2025)
+  // Claude 4.6 Series (Latest - February 2026)
+  CLAUDE_OPUS_4_6 = "claude-opus-4-6",
+  CLAUDE_SONNET_4_6 = "claude-sonnet-4-6",
+
+  // Claude 4.5 Series (September-November 2025)
   CLAUDE_OPUS_4_5 = "claude-opus-4-5-20251101",
   CLAUDE_SONNET_4_5 = "claude-sonnet-4-5-20250929",
   CLAUDE_4_5_HAIKU = "claude-haiku-4-5-20251001",
@@ -390,15 +539,21 @@ export enum AnthropicModels {
   CLAUDE_SONNET_4_0 = "claude-sonnet-4-20250514",
 
   // Claude 3.7 Series (Legacy)
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_SONNET_4_6 instead. */
   CLAUDE_SONNET_3_7 = "claude-3-7-sonnet-20250219",
 
   // Claude 3.5 Series (Legacy)
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_SONNET_4_6 instead. */
   CLAUDE_3_5_SONNET = "claude-3-5-sonnet-20241022",
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_SONNET_4_6 instead. */
   CLAUDE_3_5_HAIKU = "claude-3-5-haiku-20241022",
 
   // Claude 3 Series (Legacy - Deprecated)
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_SONNET_4_6 instead. */
   CLAUDE_3_SONNET = "claude-3-sonnet-20240229",
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_SONNET_4_6 instead. */
   CLAUDE_3_OPUS = "claude-3-opus-20240229",
+  /** @deprecated Retired from Anthropic API. Use CLAUDE_SONNET_4_6 instead. */
   CLAUDE_3_HAIKU = "claude-3-haiku-20240307",
 }
 
@@ -444,10 +599,29 @@ export enum MistralModels {
   VOXTRAL_SMALL_LATEST = "voxtral-small-latest",
   VOXTRAL_MINI_LATEST = "voxtral-mini-latest",
 
+  // Devstral 2 Series (December 2025)
+  DEVSTRAL_2 = "devstral-2512",
+  DEVSTRAL_SMALL_2 = "devstral-small-2512",
+
+  // Magistral Versioned (September 2025)
+  MAGISTRAL_MEDIUM_2509 = "magistral-medium-2509",
+  MAGISTRAL_SMALL_2509 = "magistral-small-2509",
+
+  // Voxtral Transcribe 2 (February 2026)
+  VOXTRAL_MINI_TRANSCRIBE_2 = "voxtral-mini-2602",
+
+  // OCR (December 2025)
+  MISTRAL_OCR_3 = "mistral-ocr-2512",
+  MISTRAL_OCR_LATEST = "mistral-ocr-latest",
+
   // Specialized Models
   MISTRAL_NEMO = "mistral-nemo",
   MISTRAL_EMBED = "mistral-embed",
   MISTRAL_MODERATION_LATEST = "mistral-moderation-latest",
+
+  // Mistral Small 4 Series (June 2026)
+  MISTRAL_SMALL_4 = "mistral-small-2603",
+  MISTRAL_SMALL_CREATIVE = "mistral-small-creative",
 }
 
 /**
@@ -548,6 +722,32 @@ export enum OllamaModels {
 
   // Enterprise Models
   COMMAND_R_PLUS = "command-r-plus:104b",
+
+  // Z.AI GLM-5 - Flagship reasoning model (February 2026)
+  GLM_5_LATEST = "glm-5:latest",
+
+  // Kimi-K2.5 - Moonshot AI multimodal agentic model
+  KIMI_K2_5_LATEST = "kimi-k2.5:latest",
+
+  // Qwen 3.5 - Multimodal native agents (February 2026)
+  QWEN3_5_LATEST = "qwen3.5:latest",
+
+  // Qwen3-Coder - Coding-focused agentic model
+  QWEN3_CODER_LATEST = "qwen3-coder:latest",
+  QWEN3_CODER_30B = "qwen3-coder:30b",
+
+  // DeepSeek-V3.2 - Enhanced reasoning
+  DEEPSEEK_V3_2_LATEST = "deepseek-v3.2:latest",
+
+  // NVIDIA Nemotron 3 Nano - Hybrid MoE, 1M context
+  NEMOTRON_3_NANO_LATEST = "nemotron-3-nano:latest",
+  NEMOTRON_3_NANO_30B = "nemotron-3-nano:30b",
+
+  // SmolLM3 - Compact dual-mode reasoning (HuggingFace)
+  SMOLLM3_3B = "smollm3:3b",
+
+  // GPT-OSS - Open-source GPT (Apache 2.0)
+  GPT_OSS_LATEST = "gpt-oss:latest",
 }
 
 /**
@@ -605,6 +805,20 @@ export enum LiteLLMModels {
   // AWS Bedrock via LiteLLM
   BEDROCK_CLAUDE_3_5_SONNET = "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
   BEDROCK_CLAUDE_3_HAIKU = "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+
+  // OpenAI GPT-5.2 via LiteLLM
+  OPENAI_GPT_5_2 = "openai/gpt-5.2",
+  OPENAI_GPT_5_2_CODEX = "openai/gpt-5.2-codex",
+
+  // Anthropic Claude 4.6 via LiteLLM
+  ANTHROPIC_CLAUDE_OPUS_4_6 = "anthropic/claude-opus-4-6",
+  ANTHROPIC_CLAUDE_SONNET_4_6 = "anthropic/claude-sonnet-4-6",
+
+  // Google Gemini 3 via LiteLLM
+  GEMINI_3_1_PRO = "gemini/gemini-3.1-pro-preview",
+
+  // xAI via LiteLLM
+  XAI_GROK_4_1_FAST = "xai/grok-4.1-fast",
 
   // Perplexity AI via LiteLLM
   PERPLEXITY_SONAR_PRO = "perplexity/sonar-pro",
@@ -700,6 +914,22 @@ export enum HuggingFaceModels {
   // BLOOM
   BLOOM_7B1 = "bigscience/bloom-7b1",
   BLOOM_1B3 = "bigscience/bloom-1b3",
+
+  // Z.AI GLM-5 (February 2026)
+  GLM_5 = "zai-org/GLM-5",
+
+  // Qwen 3.5 Multimodal (February 2026)
+  QWEN_3_5_397B_A17B = "Qwen/Qwen3.5-397B-A17B",
+
+  // NVIDIA Nemotron 3 Nano
+  NEMOTRON_3_NANO_30B = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+
+  // HuggingFace SmolLM3
+  SMOLLM3_3B = "HuggingFaceTB/SmolLM3-3B",
+
+  // Falcon 3 Series
+  FALCON_3_7B_INSTRUCT = "tiiuae/Falcon3-7B-Instruct",
+  FALCON_3_10B_INSTRUCT = "tiiuae/Falcon3-10B-Instruct",
 }
 
 /**
@@ -732,6 +962,12 @@ export enum SageMakerModels {
   FALCON_3_10B = "tii-falcon-3-10b-instruct",
   FALCON_40B = "tii-falcon-40b-instruct",
   FALCON_180B = "tii-falcon-180b",
+
+  // NVIDIA Nemotron 3 Nano (February 2026)
+  NEMOTRON_3_NANO_30B = "nvidia-nemotron-3-nano-30b",
+
+  // Qwen3 VL - Vision-language
+  QWEN3_VL_8B = "qwen3-vl-8b-instruct",
 }
 
 /**
@@ -767,6 +1003,13 @@ export enum ErrorCategory {
   CONFIGURATION = "configuration",
   EXECUTION = "execution",
   SYSTEM = "system",
+  /**
+   * Caller-initiated cancellation via AbortSignal. Distinct from system errors
+   * — represents a user/control-plane decision, not a SDK or provider failure.
+   * Consumers can branch on this category to differentiate "user cancelled"
+   * from "server error" without resorting to message-string matching.
+   */
+  ABORT = "abort",
 }
 
 // Error severity levels
@@ -776,3 +1019,364 @@ export enum ErrorSeverity {
   HIGH = "high",
   CRITICAL = "critical",
 }
+
+// ============================================================================
+// CLAUDE SUBSCRIPTION ENUMS
+// ============================================================================
+
+// Note: ClaudeSubscriptionTier and AnthropicAuthMethod are defined as type
+// aliases in types/subscriptionTypes.ts (canonical definitions).
+// The type aliases support all 6 tier values: free, pro, max, max_5, max_20, api.
+
+/**
+ * Beta features available for Anthropic API
+ *
+ * @description Beta feature flags that can be enabled for enhanced functionality:
+ * - CLAUDE_CODE: Claude Code beta features for development workflows
+ * - INTERLEAVED_THINKING: Enables interleaved thinking in responses
+ * - FINE_GRAINED_STREAMING: Fine-grained tool streaming for better UX
+ */
+export enum AnthropicBetaFeature {
+  CLAUDE_CODE = "claude-code-20250219",
+  INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14",
+  FINE_GRAINED_STREAMING = "fine-grained-tool-streaming-2025-05-14",
+}
+
+/**
+ * Supported Models for DeepSeek
+ * Docs: https://api-docs.deepseek.com/quick_start/pricing
+ */
+export enum DeepSeekModels {
+  /** General-purpose chat (DeepSeek-V3) */
+  DEEPSEEK_CHAT = "deepseek-chat",
+  /** Reasoning model (DeepSeek-R1) — exposes reasoning_content */
+  DEEPSEEK_REASONER = "deepseek-reasoner",
+}
+
+/**
+ * Selected NVIDIA NIM Models
+ * Full catalog: https://build.nvidia.com/models
+ * Note: NIM hosts hundreds of models; pass arbitrary IDs via --model.
+ */
+export enum NvidiaNimModels {
+  // Meta Llama
+  LLAMA_3_3_70B_INSTRUCT = "meta/llama-3.3-70b-instruct",
+  LLAMA_3_1_405B_INSTRUCT = "meta/llama-3.1-405b-instruct",
+  LLAMA_3_1_70B_INSTRUCT = "meta/llama-3.1-70b-instruct",
+  LLAMA_3_2_90B_VISION = "meta/llama-3.2-90b-vision-instruct",
+  LLAMA_3_2_11B_VISION = "meta/llama-3.2-11b-vision-instruct",
+  // NVIDIA Nemotron (reasoning)
+  NEMOTRON_SUPER_49B = "nvidia/llama-3.3-nemotron-super-49b-v1",
+  NEMOTRON_NANO_8B = "nvidia/llama-3.1-nemotron-nano-8b-v1",
+  NEMOTRON_70B_INSTRUCT = "nvidia/llama-3.1-nemotron-70b-instruct",
+  // DeepSeek hosted on NIM
+  DEEPSEEK_R1 = "deepseek-ai/deepseek-r1",
+  DEEPSEEK_R1_DISTILL_LLAMA_70B = "deepseek-ai/deepseek-r1-distill-llama-70b",
+  // Mistral / Mixtral
+  MIXTRAL_8X22B_INSTRUCT = "mistralai/mixtral-8x22b-instruct-v0.1",
+  MIXTRAL_8X7B_INSTRUCT = "mistralai/mixtral-8x7b-instruct-v0.1",
+  // Microsoft Phi
+  PHI_4 = "microsoft/phi-4",
+  // Google Gemma
+  GEMMA_3_27B_IT = "google/gemma-3-27b-it",
+  // Z.AI GLM
+  GLM_4_5 = "z-ai/glm4.5",
+}
+
+/**
+ * LM Studio loads any GGUF model the user has downloaded.
+ * Default: empty string → triggers /v1/models auto-discovery.
+ */
+export enum LMStudioModels {
+  /** Sentinel value — triggers auto-discovery from /v1/models */
+  AUTO_DISCOVER = "",
+}
+
+/**
+ * llama.cpp serves a single model loaded at server startup.
+ * Default: empty string → uses whatever is loaded.
+ */
+export enum LlamaCppModels {
+  /** Sentinel value — uses the model loaded by the llama-server process */
+  AUTO_DISCOVER = "",
+}
+
+/**
+ * xAI Grok models — accessible at api.x.ai/v1 (OpenAI-compatible).
+ * @see https://docs.x.ai/docs/models
+ */
+export enum XaiModels {
+  /** Latest Grok 3 — flagship; best for complex reasoning */
+  GROK_3 = "grok-3",
+  /** Grok 3 Mini — faster + cheaper variant of Grok 3 */
+  GROK_3_MINI = "grok-3-mini",
+  /** Grok 2 latest — previous flagship; still supported */
+  GROK_2_LATEST = "grok-2-latest",
+  /** Grok 2 Vision — multimodal (text + images) */
+  GROK_2_VISION_LATEST = "grok-2-vision-latest",
+  /** Grok beta — pre-release / experimental access */
+  GROK_BETA = "grok-beta",
+}
+
+/**
+ * Groq-hosted models — Llama / Mistral / Gemma at sub-100ms inference.
+ * @see https://console.groq.com/docs/models
+ */
+export enum GroqModels {
+  /** Llama 3.3 70B Versatile — production default */
+  LLAMA_3_3_70B_VERSATILE = "llama-3.3-70b-versatile",
+  /** Llama 3.1 8B Instant — low-latency tier */
+  LLAMA_3_1_8B_INSTANT = "llama-3.1-8b-instant",
+  /** Gemma 2 9B IT — Google's lightweight instruct model */
+  GEMMA_2_9B_IT = "gemma2-9b-it",
+  /** Mixtral 8x7B 32K — Mistral's MoE model */
+  MIXTRAL_8X7B_32768 = "mixtral-8x7b-32768",
+  /** Llama Guard 3 8B — safety classifier */
+  LLAMA_GUARD_3_8B = "llama-guard-3-8b",
+  /** Llama 3.2 90B Vision Preview — multimodal */
+  LLAMA_3_2_90B_VISION_PREVIEW = "llama-3.2-90b-vision-preview",
+  /** Llama 3.2 11B Vision Preview — smaller multimodal */
+  LLAMA_3_2_11B_VISION_PREVIEW = "llama-3.2-11b-vision-preview",
+}
+
+/**
+ * Cohere Command + Embed models.
+ * @see https://docs.cohere.com/docs/models
+ *
+ * Note: bare aliases `command-r` and `command-r-plus` were retired on
+ * September 15, 2025. Use the dated variants instead.
+ */
+export enum CohereModels {
+  /** Command A (March 2025) — current flagship chat model */
+  COMMAND_A = "command-a-03-2025",
+  /** Command A Reasoning (Aug 2025) — explicit reasoning traces */
+  COMMAND_A_REASONING = "command-a-reasoning-08-2025",
+  /** Command R+ dated (Aug 2024) — last supported R+ variant */
+  COMMAND_R_PLUS = "command-r-plus-08-2024",
+  /** Command R dated (Aug 2024) — last supported R variant */
+  COMMAND_R = "command-r-08-2024",
+  /** Command R7B (Dec 2024) — most compact */
+  COMMAND_R7B = "command-r7b-12-2024",
+  /** Embed v3 multilingual */
+  EMBED_MULTILINGUAL_V3 = "embed-multilingual-v3.0",
+  /** Embed v3 English */
+  EMBED_ENGLISH_V3 = "embed-english-v3.0",
+  /** Rerank v3 multilingual */
+  RERANK_MULTILINGUAL_V3 = "rerank-multilingual-v3.0",
+  /** Rerank v3 English */
+  RERANK_ENGLISH_V3 = "rerank-english-v3.0",
+}
+
+/**
+ * Together AI hosted models — open-model gateway.
+ * @see https://docs.together.ai/docs/serverless-models
+ */
+export enum TogetherAIModels {
+  /** Llama 3.3 70B Instruct Turbo — production default */
+  LLAMA_3_3_70B_INSTRUCT_TURBO = "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+  /** Llama 3.1 405B Instruct Turbo — flagship size */
+  LLAMA_3_1_405B_INSTRUCT_TURBO = "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo",
+  /** Llama 3.1 70B Instruct Turbo */
+  LLAMA_3_1_70B_INSTRUCT_TURBO = "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+  /** Llama 3.1 8B Instruct Turbo — fastest */
+  LLAMA_3_1_8B_INSTRUCT_TURBO = "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+  /** Mixtral 8x22B Instruct */
+  MIXTRAL_8X22B_INSTRUCT = "mistralai/Mixtral-8x22B-Instruct-v0.1",
+  /** Mixtral 8x7B Instruct */
+  MIXTRAL_8X7B_INSTRUCT = "mistralai/Mixtral-8x7B-Instruct-v0.1",
+  /** Qwen 2.5 72B Instruct Turbo */
+  QWEN_2_5_72B_INSTRUCT_TURBO = "Qwen/Qwen2.5-72B-Instruct-Turbo",
+  /** Qwen 2.5 Coder 32B Instruct */
+  QWEN_2_5_CODER_32B = "Qwen/Qwen2.5-Coder-32B-Instruct",
+  /** DeepSeek R1 — reasoning */
+  DEEPSEEK_R1 = "deepseek-ai/DeepSeek-R1",
+  /** DeepSeek V3 */
+  DEEPSEEK_V3 = "deepseek-ai/DeepSeek-V3",
+  /** Google Gemma 2 27B IT */
+  GEMMA_2_27B_IT = "google/gemma-2-27b-it",
+  /** WizardLM 2 8x22B */
+  WIZARDLM_2_8X22B = "microsoft/WizardLM-2-8x22B",
+}
+
+/**
+ * Fireworks AI hosted models — fast open-model serving.
+ * @see https://fireworks.ai/models
+ *
+ * Note: the older Llama / Mixtral / Qwen 2.5 generation was rotated
+ * out of Fireworks' serverless tier. Current shipping defaults below.
+ */
+export enum FireworksModels {
+  /** DeepSeek V4 Pro — current general-purpose default */
+  DEEPSEEK_V4_PRO = "accounts/fireworks/models/deepseek-v4-pro",
+  /** GLM 5.1 — Zhipu flagship */
+  GLM_5P1 = "accounts/fireworks/models/glm-5p1",
+  /** GLM 5 — broader coverage */
+  GLM_5 = "accounts/fireworks/models/glm-5",
+  /** Kimi K2.6 — Moonshot flagship */
+  KIMI_K2P6 = "accounts/fireworks/models/kimi-k2p6",
+  /** Kimi K2.5 — preceding Kimi */
+  KIMI_K2P5 = "accounts/fireworks/models/kimi-k2p5",
+  /** GPT-OSS 120B — Apache-2.0 OpenAI weights */
+  GPT_OSS_120B = "accounts/fireworks/models/gpt-oss-120b",
+}
+
+/**
+ * Perplexity Sonar models — built-in web grounding.
+ * @see https://docs.perplexity.ai/guides/model-cards
+ */
+export enum PerplexityModels {
+  /** Sonar — production default with web search */
+  SONAR = "sonar",
+  /** Sonar Pro — better reasoning + larger context */
+  SONAR_PRO = "sonar-pro",
+  /** Sonar Reasoning — explicit reasoning traces */
+  SONAR_REASONING = "sonar-reasoning",
+  /** Sonar Reasoning Pro — flagship reasoning + web */
+  SONAR_REASONING_PRO = "sonar-reasoning-pro",
+  /** Sonar Deep Research — long-form research with citations */
+  SONAR_DEEP_RESEARCH = "sonar-deep-research",
+}
+
+/**
+ * Cloudflare Workers AI models — edge-served open models.
+ * @see https://developers.cloudflare.com/workers-ai/models/
+ */
+export enum CloudflareModels {
+  /** Llama 3.3 70B Instruct (FP8 fast) */
+  LLAMA_3_3_70B_FAST = "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+  /** Llama 3.1 70B Instruct */
+  LLAMA_3_1_70B_INSTRUCT = "@cf/meta/llama-3.1-70b-instruct",
+  /** Llama 3.1 8B Instruct fast */
+  LLAMA_3_1_8B_FAST = "@cf/meta/llama-3.1-8b-instruct-fast",
+  /** Llama 3.2 11B Vision Instruct */
+  LLAMA_3_2_11B_VISION = "@cf/meta/llama-3.2-11b-vision-instruct",
+  /** Mistral 7B Instruct v0.2 */
+  MISTRAL_7B_INSTRUCT_V0_2 = "@cf/mistral/mistral-7b-instruct-v0.2",
+  /** Qwen 1.5 14B Chat AWQ */
+  QWEN_1P5_14B_CHAT_AWQ = "@cf/qwen/qwen1.5-14b-chat-awq",
+  /** Gemma 2B IT */
+  GEMMA_2B_IT_LORA = "@cf/google/gemma-2b-it-lora",
+}
+
+/**
+ * Voyage AI embedding models — top-tier RAG embedders.
+ * @see https://docs.voyageai.com/docs/embeddings
+ */
+export enum VoyageModels {
+  /** Voyage 3.5 — latest general-purpose (default) */
+  VOYAGE_3_5 = "voyage-3.5",
+  /** Voyage 3.5 Lite — smaller / cheaper */
+  VOYAGE_3_5_LITE = "voyage-3.5-lite",
+  /** Voyage 3 Large — flagship size */
+  VOYAGE_3_LARGE = "voyage-3-large",
+  /** Voyage Code 3 — code-tuned */
+  VOYAGE_CODE_3 = "voyage-code-3",
+  /** Voyage Finance 2 — domain-tuned */
+  VOYAGE_FINANCE_2 = "voyage-finance-2",
+  /** Voyage Law 2 — domain-tuned */
+  VOYAGE_LAW_2 = "voyage-law-2",
+  /** Voyage Multilingual 2 */
+  VOYAGE_MULTILINGUAL_2 = "voyage-multilingual-2",
+}
+
+/**
+ * Jina AI embedding + reranking models.
+ * @see https://jina.ai/embeddings/
+ */
+export enum JinaModels {
+  /** Jina Embeddings v3 — flagship multilingual (default) */
+  JINA_EMBEDDINGS_V3 = "jina-embeddings-v3",
+  /** Jina Embeddings v2 base English */
+  JINA_EMBEDDINGS_V2_BASE_EN = "jina-embeddings-v2-base-en",
+  /** Jina Embeddings v2 small English */
+  JINA_EMBEDDINGS_V2_SMALL_EN = "jina-embeddings-v2-small-en",
+  /** Jina Embeddings v2 base code */
+  JINA_EMBEDDINGS_V2_BASE_CODE = "jina-embeddings-v2-base-code",
+  /** Jina Embeddings v2 base multilingual */
+  JINA_EMBEDDINGS_V2_BASE_MULTILINGUAL = "jina-embeddings-v2-base-zh",
+  /** Jina ColBERT v2 — late-interaction retrieval */
+  JINA_COLBERT_V2 = "jina-colbert-v2",
+  /** Jina Reranker v2 base multilingual */
+  JINA_RERANKER_V2_BASE_MULTILINGUAL = "jina-reranker-v2-base-multilingual",
+  /** Jina Reranker v1 turbo English */
+  JINA_RERANKER_V1_TURBO_EN = "jina-reranker-v1-turbo-en",
+}
+
+/**
+ * Stability AI image generation models (api.stability.ai).
+ * @see https://platform.stability.ai/docs/api-reference
+ */
+export enum StabilityModels {
+  /** Stable Image Ultra — flagship quality (default) */
+  STABLE_IMAGE_ULTRA = "stable-image-ultra",
+  /** Stable Image Core — fast tier */
+  STABLE_IMAGE_CORE = "stable-image-core",
+  /** Stable Diffusion 3.5 Large */
+  SD_3_5_LARGE = "sd3.5-large",
+  /** Stable Diffusion 3.5 Large Turbo */
+  SD_3_5_LARGE_TURBO = "sd3.5-large-turbo",
+  /** Stable Diffusion 3.5 Medium */
+  SD_3_5_MEDIUM = "sd3.5-medium",
+}
+
+/**
+ * Ideogram image generation models.
+ * @see https://docs.ideogram.ai/api-reference/api-reference/post-v-1-ideogram-v-3-generate
+ */
+export enum IdeogramModels {
+  /** Ideogram V3 — latest with strong typography (default) */
+  IDEOGRAM_V3 = "V_3",
+  /** Ideogram V2 */
+  IDEOGRAM_V2 = "V_2",
+  /** Ideogram V2 Turbo — fast tier */
+  IDEOGRAM_V2_TURBO = "V_2_TURBO",
+  /** Ideogram V1 */
+  IDEOGRAM_V1 = "V_1",
+}
+
+/**
+ * Recraft image generation models — vector / illustration focus.
+ * @see https://www.recraft.ai/docs
+ */
+export enum RecraftModels {
+  /** Recraft V3 — flagship raster (default) */
+  RECRAFT_V3 = "recraftv3",
+  /** Recraft V3 SVG — vector output */
+  RECRAFT_V3_SVG = "recraftv3-svg",
+  /** Recraft V2 */
+  RECRAFT_V2 = "recraftv2",
+}
+
+/**
+ * Replicate hosted models (LLMs only — image / video / avatar / music
+ * accessed via dedicated handlers).
+ *
+ * Replicate accepts arbitrary `owner/name` or `owner/name:version`; this
+ * enum lists popular LLM defaults. Pass any model id via `--model`.
+ *
+ * @see https://replicate.com/explore
+ */
+export enum ReplicateModels {
+  /** Meta Llama 3.1 405B Instruct */
+  LLAMA_3_1_405B_INSTRUCT = "meta/meta-llama-3.1-405b-instruct",
+  /** Meta Llama 3 70B Instruct (stable; the meta-llama-3.1-70b variant was retired upstream) */
+  LLAMA_3_70B_INSTRUCT = "meta/meta-llama-3-70b-instruct",
+  /** Meta Llama 3 8B Instruct */
+  LLAMA_3_8B_INSTRUCT = "meta/meta-llama-3-8b-instruct",
+  /** Mistral 7B Instruct v0.2 */
+  MISTRAL_7B_INSTRUCT_V02 = "mistralai/mistral-7b-instruct-v0.2",
+  /** Mixtral 8x7B Instruct v0.1 */
+  MIXTRAL_8X7B_INSTRUCT_V01 = "mistralai/mixtral-8x7b-instruct-v0.1",
+}
+
+// ============================================================================
+// ANTHROPIC OAUTH CONSTANTS
+// ============================================================================
+
+/**
+ * Buffer time in milliseconds before token expiry to trigger refresh
+ *
+ * @description Tokens are refreshed 5 minutes before expiry to prevent
+ * authentication failures during ongoing operations
+ */
+export const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000; // 5 minutes

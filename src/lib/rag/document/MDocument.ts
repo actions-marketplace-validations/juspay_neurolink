@@ -26,30 +26,13 @@ import { LLMMetadataExtractor } from "../metadata/metadataExtractor.js";
 import type {
   BaseChunkerConfig,
   Chunk,
-  ChunkingStrategy,
   ChunkParams,
+  ChunkingStrategy,
+  DocumentState,
   DocumentType,
   ExtractParams,
   MDocumentConfig,
-} from "../types.js";
-
-/**
- * Document processing state
- */
-type DocumentState = {
-  /** Raw document content */
-  content: string;
-  /** Document type */
-  type: DocumentType;
-  /** Document metadata */
-  metadata: Record<string, unknown>;
-  /** Generated chunks (after chunking) */
-  chunks: Chunk[];
-  /** Document embeddings (after embedding) */
-  embeddings: number[][];
-  /** Processing history */
-  history: string[];
-};
+} from "../../types/index.js";
 
 /**
  * MDocument class for comprehensive document processing
@@ -274,9 +257,8 @@ export class MDocument {
     }
 
     // Lazy import to avoid circular dependencies
-    const { ProviderFactory } = await import(
-      "../../factories/providerFactory.js"
-    );
+    const { ProviderFactory } =
+      await import("../../factories/providerFactory.js");
 
     logger.debug("[MDocument] Generating embeddings", {
       documentId: this.documentId,
@@ -290,21 +272,14 @@ export class MDocument {
       modelName,
     );
 
-    if (
-      typeof (embeddingProvider as unknown as { embed?: unknown }).embed !==
-      "function"
-    ) {
+    if (typeof embeddingProvider.embed !== "function") {
       throw new Error(`Provider ${provider} does not support embeddings`);
     }
 
     this.state.embeddings = [];
 
     for (const chunk of this.state.chunks) {
-      const embedding = await (
-        embeddingProvider as unknown as {
-          embed: (s: string) => Promise<number[]>;
-        }
-      ).embed(chunk.text);
+      const embedding = await embeddingProvider.embed(chunk.text);
       this.state.embeddings.push(embedding);
       chunk.embedding = embedding;
     }

@@ -5,13 +5,156 @@
  */
 
 import { logger } from "../utils/logger.js";
+import { SpanStatusCode, propagation, context } from "@opentelemetry/api";
+import { tracers } from "../telemetry/tracers.js";
 import type { ProxyAgent } from "undici";
 import { shouldBypassProxy } from "./utils/noProxyUtils.js";
-import type { ParsedProxyConfig } from "../types/utilities.js";
+import type {
+  LangfuseContext,
+  ParsedProxyConfig,
+  ProxyEnvironmentSnapshot,
+} from "../types/index.js";
+import { createHash } from "node:crypto";
+
+async function getLangfuseContext(): Promise<LangfuseContext | undefined> {
+  try {
+    // Dynamic import to avoid hard dependency — getLangfuseContext is only
+    // available when the observability module is loaded.
+    const mod =
+      await import("../services/server/ai/observability/instrumentation.js");
+    return mod.getLangfuseContext?.();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Inject OTel trace context (traceparent/tracestate) and NeuroLink session context
+ * into outgoing request headers. This enables:
+ * - The NeuroLink proxy to link proxy spans as children of the calling SDK's trace
+ * - Conversation-level session/user attribution on proxy spans
+ */
+function mergeTraceHeaders(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Headers {
+  const existingHeaders = new Headers(
+    input instanceof Request ? input.headers : undefined,
+  );
+
+  if (init?.headers) {
+    const initHeaders = new Headers(init.headers);
+    for (const [key, value] of initHeaders.entries()) {
+      existingHeaders.set(key, value);
+    }
+  }
+
+  return existingHeaders;
+}
+
+async function injectTraceContext(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<RequestInit> {
+  const carrier: Record<string, string> = {};
+  propagation.inject(context.active(), carrier);
+
+  // Also inject NeuroLink session context from Langfuse AsyncLocalStorage
+  const langfuseContext = await getLangfuseContext();
+  if (langfuseContext?.sessionId) {
+    carrier["x-neurolink-session-id"] = langfuseContext.sessionId;
+  }
+  if (langfuseContext?.userId) {
+    carrier["x-neurolink-user-id"] = langfuseContext.userId;
+  }
+  if (langfuseContext?.conversationId) {
+    carrier["x-neurolink-conversation-id"] = langfuseContext.conversationId;
+  }
+
+  if (Object.keys(carrier).length === 0) {
+    return init ?? {};
+  }
+
+  const existingHeaders = mergeTraceHeaders(input, init);
+  for (const [key, value] of Object.entries(carrier)) {
+    if (!existingHeaders.has(key)) {
+      existingHeaders.set(key, value);
+    }
+  }
+
+  return { ...init, headers: existingHeaders };
+}
+
+const fetchTracer = tracers.http;
+
+/**
+ * Extract hostname from a URL string for safe logging (no auth tokens or paths).
+ * Returns "[unknown]" if parsing fails.
+ */
+function extractHostname(url: string | URL | RequestInfo): string {
+  try {
+    const urlStr =
+      typeof url === "string"
+        ? url
+        : url instanceof URL
+          ? url.href
+          : (url as Request).url;
+    const parsed = new URL(urlStr);
+    return parsed.hostname;
+  } catch {
+    return "[unknown]";
+  }
+}
+
+/** Error codes classified as transient (module-scope: the retry path is hot). */
+const TRANSIENT_NETWORK_CODES = new Set([
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "ECONNREFUSED",
+  "EPIPE",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+/**
+ * Classify a fetch failure as a transient network error worth retrying.
+ *
+ * undici's `fetch()` wraps the real failure in `TypeError: fetch failed`
+ * with the actionable code (`ECONNRESET`, `UND_ERR_SOCKET`, ...) on
+ * `error.cause` — sometimes nested another level (e.g. SocketError inside
+ * a ConnectTimeoutError). Walk the cause chain so those are recognized;
+ * checking only the top-level error silently classified every undici
+ * connection death as non-retryable.
+ *
+ * Deliberately NOT retried: `UND_ERR_HEADERS_TIMEOUT` / `UND_ERR_BODY_TIMEOUT`
+ * — those already waited out undici's own long deadline (default 300s), and
+ * replaying them can triple a stall under the caller's wall-clock budget.
+ *
+ * Exported for direct coverage by the no-API test suite.
+ */
+export function isTransientNetworkError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current; depth++) {
+    const err = current as { code?: string; message?: string; cause?: unknown };
+    if (err.code && TRANSIENT_NETWORK_CODES.has(err.code)) {
+      return true;
+    }
+    if (
+      err.message?.includes("socket hang up") ||
+      err.message?.includes("network socket disconnected") ||
+      err.message?.includes("other side closed")
+    ) {
+      return true;
+    }
+    current = err.cause;
+  }
+  return false;
+}
 
 /**
  * Retry-aware fetch wrapper for transient network errors (ECONNRESET, ETIMEDOUT, socket hang up).
  * Protects all LLM API calls and token refreshes that go through createProxyFetch().
+ * Instrumented with OpenTelemetry spans for retry visibility.
  */
 async function fetchWithRetry(
   url: string | URL | RequestInfo,
@@ -19,29 +162,71 @@ async function fetchWithRetry(
   maxRetries = 3,
   baseDelay = 500,
 ): Promise<Response> {
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await fetch(url as RequestInfo | URL, init);
-    } catch (error: unknown) {
-      const err = error as { code?: string; message?: string };
-      const isRetryable =
-        err?.code === "ECONNRESET" ||
-        err?.code === "ETIMEDOUT" ||
-        err?.message?.includes("socket hang up") ||
-        err?.message?.includes("network socket disconnected");
+  const hostname = extractHostname(url);
 
-      if (!isRetryable || attempt === maxRetries) {
-        throw error;
+  return fetchTracer.startActiveSpan(
+    "neurolink.http.fetchWithRetry",
+    async (span) => {
+      span.setAttribute("http.request.max_retries", maxRetries);
+      span.setAttribute("http.request.hostname", hostname);
+      span.setAttribute("http.request.method", init?.method || "GET");
+
+      // eslint-disable-next-line no-useless-assignment
+      let totalAttempts = 0;
+
+      try {
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+          totalAttempts = attempt + 1;
+          try {
+            const response = await fetch(url as RequestInfo | URL, init);
+
+            // Record success attributes
+            span.setAttribute("http.request.total_attempts", totalAttempts);
+            span.setAttribute("http.response.status_code", response.status);
+            span.setStatus({ code: SpanStatusCode.OK });
+
+            return response;
+          } catch (error: unknown) {
+            const isRetryable = isTransientNetworkError(error);
+            const err = error as { code?: string; message?: string };
+
+            if (!isRetryable || attempt === maxRetries) {
+              // Final failure — record on span and rethrow
+              span.setAttribute("http.request.total_attempts", totalAttempts);
+              span.setStatus({
+                code: SpanStatusCode.ERROR,
+                message:
+                  err?.message || err?.code || "fetchWithRetry final failure",
+              });
+              span.recordException(
+                error instanceof Error ? error : new Error(String(error)),
+              );
+              throw error;
+            }
+
+            // Transient error — add retry event and continue loop
+            const delay = baseDelay * Math.pow(2, attempt);
+            span.addEvent("http.request.retry", {
+              "retry.attempt": attempt + 1,
+              "retry.delay_ms": delay,
+              "retry.error": (err?.code || err?.message || String(error)).slice(
+                0,
+                256,
+              ),
+            });
+
+            logger.debug(
+              `[fetchWithRetry] Transient error (${err?.code || err?.message}), retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`,
+            );
+            await new Promise((r) => setTimeout(r, delay));
+          }
+        }
+        throw new Error("fetchWithRetry exhausted"); // unreachable
+      } finally {
+        span.end();
       }
-
-      const delay = baseDelay * Math.pow(2, attempt);
-      logger.debug(
-        `[fetchWithRetry] Transient error (${err?.code || err?.message}), retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`,
-      );
-      await new Promise((r) => setTimeout(r, delay));
-    }
-  }
-  throw new Error("fetchWithRetry exhausted"); // unreachable
+    },
+  );
 }
 
 /**
@@ -89,33 +274,11 @@ const SENSITIVE_HEADERS = new Set([
 ]);
 
 /**
- * Extract all headers as plain object with sensitive values redacted
- */
-function getAllHeaders(
-  headers: HeadersInit | undefined,
-): Record<string, string> {
-  if (!headers) {
-    return {};
-  }
-  const entries: [string, string][] =
-    headers instanceof Headers
-      ? [...headers.entries()]
-      : Array.isArray(headers)
-        ? headers
-        : Object.entries(headers as Record<string, string>);
-  return Object.fromEntries(
-    entries.map(([key, value]) =>
-      SENSITIVE_HEADERS.has(key.toLowerCase())
-        ? [key, `${value.substring(0, 4)}***`]
-        : [key, value],
-    ),
-  );
-}
-
-/**
  * Clone response and read body + headers for debug logging
  */
-async function readResponseBody(response: Response): Promise<{
+async function readResponseBody(
+  response: Response | import("undici").Response,
+): Promise<{
   parsed: unknown;
   size: number;
   type: string;
@@ -192,7 +355,7 @@ function parseProxyUrl(proxyUrl: string): ParsedProxyConfig {
       proxyUrl: safeUrl,
       error,
     });
-    throw new Error(`Invalid proxy URL: ${safeUrl}`);
+    throw new Error(`Invalid proxy URL: ${safeUrl}`, { cause: error });
   }
 }
 
@@ -287,6 +450,301 @@ async function createProxyAgent(proxyUrl: string): Promise<ProxyAgent> {
   }
 }
 
+function sanitizeProxyUrl(url: string | undefined): string {
+  return maskProxyUrl(url) ?? "NOT_SET";
+}
+
+function getTargetUrl(input: RequestInfo | URL): string {
+  return typeof input === "string"
+    ? input
+    : input instanceof URL
+      ? input.href
+      : (input as Request).url;
+}
+
+function createDirectFetchHandler(): typeof fetch {
+  return async (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    const enrichedInit = await injectTraceContext(input, init);
+    const reqId = `req-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+    const startTs = Date.now();
+    const url = getTargetUrl(input);
+
+    if (logger.shouldLog("debug")) {
+      const { size: bodySize, type: bodyType } = parseBody(enrichedInit?.body);
+      logger.debug("[Observability] HTTP request to LLM provider", {
+        requestId: reqId,
+        url,
+        method: enrichedInit?.method || "POST",
+        bodySize,
+        bodyType,
+      });
+    }
+
+    try {
+      const response = await fetchWithRetry(input, enrichedInit);
+
+      if (logger.shouldLog("debug")) {
+        const {
+          parsed: responseBody,
+          size: responseSize,
+          type: responseType,
+          headers: responseHeaders,
+        } = await readResponseBody(response);
+        logger.debug("[Observability] HTTP response from LLM provider", {
+          requestId: reqId,
+          url,
+          status: response.status,
+          statusText: response.statusText,
+          durationMs: Date.now() - startTs,
+          contentLength: responseSize,
+          hasContent: !!responseBody,
+          bodyType: responseType,
+          responseHeaders,
+        });
+      }
+
+      return response;
+    } catch (error: unknown) {
+      logger.debug("[Observability] HTTP request failed", {
+        requestId: reqId,
+        url,
+        error: error instanceof Error ? error.message : String(error),
+        durationMs: Date.now() - startTs,
+      });
+      throw error;
+    }
+  };
+}
+
+async function executeProxiedFetch(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+  proxyEnv: ProxyEnvironmentSnapshot,
+): Promise<Response> {
+  const { httpsProxy, httpProxy, allProxy, socksProxy, noProxy } = proxyEnv;
+  init = await injectTraceContext(input, init);
+  const requestId = `req-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+  const requestStartTime = Date.now();
+  const targetUrl = getTargetUrl(input);
+
+  if (logger.shouldLog("debug")) {
+    const { size: bodySize, type: bodyType } = parseBody(init?.body);
+    logger.debug("[Observability] HTTP request to LLM provider", {
+      requestId,
+      url: targetUrl,
+      method: init?.method || "POST",
+      bodySize,
+      bodyType,
+    });
+  }
+
+  logger.debug(`[Proxy Fetch] ENHANCED REQUEST START`, {
+    requestId,
+    targetUrl,
+    timestamp: new Date().toISOString(),
+    httpProxy: sanitizeProxyUrl(httpProxy),
+    httpsProxy: sanitizeProxyUrl(httpsProxy),
+    allProxy: sanitizeProxyUrl(allProxy),
+    socksProxy: sanitizeProxyUrl(socksProxy),
+    noProxy: noProxy || "NOT_SET",
+    initMethod: init?.method || "GET",
+  });
+
+  // Clone the request before any proxy attempt so that if the proxy path
+  // consumes the body stream and then fails, the fallback still has an intact
+  // body to send.
+  const requestClone = input instanceof Request ? input.clone() : null;
+
+  try {
+    const proxyUrl = selectProxyUrl(targetUrl);
+
+    if (proxyUrl) {
+      const url = new URL(targetUrl);
+      logger.debug(`[Proxy Fetch] 🔗 ENHANCED URL ANALYSIS`, {
+        requestId,
+        targetUrl,
+        urlHostname: url.hostname,
+        urlProtocol: url.protocol,
+        urlPort: url.port,
+        selectedProxyUrl: sanitizeProxyUrl(proxyUrl),
+        timestamp: new Date().toISOString(),
+      });
+      logger.debug(`[Proxy Fetch] 🎯 ENHANCED PROXY AGENT CREATION`, {
+        requestId,
+        proxyUrl: sanitizeProxyUrl(proxyUrl),
+        targetHostname: url.hostname,
+        targetProtocol: url.protocol,
+        aboutToCreateProxyAgent: true,
+        timestamp: new Date().toISOString(),
+      });
+
+      const globalWithCache = globalThis as {
+        __NL_PROXY_AGENT_CACHE__?: Map<string, ProxyAgent>;
+      };
+      if (!globalWithCache.__NL_PROXY_AGENT_CACHE__) {
+        globalWithCache.__NL_PROXY_AGENT_CACHE__ = new Map();
+      }
+      const agentCache: Map<string, ProxyAgent> =
+        globalWithCache.__NL_PROXY_AGENT_CACHE__;
+      const cacheKey = createHash("sha256")
+        .update(maskProxyUrl(proxyUrl) ?? proxyUrl)
+        .digest("hex");
+      const dispatcher =
+        agentCache.get(cacheKey) || (await createProxyAgent(proxyUrl));
+      agentCache.set(cacheKey, dispatcher);
+
+      logger.debug(`[Proxy Fetch] ✅ ENHANCED PROXY AGENT CREATED`, {
+        requestId,
+        hasDispatcher: !!dispatcher,
+        dispatcherType: typeof dispatcher,
+        dispatcherConstructor: dispatcher?.constructor?.name || "unknown",
+        timestamp: new Date().toISOString(),
+      });
+
+      let fetchInput: string | URL;
+      let fetchInit = { ...init };
+
+      if (input instanceof Request) {
+        fetchInput = input.url;
+        fetchInit = {
+          method: input.method,
+          headers: input.headers,
+          body: input.body,
+          ...init,
+        };
+      } else {
+        fetchInput = input;
+      }
+
+      const undici = await import("undici");
+      // undici's fetch types and lib.dom's diverge on iterator helper details,
+      // so the runtime-identical response is typed as either flavor (widening
+      // assertion so control flow keeps the union) and narrowed
+      // (overlap-checked) back to the DOM flavor at the return boundary.
+      const response = (await undici.fetch(fetchInput, {
+        ...fetchInit,
+        dispatcher,
+      } as import("undici").RequestInit)) as
+        | Response
+        | import("undici").Response;
+
+      if (logger.shouldLog("debug")) {
+        const {
+          parsed: responseBody,
+          size: responseSize,
+          type: responseType,
+          headers: responseHeaders,
+        } = await readResponseBody(response);
+        logger.debug("[Observability] HTTP response from LLM provider", {
+          requestId,
+          url: targetUrl,
+          status: response?.status,
+          statusText: response?.statusText,
+          durationMs: Date.now() - requestStartTime,
+          contentLength: responseSize,
+          hasContent: !!responseBody,
+          bodyType: responseType,
+          proxied: true,
+          responseHeaders,
+        });
+      }
+
+      logger.debug(`[Proxy Fetch] ENHANCED PROXY SUCCESS`, {
+        requestId,
+        responseStatus: response?.status,
+        responseOk: response?.ok,
+        proxyUsed: true,
+        timestamp: new Date().toISOString(),
+      });
+
+      return response as Response;
+    }
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+
+    logger.debug("[Observability] HTTP request failed", {
+      requestId,
+      url: targetUrl,
+      error: errorMessage,
+      durationMs: Date.now() - requestStartTime,
+    });
+    logger.debug(`[Proxy Fetch] ENHANCED ERROR ANALYSIS`, {
+      requestId,
+      error: errorMessage,
+      errorType: error instanceof Error ? error.constructor.name : typeof error,
+      willFallback: true,
+      timestamp: new Date().toISOString(),
+    });
+    logger.warn(
+      `[Proxy Fetch] Enhanced proxy failed (${errorMessage}), falling back to direct connection`,
+    );
+  }
+
+  logger.debug(`[Proxy Fetch] ENHANCED FALLBACK TO STANDARD FETCH`, {
+    requestId,
+    fallbackReason: "No proxy configured or proxy failed",
+    timestamp: new Date().toISOString(),
+  });
+
+  // Use the cloned request for the fallback so that the body stream is not
+  // already consumed from the proxy attempt above.
+  const fallbackInput: RequestInfo | URL = (
+    input instanceof Request ? (requestClone ?? input) : input
+  ) as RequestInfo | URL;
+
+  try {
+    const response = await fetchWithRetry(fallbackInput, init);
+
+    if (logger.shouldLog("debug")) {
+      const {
+        parsed: responseBody,
+        size: responseSize,
+        type: responseType,
+        headers: responseHeaders,
+      } = await readResponseBody(response);
+      logger.debug("[Observability] HTTP response from LLM provider", {
+        requestId,
+        url: targetUrl,
+        status: response.status,
+        statusText: response.statusText,
+        durationMs: Date.now() - requestStartTime,
+        contentLength: responseSize,
+        hasContent: !!responseBody,
+        bodyType: responseType,
+        proxied: false,
+        responseHeaders,
+      });
+    }
+
+    return response;
+  } catch (fallbackError: unknown) {
+    const fallbackMessage =
+      fallbackError instanceof Error
+        ? fallbackError.message
+        : String(fallbackError);
+
+    logger.debug("[Observability] HTTP request failed", {
+      requestId,
+      url: targetUrl,
+      error: fallbackMessage,
+      durationMs: Date.now() - requestStartTime,
+    });
+    throw fallbackError;
+  }
+}
+
+function createProxiedFetchHandler(
+  proxyEnv: ProxyEnvironmentSnapshot,
+): typeof fetch {
+  return async (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ): Promise<Response> => executeProxiedFetch(input, init, proxyEnv);
+}
+
 // ==================== ENHANCED PROXY FETCH FUNCTION ====================
 
 /**
@@ -300,12 +758,15 @@ export function createProxyFetch(): typeof fetch {
   const allProxy = process.env.ALL_PROXY || process.env.all_proxy;
   const socksProxy = process.env.SOCKS_PROXY || process.env.socks_proxy;
   const noProxy = process.env.NO_PROXY || process.env.no_proxy;
+  const proxyEnv: ProxyEnvironmentSnapshot = {
+    httpsProxy,
+    httpProxy,
+    allProxy,
+    socksProxy,
+    noProxy,
+  };
 
   // ENHANCED LOGGING: Capture ALL proxy-related environment variables — credentials redacted
-  // Reuse module-level maskProxyUrl, defaulting to "NOT_SET" for undefined values
-  const sanitizeProxyUrl = (url: string | undefined): string =>
-    maskProxyUrl(url) ?? "NOT_SET";
-
   if (logger.shouldLog("debug")) {
     const allProxyRelatedEnvVars = Object.keys(process.env)
       .filter((key) => key.toLowerCase().includes("proxy"))
@@ -334,70 +795,7 @@ export function createProxyFetch(): typeof fetch {
     logger.debug(
       "[Proxy Fetch] No proxy environment variables found - using standard fetch",
     );
-    return async (
-      input: RequestInfo | URL,
-      init?: RequestInit,
-    ): Promise<Response> => {
-      const reqId = `req-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
-      const startTs = Date.now();
-      const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.href
-            : (input as Request).url;
-
-      if (logger.shouldLog("debug")) {
-        const {
-          parsed: requestBody,
-          size: bodySize,
-          type: bodyType,
-        } = parseBody(init?.body);
-        logger.debug("[Observability] HTTP request to LLM provider", {
-          requestId: reqId,
-          url,
-          method: init?.method || "POST",
-          headers: getAllHeaders(init?.headers),
-          body: requestBody,
-          bodySize,
-          bodyType,
-        });
-      }
-
-      try {
-        const response = await fetchWithRetry(input, init);
-
-        if (logger.shouldLog("debug")) {
-          const {
-            parsed: responseBody,
-            size: responseSize,
-            type: responseType,
-            headers: responseHeaders,
-          } = await readResponseBody(response);
-          logger.debug("[Observability] HTTP response from LLM provider", {
-            requestId: reqId,
-            url,
-            status: response.status,
-            statusText: response.statusText,
-            durationMs: Date.now() - startTs,
-            headers: responseHeaders,
-            body: responseBody,
-            bodySize: responseSize,
-            bodyType: responseType,
-          });
-        }
-
-        return response;
-      } catch (error: unknown) {
-        logger.debug("[Observability] HTTP request failed", {
-          requestId: reqId,
-          url,
-          error: error instanceof Error ? error.message : String(error),
-          durationMs: Date.now() - startTs,
-        });
-        throw error;
-      }
-    };
+    return createDirectFetchHandler();
   }
 
   logger.debug(
@@ -409,236 +807,18 @@ export function createProxyFetch(): typeof fetch {
   logger.debug(`[Proxy Fetch] SOCKS_PROXY: ${sanitizeProxyUrl(socksProxy)}`);
   logger.debug(`[Proxy Fetch] NO_PROXY: ${noProxy || "not set"}`);
 
-  // Return enhanced proxy-aware fetch function
-  return async (
-    input: RequestInfo | URL,
-    init?: RequestInit,
-  ): Promise<Response> => {
-    const requestId = `req-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
-    const requestStartTime = Date.now();
-
-    // Determine target URL
-    const targetUrl =
-      typeof input === "string"
-        ? input
-        : input instanceof URL
-          ? input.href
-          : (input as Request).url;
-
-    // Request logging with sensitive header redaction — gated behind debug check
-    if (logger.shouldLog("debug")) {
-      const {
-        parsed: requestBody,
-        size: bodySize,
-        type: bodyType,
-      } = parseBody(init?.body);
-      logger.debug("[Observability] HTTP request to LLM provider", {
-        requestId,
-        url: targetUrl,
-        method: init?.method || "POST",
-        headers: getAllHeaders(init?.headers),
-        body: requestBody,
-        bodySize,
-        bodyType,
-      });
-    }
-
-    logger.debug(`[Proxy Fetch] ENHANCED REQUEST START`, {
-      requestId,
-      targetUrl,
-      timestamp: new Date().toISOString(),
-      httpProxy: sanitizeProxyUrl(httpProxy),
-      httpsProxy: sanitizeProxyUrl(httpsProxy),
-      allProxy: sanitizeProxyUrl(allProxy),
-      socksProxy: sanitizeProxyUrl(socksProxy),
-      initMethod: init?.method || "GET",
-    });
-
-    try {
-      // Enhanced proxy selection with NO_PROXY bypass and multiple protocols
-      const proxyUrl = selectProxyUrl(targetUrl);
-
-      if (proxyUrl) {
-        const url = new URL(targetUrl);
-
-        const sanitizedProxy = sanitizeProxyUrl(proxyUrl);
-        logger.debug(`[Proxy Fetch] 🔗 ENHANCED URL ANALYSIS`, {
-          requestId,
-          targetUrl,
-          urlHostname: url.hostname,
-          urlProtocol: url.protocol,
-          urlPort: url.port,
-          selectedProxyUrl: sanitizedProxy,
-          timestamp: new Date().toISOString(),
-        });
-
-        logger.debug(`[Proxy Fetch] 🎯 ENHANCED PROXY AGENT CREATION`, {
-          requestId,
-          proxyUrl: sanitizedProxy,
-          targetHostname: url.hostname,
-          targetProtocol: url.protocol,
-          aboutToCreateProxyAgent: true,
-          timestamp: new Date().toISOString(),
-        });
-
-        // Create/reuse proxy agent (HTTP/HTTPS/SOCKS)
-        const agentCache: Map<string, ProxyAgent> =
-          (
-            globalThis as unknown as {
-              __NL_PROXY_AGENT_CACHE__?: Map<string, ProxyAgent>;
-            }
-          ).__NL_PROXY_AGENT_CACHE__ ??
-          ((
-            globalThis as unknown as {
-              __NL_PROXY_AGENT_CACHE__: Map<string, ProxyAgent>;
-            }
-          ).__NL_PROXY_AGENT_CACHE__ = new Map());
-        const cacheKey = maskProxyUrl(proxyUrl) ?? proxyUrl; // credentials stripped for key
-        const dispatcher =
-          agentCache.get(cacheKey) || (await createProxyAgent(proxyUrl));
-        agentCache.set(cacheKey, dispatcher);
-
-        logger.debug(`[Proxy Fetch] ✅ ENHANCED PROXY AGENT CREATED`, {
-          requestId,
-          hasDispatcher: !!dispatcher,
-          dispatcherType: typeof dispatcher,
-          dispatcherConstructor: dispatcher?.constructor?.name || "unknown",
-          timestamp: new Date().toISOString(),
-        });
-
-        // Handle Request objects by extracting URL and merging properties
-        let fetchInput: string | URL;
-        let fetchInit = { ...init };
-
-        if (input instanceof Request) {
-          fetchInput = input.url;
-          fetchInit = {
-            method: input.method,
-            headers: input.headers,
-            body: input.body,
-            ...init, // Allow init to override Request properties
-          };
-        } else {
-          fetchInput = input;
-        }
-
-        // Use undici fetch with enhanced dispatcher (supports HTTP/HTTPS/SOCKS)
-        const undici = await import("undici");
-        const response = await undici.fetch(fetchInput, {
-          ...fetchInit,
-          dispatcher: dispatcher,
-        } as unknown as import("undici").RequestInit);
-
-        if (logger.shouldLog("debug")) {
-          const {
-            parsed: responseBody,
-            size: responseSize,
-            type: responseType,
-            headers: responseHeaders,
-          } = await readResponseBody(response as unknown as Response);
-          logger.debug("[Observability] HTTP response from LLM provider", {
-            requestId,
-            url: targetUrl,
-            status: response?.status,
-            statusText: response?.statusText,
-            durationMs: Date.now() - requestStartTime,
-            headers: responseHeaders,
-            body: responseBody,
-            bodySize: responseSize,
-            bodyType: responseType,
-            proxied: true,
-          });
-        }
-
-        logger.debug(`[Proxy Fetch] ENHANCED PROXY SUCCESS`, {
-          requestId,
-          responseStatus: response?.status,
-          responseOk: response?.ok,
-          proxyUsed: true,
-          timestamp: new Date().toISOString(),
-        });
-
-        return response as unknown as Response;
-      }
-    } catch (error: unknown) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-
-      logger.debug("[Observability] HTTP request failed", {
-        requestId,
-        url: targetUrl,
-        error: errorMessage,
-        durationMs: Date.now() - requestStartTime,
-      });
-
-      logger.debug(`[Proxy Fetch] ENHANCED ERROR ANALYSIS`, {
-        requestId,
-        error: errorMessage,
-        errorType:
-          error instanceof Error ? error.constructor.name : typeof error,
-        willFallback: true,
-        timestamp: new Date().toISOString(),
-      });
-
-      logger.warn(
-        `[Proxy Fetch] Enhanced proxy failed (${errorMessage}), falling back to direct connection`,
-      );
-    }
-
-    // Fallback to standard fetch
-    logger.debug(`[Proxy Fetch] ENHANCED FALLBACK TO STANDARD FETCH`, {
-      requestId,
-      fallbackReason: "No proxy configured or proxy failed",
-      timestamp: new Date().toISOString(),
-    });
-
-    try {
-      const response = await fetchWithRetry(input, init);
-
-      if (logger.shouldLog("debug")) {
-        const {
-          parsed: responseBody,
-          size: responseSize,
-          type: responseType,
-          headers: responseHeaders,
-        } = await readResponseBody(response);
-        logger.debug("[Observability] HTTP response from LLM provider", {
-          requestId,
-          url: targetUrl,
-          status: response.status,
-          statusText: response.statusText,
-          durationMs: Date.now() - requestStartTime,
-          headers: responseHeaders,
-          body: responseBody,
-          bodySize: responseSize,
-          bodyType: responseType,
-          proxied: false,
-        });
-      }
-
-      return response;
-    } catch (fallbackError: unknown) {
-      const fallbackMessage =
-        fallbackError instanceof Error
-          ? fallbackError.message
-          : String(fallbackError);
-
-      logger.debug("[Observability] HTTP request failed", {
-        requestId,
-        url: targetUrl,
-        error: fallbackMessage,
-        durationMs: Date.now() - requestStartTime,
-      });
-
-      throw fallbackError;
-    }
-  };
+  return createProxiedFetchHandler(proxyEnv);
 }
 
 /**
  * Mask credentials in a proxy URL for safe logging/reporting.
+ *
+ * Exported so provider-side fetch loggers (lmStudio, llamaCpp, deepseek,
+ * nvidiaNim) can sanitize upstream URLs before emitting warnings — reverse-
+ * proxied deployments can embed credentials or signed query params in the
+ * base URL, and those should never reach application logs verbatim.
  */
-function maskProxyUrl(url: string | null | undefined): string | null {
+export function maskProxyUrl(url: string | null | undefined): string | null {
   if (!url) {
     return null;
   }

@@ -14,7 +14,30 @@
  * - Tabular data display
  */
 
-import type { LogEntry, LogLevel } from "../types/utilities.js";
+import type { LogEntry, LogLevel } from "../types/index.js";
+
+// OTel trace context for log correlation (optional — gracefully no-ops if OTel not initialized)
+let traceApi: typeof import("@opentelemetry/api") | null = null;
+let traceApiPromise: Promise<
+  typeof import("@opentelemetry/api") | null
+> | null = null;
+
+async function getTraceApi(): Promise<
+  typeof import("@opentelemetry/api") | null
+> {
+  if (!traceApiPromise) {
+    traceApiPromise = import("@opentelemetry/api")
+      .then((mod) => {
+        traceApi = mod;
+        return mod;
+      })
+      .catch(() => null);
+  }
+  return traceApiPromise;
+}
+
+// Eagerly kick off the import so the cached value is available for synchronous callers
+void getTraceApi();
 
 // Pre-computed uppercase log levels for performance optimization
 const UPPERCASE_LOG_LEVELS: Record<LogLevel, string> = {
@@ -61,9 +84,19 @@ class NeuroLinkLogger {
 
   /**
    * Clears the event emitter reference.
-   * Should be called when a NeuroLink instance is disposed to prevent memory leaks.
+   * Should be called when a NeuroLink instance is disposed to prevent memory
+   * leaks. Pass the disposing instance's emitter so a short-lived instance
+   * (e.g. a worker sub-agent) only clears the bridge when it actually owns
+   * it — never yanking a host instance's live log bridge.
+   *
+   * @param ifEmitter - When provided, clear only if it is the current emitter
    */
-  clearEventEmitter(): void {
+  clearEventEmitter(ifEmitter?: {
+    emit: (event: string, ...args: unknown[]) => boolean;
+  }): void {
+    if (ifEmitter !== undefined && this.eventEmitter !== ifEmitter) {
+      return;
+    }
     this.eventEmitter = undefined;
   }
 
@@ -113,6 +146,40 @@ class NeuroLinkLogger {
    */
   private getLogPrefix(timestamp: string, level: LogLevel): string {
     return `[${timestamp}] [NEUROLINK:${UPPERCASE_LOG_LEVELS[level]}]`;
+  }
+
+  /**
+   * Extracts current OTel trace context (trace_id, span_id) if available.
+   * Returns empty object if OTel is not initialized or no active span exists.
+   */
+  private getTraceContext(): {
+    trace_id?: string;
+    span_id?: string;
+    trace_flags?: string;
+  } {
+    if (!traceApi) {
+      return {};
+    }
+    try {
+      const span = traceApi.trace.getSpan(traceApi.context.active());
+      if (!span) {
+        return {};
+      }
+      const spanContext = span.spanContext();
+      if (
+        !spanContext ||
+        spanContext.traceId === "00000000000000000000000000000000"
+      ) {
+        return {};
+      }
+      return {
+        trace_id: spanContext.traceId,
+        span_id: spanContext.spanId,
+        trace_flags: String(spanContext.traceFlags),
+      };
+    } catch {
+      return {};
+    }
   }
 
   /**
@@ -187,10 +254,14 @@ class NeuroLinkLogger {
       warn: console.warn,
       error: console.error,
     }[level];
+    const traceCtx = this.getTraceContext();
+    const tracePrefix = traceCtx.trace_id
+      ? ` [trace_id=${traceCtx.trace_id} span_id=${traceCtx.span_id}]`
+      : "";
     if (data !== undefined && data !== null) {
-      logMethod(prefix, message, this.serializeData(data));
+      logMethod(prefix + tracePrefix, message, this.serializeData(data));
     } else {
-      logMethod(prefix, message);
+      logMethod(prefix + tracePrefix, message);
     }
   }
 
@@ -336,6 +407,20 @@ class NeuroLinkLogger {
   }
 
   /**
+   * Logs messages unconditionally using `console.error` (stderr).
+   *
+   * Same semantics as `always()` — bypasses log level checks and debug mode
+   * gating — but targets stderr instead of stdout. Use this for output that
+   * must stay visible (safety warnings, notices) without risking corruption
+   * of machine-readable stdout (e.g. `--format json`).
+   *
+   * @param args - The arguments to log. These are passed directly to `console.error`.
+   */
+  alwaysStderr(...args: unknown[]): void {
+    console.error(...args);
+  }
+
+  /**
    * Displays tabular data unconditionally using `console.table`.
    *
    * Similar to the `always` method, this bypasses log level checks and
@@ -439,6 +524,9 @@ export const logger = {
   always: (...args: unknown[]) => {
     neuroLinkLogger.always(...args);
   },
+  alwaysStderr: (...args: unknown[]) => {
+    neuroLinkLogger.alwaysStderr(...args);
+  },
   table: (data: unknown) => {
     neuroLinkLogger.table(data);
   },
@@ -451,7 +539,9 @@ export const logger = {
   setEventEmitter: (emitter: {
     emit: (event: string, ...args: unknown[]) => boolean;
   }) => neuroLinkLogger.setEventEmitter(emitter),
-  clearEventEmitter: () => neuroLinkLogger.clearEventEmitter(),
+  clearEventEmitter: (ifEmitter?: {
+    emit: (event: string, ...args: unknown[]) => boolean;
+  }) => neuroLinkLogger.clearEventEmitter(ifEmitter),
 };
 
 /**

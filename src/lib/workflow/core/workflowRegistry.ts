@@ -4,17 +4,16 @@
  */
 
 import { logger } from "../../utils/logger.js";
-import type { WorkflowConfig } from "../types.js";
-import { validateForRegistration } from "../utils/workflowValidation.js";
 import type {
+  WorkflowConfig,
   ListOptions,
   RegisterOptions,
   RegisterResult,
   RegistryEntry,
   RegistryStats,
   WorkflowMetadata,
-} from "./types/index.js";
-
+} from "../../types/index.js";
+import { validateForRegistration } from "../utils/workflowValidation.js";
 const functionTag = "WorkflowRegistry";
 
 // ============================================================================
@@ -23,7 +22,7 @@ const functionTag = "WorkflowRegistry";
 
 /**
  * In-memory workflow registry
- * TODO: Consider persistent storage in future phases
+ * TODO(#1179): Consider persistent storage in future phases
  */
 const workflowRegistry = new Map<string, RegistryEntry>();
 

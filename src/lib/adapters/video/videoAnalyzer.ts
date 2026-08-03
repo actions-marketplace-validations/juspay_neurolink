@@ -1,7 +1,7 @@
 /**
  * Video Analysis Handler
  *
- * Provides video analysis using Google's Gemini 2.0 Flash model.
+ * Provides video analysis using Google's Gemini 2.5 Flash model.
  * Supports both Vertex AI and Gemini API providers.
  *
  * @module adapters/video/geminiVideoAnalyzer
@@ -15,22 +15,22 @@ import {
 import { logger } from "../../utils/logger.js";
 import { readFile } from "node:fs/promises";
 import { NeuroLinkError, ErrorFactory } from "../../utils/errorHandling.js";
-import type { CoreMessage } from "ai";
+import type { ModelMessage } from "../../types/index.js";
 
 // ---------------------------------------------------------------------------
 // Shared config
 // ---------------------------------------------------------------------------
 
-const DEFAULT_MODEL = "gemini-2.0-flash";
+const DEFAULT_MODEL = "gemini-2.5-flash";
 const DEFAULT_LOCATION = "us-central1";
 
 /**
  * Extract content items from user messages
  *
- * @param messages - Array of CoreMessage objects
+ * @param messages - Array of ModelMessage objects
  * @returns Flattened array of content items from user messages
  */
-function extractUserContent(messages: CoreMessage[]) {
+function extractUserContent(messages: ModelMessage[]) {
   const userMessages = messages.filter((msg) => msg.role === "user");
   return userMessages.flatMap((msg) =>
     Array.isArray(msg.content) ? msg.content : [],
@@ -38,13 +38,13 @@ function extractUserContent(messages: CoreMessage[]) {
 }
 
 /**
- * Convert CoreMessage content array to Gemini parts format
+ * Convert ModelMessage content array to Gemini parts format
  *
- * @param messages - Array of CoreMessage objects
+ * @param messages - Array of ModelMessage objects
  * @returns Array of parts in Gemini API format
  */
 function buildContentParts(
-  messages: CoreMessage[],
+  messages: ModelMessage[],
 ): Array<
   { text: string } | { inlineData: { mimeType: string; data: string } }
 > {
@@ -134,7 +134,7 @@ Ensure the final response is fully self-sufficient and does not reference extern
 // ---------------------------------------------------------------------------
 
 export async function analyzeVideoWithVertexAI(
-  messages: CoreMessage[],
+  messages: ModelMessage[],
   options: {
     project?: string;
     location?: string;
@@ -190,7 +190,7 @@ export async function analyzeVideoWithVertexAI(
 // ---------------------------------------------------------------------------
 
 export async function analyzeVideoWithGeminiAPI(
-  messages: CoreMessage[],
+  messages: ModelMessage[],
   options: {
     apiKey?: string;
     model?: string;
@@ -298,7 +298,7 @@ async function getVertexConfig(): Promise<{
 }
 
 export async function analyzeVideo(
-  messages: CoreMessage[],
+  messages: ModelMessage[],
   options: {
     provider?: AIProviderName;
     project?: string;
@@ -308,18 +308,25 @@ export async function analyzeVideo(
   } = {},
 ): Promise<string> {
   const provider = options.provider || AIProviderName.AUTO;
-  // Vertex — only when GOOGLE_VERTEX_PROJECT is explicitly set
-  if (provider === AIProviderName.VERTEX || provider === AIProviderName.AUTO) {
+  // Vertex — only when Vertex credentials are configured
+  if (
+    provider === AIProviderName.VERTEX ||
+    (provider === AIProviderName.AUTO &&
+      (process.env.GOOGLE_VERTEX_PROJECT || process.env.GOOGLE_CLOUD_PROJECT))
+  ) {
     return analyzeVideoWithVertexAI(messages, options);
   }
 
-  // Gemini API — when GOOGLE_AI_API_KEY is set
-  if (provider === AIProviderName.GOOGLE_AI && process.env.GOOGLE_AI_API_KEY) {
+  // Gemini API — when Google AI API key is available
+  if (
+    provider === AIProviderName.GOOGLE_AI ||
+    (provider === AIProviderName.AUTO && process.env.GOOGLE_AI_API_KEY)
+  ) {
     return analyzeVideoWithGeminiAPI(messages, options);
   }
 
-  throw new Error(
-    "No valid provider configuration found. " +
-      "Set GOOGLE_VERTEX_PROJECT for Vertex AI or GOOGLE_AI_API_KEY for Gemini API.",
+  throw ErrorFactory.invalidConfiguration(
+    "video analysis provider",
+    "No valid provider configuration found. Set GOOGLE_VERTEX_PROJECT for Vertex AI or GOOGLE_AI_API_KEY for Gemini API.",
   );
 }

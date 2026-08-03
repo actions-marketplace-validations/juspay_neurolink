@@ -8,10 +8,15 @@
  */
 
 import { logger } from "./logger.js";
-import type { TTSOptions, TTSResult, TTSVoice } from "../types/ttsTypes.js";
+import type { TTSOptions, TTSResult, TTSHandler } from "../types/index.js";
 import { ErrorCategory, ErrorSeverity } from "../constants/enums.js";
 import { NeuroLinkError } from "./errorHandling.js";
-
+import {
+  SpanSerializer,
+  SpanType,
+  SpanStatus,
+  getMetricsAggregator,
+} from "../observability/index.js";
 /**
  * TTS-specific error codes
  */
@@ -49,78 +54,6 @@ export class TTSError extends NeuroLinkError {
     this.name = "TTSError";
   }
 }
-
-/**
- * TTS Handler interface for provider-specific implementations
- *
- * Each provider (Google AI, OpenAI, etc.) implements this interface
- * to provide TTS generation capabilities using their respective APIs.
- *
- * **Timeout Handling:**
- * Implementations MUST handle their own timeouts for the `synthesize()` method.
- * Recommended timeout: 30 seconds. Implementations should use `withTimeout()` utility
- * or provider-specific timeout mechanisms (e.g., Google Cloud client timeout).
- *
- * **Error Handling:**
- * Implementations should throw TTSError for all failures, including timeouts.
- * Use appropriate error codes from TTS_ERROR_CODES.
- *
- * @example
- * ```typescript
- * class MyTTSHandler implements TTSHandler {
- *   async synthesize(text: string, options: TTSOptions): Promise<TTSResult> {
- *     // REQUIRED: Implement timeout handling
- *     return await withTimeout(
- *       this.actualSynthesis(text, options),
- *       30000, // 30 second timeout
- *       'TTS synthesis timed out'
- *     );
- *   }
- *
- *   isConfigured(): boolean {
- *     return !!process.env.MY_TTS_API_KEY;
- *   }
- * }
- * ```
- */
-export type TTSHandler = {
-  /**
-   * Generate audio from text using provider-specific TTS API
-   *
-   * **IMPORTANT: Timeout Responsibility**
-   * Implementations MUST enforce their own timeouts (recommended: 30 seconds).
-   * Use the `withTimeout()` utility or provider-specific timeout mechanisms.
-   *
-   * @param text - Text to convert to speech (pre-validated, non-empty, within length limits)
-   * @param options - TTS configuration options (voice, format, speed, etc.)
-   * @returns Audio buffer with metadata
-   * @throws {TTSError} On synthesis failure, timeout, or configuration issues
-   */
-  synthesize(text: string, options: TTSOptions): Promise<TTSResult>;
-
-  /**
-   * Get available voices for the provider
-   *
-   * @param languageCode - Optional language filter (e.g., "en-US")
-   * @returns List of available voices
-   */
-  getVoices?(languageCode?: string): Promise<TTSVoice[]>;
-
-  /**
-   * Validate that the provider is properly configured
-   *
-   * @returns True if provider can generate TTS
-   */
-  isConfigured(): boolean;
-
-  /**
-   * Maximum text length supported by this provider (in bytes)
-   * Different providers have different limits
-   *
-   * @default 3000 if not specified
-   */
-  maxTextLength?: number;
-};
 
 /**
  * TTS processor class for orchestrating text-to-speech operations
@@ -202,13 +135,16 @@ export class TTSProcessor {
   }
 
   /**
-   * Get a registered TTS handler by provider name
+   * Get a registered TTS handler by provider name.
    *
-   * @private
+   * Exposed publicly so module-level auto-registration code can reuse an
+   * already-registered primary handler when backfilling its aliases —
+   * see `src/lib/voice/index.ts:registerDefaultTTSHandlers`.
+   *
    * @param providerName - Provider identifier
    * @returns Handler instance or undefined if not registered
    */
-  private static getHandler(providerName: string): TTSHandler | undefined {
+  static getHandler(providerName: string): TTSHandler | undefined {
     const normalizedName = providerName.toLowerCase();
     return this.handlers.get(normalizedName);
   }
@@ -282,72 +218,81 @@ export class TTSProcessor {
     provider: string,
     options: TTSOptions,
   ): Promise<TTSResult> {
-    // Trim the text once at the start
-    const trimmedText = text.trim();
-
-    // 1. Text validation: reject empty text
-    if (!trimmedText) {
-      logger.error("[TTSProcessor] Text is required for synthesis");
-      throw new TTSError({
-        code: TTS_ERROR_CODES.EMPTY_TEXT,
-        message: "Text is required for TTS synthesis",
-        severity: ErrorSeverity.LOW,
-        retriable: false,
-        context: { provider },
-      });
-    }
-
-    // 2. Handler lookup and error if provider not supported
-    const handler = this.getHandler(provider);
-    if (!handler) {
-      logger.error(`[TTSProcessor] Provider "${provider}" is not registered`);
-      throw new TTSError({
-        code: TTS_ERROR_CODES.PROVIDER_NOT_SUPPORTED,
-        message: `TTS provider "${provider}" is not supported. Use TTSProcessor.registerHandler() to register it.`,
-        severity: ErrorSeverity.HIGH,
-        retriable: false,
-        context: {
-          provider,
-          availableProviders: Array.from(this.handlers.keys()),
-        },
-      });
-    }
-
-    // 3. Text validation: reject text exceeding provider-specific max length
-    const maxTextLength = handler.maxTextLength ?? this.DEFAULT_MAX_TEXT_LENGTH;
-    if (trimmedText.length > maxTextLength) {
-      logger.error(
-        `[TTSProcessor] Text exceeds maximum length of ${maxTextLength} characters for provider "${provider}"`,
-      );
-      throw new TTSError({
-        code: TTS_ERROR_CODES.TEXT_TOO_LONG,
-        message: `Text length (${trimmedText.length}) exceeds maximum allowed length (${maxTextLength} characters) for provider "${provider}"`,
-        severity: ErrorSeverity.MEDIUM,
-        retriable: false,
-        context: {
-          provider,
-          textLength: trimmedText.length,
-          maxLength: maxTextLength,
-        },
-      });
-    }
-
-    // 4. Configuration check
-    if (!handler.isConfigured()) {
-      logger.warn(
-        `[TTSProcessor] Provider "${provider}" is not properly configured`,
-      );
-      throw new TTSError({
-        code: TTS_ERROR_CODES.PROVIDER_NOT_CONFIGURED,
-        message: `TTS provider "${provider}" is not configured. Please set the required API keys.`,
-        category: ErrorCategory.CONFIGURATION,
-        severity: ErrorSeverity.HIGH,
-        retriable: false,
-        context: { provider },
-      });
-    }
+    // Create span early so preflight failures are captured
+    const span = SpanSerializer.createSpan(SpanType.TTS, "tts.synthesize", {
+      "tts.operation": "synthesize",
+      "tts.provider": provider,
+      "tts.voice": options.voice,
+      "tts.format": options.format,
+    });
 
     try {
+      // Trim the text once at the start
+      const trimmedText = text.trim();
+
+      // 1. Text validation: reject empty text
+      if (!trimmedText) {
+        logger.error("[TTSProcessor] Text is required for synthesis");
+        throw new TTSError({
+          code: TTS_ERROR_CODES.EMPTY_TEXT,
+          message: "Text is required for TTS synthesis",
+          severity: ErrorSeverity.LOW,
+          retriable: false,
+          context: { provider },
+        });
+      }
+
+      // 2. Handler lookup and error if provider not supported
+      const handler = this.getHandler(provider);
+      if (!handler) {
+        logger.error(`[TTSProcessor] Provider "${provider}" is not registered`);
+        throw new TTSError({
+          code: TTS_ERROR_CODES.PROVIDER_NOT_SUPPORTED,
+          message: `TTS provider "${provider}" is not supported. Use TTSProcessor.registerHandler() to register it.`,
+          severity: ErrorSeverity.HIGH,
+          retriable: false,
+          context: {
+            provider,
+            availableProviders: Array.from(this.handlers.keys()),
+          },
+        });
+      }
+
+      // 3. Text validation: reject text exceeding provider-specific max length
+      const maxTextLength =
+        handler.maxTextLength ?? this.DEFAULT_MAX_TEXT_LENGTH;
+      if (trimmedText.length > maxTextLength) {
+        logger.error(
+          `[TTSProcessor] Text exceeds maximum length of ${maxTextLength} characters for provider "${provider}"`,
+        );
+        throw new TTSError({
+          code: TTS_ERROR_CODES.TEXT_TOO_LONG,
+          message: `Text length (${trimmedText.length}) exceeds maximum allowed length (${maxTextLength} characters) for provider "${provider}"`,
+          severity: ErrorSeverity.MEDIUM,
+          retriable: false,
+          context: {
+            provider,
+            textLength: trimmedText.length,
+            maxLength: maxTextLength,
+          },
+        });
+      }
+
+      // 4. Configuration check
+      if (!handler.isConfigured()) {
+        logger.warn(
+          `[TTSProcessor] Provider "${provider}" is not properly configured`,
+        );
+        throw new TTSError({
+          code: TTS_ERROR_CODES.PROVIDER_NOT_CONFIGURED,
+          message: `TTS provider "${provider}" is not configured. Please set the required API keys.`,
+          category: ErrorCategory.CONFIGURATION,
+          severity: ErrorSeverity.HIGH,
+          retriable: false,
+          context: { provider },
+        });
+      }
+
       logger.debug(
         `[TTSProcessor] Starting synthesis with provider: ${provider}`,
       );
@@ -365,10 +310,22 @@ export class TTSProcessor {
         `[TTSProcessor] Successfully synthesized ${result.size} bytes of audio`,
       );
 
-      // 7. Returns TTSResult with buffer, format, metadata
+      // 7. Record successful span
+      const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+      getMetricsAggregator().recordSpan(endedSpan);
+
+      // 8. Returns TTSResult with buffer, format, metadata
       return enrichedResult;
     } catch (err: unknown) {
-      // 8. Comprehensive error handling
+      // Record error span
+      const endedSpan = SpanSerializer.endSpan(
+        span,
+        SpanStatus.ERROR,
+        err instanceof Error ? err.message : String(err),
+      );
+      getMetricsAggregator().recordSpan(endedSpan);
+
+      // 9. Comprehensive error handling
       // Re-throw TTSError as-is
       if (err instanceof TTSError) {
         throw err;
@@ -388,7 +345,7 @@ export class TTSProcessor {
         retriable: true,
         context: {
           provider,
-          textLength: trimmedText.length,
+          textLength: text.trim().length,
           options,
         },
         originalError: err instanceof Error ? err : undefined,

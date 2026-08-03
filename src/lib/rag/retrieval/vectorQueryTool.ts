@@ -8,6 +8,8 @@
 import { randomUUID } from "crypto";
 import { z } from "zod";
 import { ProviderFactory } from "../../factories/providerFactory.js";
+import { withSpan } from "../../telemetry/withSpan.js";
+import { tracers } from "../../telemetry/tracers.js";
 import { logger } from "../../utils/logger.js";
 import { rerank } from "../reranker/reranker.js";
 import type {
@@ -16,10 +18,8 @@ import type {
   VectorQueryResponse,
   VectorQueryResult,
   VectorQueryToolConfig,
-} from "../types.js";
-import type { VectorStore } from "../../types/ragTypes.js";
-
-export type { VectorStore } from "../../types/ragTypes.js";
+  VectorStore,
+} from "../../types/index.js";
 
 /**
  * Creates a vector query tool for semantic search
@@ -57,7 +57,7 @@ export function createVectorQueryTool(
       ...(enableFilter
         ? {
             filter: z
-              .record(z.unknown())
+              .record(z.string(), z.unknown())
               .optional()
               .describe("Metadata filters to narrow down results"),
           }
@@ -78,103 +78,116 @@ export function createVectorQueryTool(
       params: { query: string; filter?: MetadataFilter; topK?: number },
       context?: RequestContext,
     ): Promise<VectorQueryResponse> => {
-      const startTime = Date.now();
-
-      try {
-        // Resolve vector store if it's a function
-        const store: VectorStore =
-          typeof vectorStore === "function"
-            ? vectorStore(context || {})
-            : vectorStore;
-
-        // Generate query embedding
-        const embeddingProvider = await ProviderFactory.createProvider(
-          embeddingModel.provider,
-          embeddingModel.modelName,
-        );
-
-        // Check if provider has embed method
-        if (
-          typeof (embeddingProvider as unknown as { embed?: unknown }).embed !==
-          "function"
-        ) {
-          throw new Error(
-            `Provider ${embeddingModel.provider} does not support embeddings`,
-          );
-        }
-
-        const queryEmbedding = await (
-          embeddingProvider as unknown as {
-            embed: (s: string) => Promise<number[]>;
-          }
-        ).embed(params.query);
-
-        // Query the vector store
-        let results = await store.query({
-          indexName,
-          queryVector: queryEmbedding,
-          topK: params.topK || topK,
-          filter: params.filter,
-          includeVectors,
-          ...providerOptions,
-        });
-
-        let reranked = false;
-
-        // Apply reranking if configured
-        if (rerankerConfig && results.length > 0) {
-          const rerankerModel = await ProviderFactory.createProvider(
-            rerankerConfig.model.provider,
-            rerankerConfig.model.modelName,
-          );
-
-          const rerankedResults = await rerank(
-            results,
-            params.query,
-            rerankerModel,
-            {
-              weights: rerankerConfig.weights,
-              topK: rerankerConfig.topK,
-              queryEmbedding,
-            },
-          );
-
-          results = rerankedResults.map((r) => r.result);
-          reranked = true;
-        }
-
-        // Format results
-        const relevantContext = results
-          .map((r, i) => `[${i + 1}] ${r.metadata?.text || r.text || ""}`)
-          .join("\n\n");
-
-        const queryTime = Date.now() - startTime;
-
-        logger.info("[VectorQueryTool] Query completed", {
-          query: params.query.slice(0, 50),
-          resultsCount: results.length,
-          queryTime,
-          reranked,
-          filtered: !!params.filter,
-        });
-
-        return {
-          relevantContext,
-          sources: includeSources ? results : [],
-          totalResults: results.length,
-          metadata: {
-            queryTime,
-            reranked,
-            filtered: !!params.filter,
+      return withSpan(
+        {
+          name: "neurolink.rag.vectorQuery",
+          tracer: tracers.rag,
+          attributes: {
+            "rag.vector.index": indexName,
+            "rag.vector.top_k": params.topK ?? topK,
+            "rag.vector.query_length": params.query.length,
           },
-        };
-      } catch (error) {
-        logger.error("[VectorQueryTool] Query failed", {
-          query: params.query.slice(0, 50),
-          error: error instanceof Error ? error.message : String(error),
-        });
-        throw error;
-      }
+        },
+        async (span) => {
+          const startTime = Date.now();
+
+          try {
+            // Resolve vector store if it's a function
+            const store: VectorStore =
+              typeof vectorStore === "function"
+                ? vectorStore(context || {})
+                : vectorStore;
+
+            // Generate query embedding
+            const embeddingProvider = await ProviderFactory.createProvider(
+              embeddingModel.provider,
+              embeddingModel.modelName,
+            );
+
+            // Check if provider has embed method
+            if (typeof embeddingProvider.embed !== "function") {
+              throw new Error(
+                `Provider ${embeddingModel.provider} does not support embeddings`,
+              );
+            }
+
+            const queryEmbedding = await embeddingProvider.embed(params.query);
+
+            // Query the vector store
+            let results = await store.query({
+              indexName,
+              queryVector: queryEmbedding,
+              topK: params.topK || topK,
+              filter: params.filter,
+              includeVectors,
+              ...providerOptions,
+            });
+
+            let reranked = false;
+
+            // Apply reranking if configured
+            if (rerankerConfig && results.length > 0) {
+              const rerankerModel = await ProviderFactory.createProvider(
+                typeof rerankerConfig.model === "object"
+                  ? rerankerConfig.model.provider
+                  : rerankerConfig.model,
+                typeof rerankerConfig.model === "object"
+                  ? rerankerConfig.model.modelName
+                  : rerankerConfig.model,
+              );
+
+              const rerankedResults = await rerank(
+                results,
+                params.query,
+                rerankerModel,
+                {
+                  weights: rerankerConfig.weights,
+                  topK: rerankerConfig.topK,
+                  queryEmbedding,
+                },
+              );
+
+              results = rerankedResults.map((r) => r.result);
+              reranked = true;
+            }
+
+            // Format results
+            const relevantContext = results
+              .map((r, i) => `[${i + 1}] ${r.metadata?.text || r.text || ""}`)
+              .join("\n\n");
+
+            const queryTime = Date.now() - startTime;
+
+            logger.info("[VectorQueryTool] Query completed", {
+              query: params.query.slice(0, 50),
+              resultsCount: results.length,
+              queryTime,
+              reranked,
+              filtered: !!params.filter,
+            });
+
+            span.setAttribute("rag.vector.result_count", results.length);
+            span.setAttribute("rag.vector.reranked", reranked);
+
+            return {
+              relevantContext,
+              sources: includeSources ? results : [],
+              totalResults: results.length,
+              metadata: {
+                queryTime,
+                reranked,
+                filtered: !!params.filter,
+              },
+            };
+          } catch (error) {
+            logger.error("[VectorQueryTool] Query failed", {
+              query: params.query.slice(0, 50),
+              error: error instanceof Error ? error.message : String(error),
+            });
+            throw error;
+          }
+        },
+      ); // end withSpan
     },
   };
 }
@@ -378,12 +391,27 @@ export class InMemoryVectorStore implements VectorStore {
           ) {
             return false;
           }
-          if (
-            "$regex" in ops &&
-            (typeof fieldValue !== "string" ||
-              !new RegExp(ops.$regex as string).test(fieldValue))
-          ) {
-            return false;
+          if ("$regex" in ops) {
+            const pattern = ops.$regex as string;
+            let regexMatches = false;
+            // Guard against ReDoS: reject excessively long patterns and limit
+            // the tested string length to prevent pathological backtracking.
+            if (pattern.length <= 200) {
+              try {
+                const re = new RegExp(pattern);
+                const testValue =
+                  typeof fieldValue === "string"
+                    ? fieldValue.slice(0, 10_000)
+                    : "";
+                regexMatches = re.test(testValue);
+              } catch {
+                // Invalid regex pattern — treat as non-match
+                regexMatches = false;
+              }
+            }
+            if (!regexMatches) {
+              return false;
+            }
           }
         } else {
           // Direct equality

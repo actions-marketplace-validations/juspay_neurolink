@@ -1,40 +1,31 @@
 /**
  * SageMaker Language Model Implementation
  *
- * This module implements the LanguageModelV1 interface for Amazon SageMaker
+ * This module implements the LanguageModel interface for Amazon SageMaker
  * integration with the Vercel AI SDK.
  */
 
 import { randomUUID } from "crypto";
-import type {
-  LanguageModelV1,
-  LanguageModelV1CallOptions,
-  LanguageModelV1StreamPart,
-} from "ai";
 
 import { SageMakerRuntimeClient } from "./client.js";
 import { handleSageMakerError } from "./errors.js";
-import { estimateTokenUsage, createSageMakerStream } from "./streaming.js";
+import {
+  estimateTokenUsage,
+  createSageMakerStream,
+  parseUsageFromResponseBody,
+} from "./streaming.js";
 import type {
+  ConnectivityResult,
+  OpenAICompatV3CallToolChoice,
+  OpenAICompatV3CallTools,
+  SageMakerAsLanguageModel,
   SageMakerConfig,
   SageMakerModelConfig,
-} from "../../types/providers.js";
-import type { ConnectivityResult } from "../../types/typeAliases.js";
+  SageMakerOpenAIToolCall,
+  UnknownRecord,
+} from "../../types/index.js";
 import { createAdaptiveSemaphore } from "./adaptive-semaphore.js";
 import { logger } from "../../utils/logger.js";
-import type { UnknownRecord } from "../../types/common.js";
-
-/**
- * Interface for SageMaker tool call results
- */
-type SageMakerToolCall = {
-  type: "function";
-  id: string;
-  function: {
-    name: string;
-    arguments: string;
-  };
-};
 
 /**
  * Base synthetic streaming delay in milliseconds for simulating real-time response
@@ -119,19 +110,31 @@ const DEFAULT_MAX_CONCURRENCY = 10;
 const DEFAULT_MIN_CONCURRENCY = 1;
 
 /**
- * SageMaker Language Model implementing LanguageModelV1 interface
+ * SageMaker Language Model implementing LanguageModel interface
  *
  * Token Limit Behavior:
  * - When maxTokens is undefined, SageMaker uses the model's default token limits
  * - When maxTokens is specified, it sets max_new_tokens parameter explicitly
  * - This aligns with the unlimited-by-default token policy across all providers
  */
-export class SageMakerLanguageModel implements LanguageModelV1 {
-  readonly specificationVersion = "v1";
+export class SageMakerLanguageModel implements SageMakerAsLanguageModel {
+  /**
+   * Specification version for the AI SDK LanguageModel interface.
+   * Uses "v2" for structural compatibility with AI SDK v6's `LanguageModelV2`.
+   * The AI SDK checks this field to determine which interface version to use.
+   */
+  readonly specificationVersion = "v2" as const;
   readonly provider = "sagemaker";
   readonly modelId: string;
   readonly supportsStreaming = true;
   readonly defaultObjectGenerationMode = "json" as const;
+
+  /**
+   * Supported URL patterns by media type.
+   * SageMaker endpoints do not natively download URLs, so this is empty.
+   * Required by the LanguageModelV2 interface.
+   */
+  readonly supportedUrls: Record<string, RegExp[]> = {};
 
   private client: SageMakerRuntimeClient;
   private config: SageMakerConfig;
@@ -158,7 +161,7 @@ export class SageMakerLanguageModel implements LanguageModelV1 {
   /**
    * Generate text synchronously using SageMaker endpoint
    */
-  async doGenerate(options: LanguageModelV1CallOptions): Promise<{
+  async doGenerate(options: Record<string, unknown>): Promise<{
     text?: string;
     reasoning?:
       | string
@@ -173,8 +176,8 @@ export class SageMakerLanguageModel implements LanguageModelV1 {
       topLogprobs: Array<{ token: string; logprob: number }>;
     }>;
     usage: {
-      promptTokens: number;
-      completionTokens: number;
+      inputTokens: number;
+      outputTokens: number;
       totalTokens?: number;
     };
     finishReason:
@@ -229,8 +232,11 @@ export class SageMakerLanguageModel implements LanguageModelV1 {
       // Extract tool calls if present (Phase 4 enhancement)
       const toolCalls = this.extractToolCallsFromResponse(responseBody);
 
-      // Calculate token usage
-      const usage = estimateTokenUsage(promptText, generatedText);
+      // Prefer the endpoint's REAL token counts; only fall back to the
+      // char-heuristic estimate when the response reports none.
+      const usage =
+        parseUsageFromResponseBody(responseBody) ??
+        estimateTokenUsage(promptText, generatedText);
 
       // Determine finish reason based on response content
       let finishReason:
@@ -272,8 +278,8 @@ export class SageMakerLanguageModel implements LanguageModelV1 {
           topLogprobs: Array<{ token: string; logprob: number }>;
         }>;
         usage: {
-          promptTokens: number;
-          completionTokens: number;
+          inputTokens: number;
+          outputTokens: number;
           totalTokens?: number;
         };
         finishReason:
@@ -287,13 +293,13 @@ export class SageMakerLanguageModel implements LanguageModelV1 {
         rawCall: { rawPrompt: unknown; rawSettings: Record<string, unknown> };
         rawResponse?: { headers?: Record<string, string> };
         request?: { body?: string };
-        toolCalls?: SageMakerToolCall[];
+        toolCalls?: SageMakerOpenAIToolCall[];
         object?: unknown;
       } = {
         text: generatedText,
         usage: {
-          promptTokens: usage.promptTokens,
-          completionTokens: usage.completionTokens,
+          inputTokens: usage.promptTokens,
+          outputTokens: usage.completionTokens,
           totalTokens: usage.total,
         },
         finishReason,
@@ -365,8 +371,8 @@ export class SageMakerLanguageModel implements LanguageModelV1 {
   /**
    * Generate text with streaming using SageMaker endpoint
    */
-  async doStream(options: LanguageModelV1CallOptions): Promise<{
-    stream: ReadableStream<LanguageModelV1StreamPart>;
+  async doStream(options: Record<string, unknown>): Promise<{
+    stream: ReadableStream<Record<string, unknown>>;
     rawCall: {
       rawPrompt: unknown;
       rawSettings: Record<string, unknown>;
@@ -448,10 +454,10 @@ export class SageMakerLanguageModel implements LanguageModelV1 {
         );
 
         return {
-          stream: stream as ReadableStream<LanguageModelV1StreamPart>,
+          stream: stream as ReadableStream<Record<string, unknown>>,
           rawCall: {
             rawPrompt: sagemakerRequest,
-            rawSettings: this.modelConfig as unknown as Record<string, unknown>,
+            rawSettings: this.modelConfig,
           },
           rawResponse: {
             headers: {
@@ -474,7 +480,7 @@ export class SageMakerLanguageModel implements LanguageModelV1 {
         const result = await this.doGenerate(options);
 
         // Create synthetic stream from complete result using async iterator pattern
-        const syntheticStream = new ReadableStream<LanguageModelV1StreamPart>({
+        const syntheticStream = new ReadableStream<Record<string, unknown>>({
           async start(controller) {
             try {
               // Create async iterator for text chunks
@@ -534,7 +540,7 @@ export class SageMakerLanguageModel implements LanguageModelV1 {
    * Convert AI SDK options to SageMaker request format
    */
   private convertToSageMakerRequest(
-    options: LanguageModelV1CallOptions,
+    options: Record<string, unknown>,
   ): UnknownRecord {
     const promptText = this.extractPromptText(options);
 
@@ -552,13 +558,22 @@ export class SageMakerLanguageModel implements LanguageModelV1 {
       },
     };
 
-    // Add tool support if tools are present
+    // Add tool support if tools are present. `options.tools` arrives here in
+    // the AI SDK's LanguageModelV2/V3 call-options shape — a flat
+    // `{ type: "function", name, description?, inputSchema }` per tool (see
+    // `LanguageModelV3FunctionTool` in @ai-sdk/provider), the same shape
+    // every other provider's tool converter consumes (compare
+    // `v3ToolsToOpenAI` in openaiChatCompletionsClient.ts). It is NOT the
+    // nested OpenAI Chat Completions wire format.
     const tools = (options as UnknownRecord).tools;
     if (tools && Array.isArray(tools) && tools.length > 0) {
-      request.tools = this.convertToolsToSageMakerFormat(tools);
+      request.tools = this.convertToolsToSageMakerFormat(
+        tools as OpenAICompatV3CallTools,
+      );
 
       // Add tool choice if specified
-      const toolChoice = (options as UnknownRecord).toolChoice as UnknownRecord;
+      const toolChoice = (options as UnknownRecord)
+        .toolChoice as OpenAICompatV3CallToolChoice;
       if (toolChoice) {
         request.tool_choice =
           this.convertToolChoiceToSageMakerFormat(toolChoice);
@@ -592,46 +607,65 @@ export class SageMakerLanguageModel implements LanguageModelV1 {
   }
 
   /**
-   * Convert Vercel AI SDK tools to SageMaker format
+   * Convert AI SDK tools (`LanguageModelV3FunctionTool | LanguageModelV3ProviderTool`,
+   * the same union every other provider's tool converter accepts — see
+   * `v3ToolsToOpenAI` in openaiChatCompletionsClient.ts) into the SageMaker
+   * wire format, which mirrors the OpenAI Chat Completions nested
+   * `{ function: { name, description, parameters } }` convention.
+   *
+   * Function tools carry their fields flat (`tool.name`, `tool.inputSchema`,
+   * etc.) — there is no `tool.function` sub-object on the AI SDK side.
+   * `type: "provider"` tools (provider-defined tools like web search) have
+   * no SageMaker equivalent; they're dropped explicitly with a debug log
+   * rather than crashing or being sent malformed.
    */
   private convertToolsToSageMakerFormat(
-    tools: UnknownRecord[],
+    tools: OpenAICompatV3CallTools,
   ): UnknownRecord[] {
-    return tools.map((tool) => {
-      if (tool.type === "function") {
-        return {
-          type: "function",
-          function: {
-            name: (tool.function as UnknownRecord).name,
-            description: (tool.function as UnknownRecord).description || "",
-            parameters: (tool.function as UnknownRecord).parameters || {},
-          },
-        };
+    const converted: UnknownRecord[] = [];
+    for (const tool of tools) {
+      if (tool.type !== "function") {
+        logger.debug("SageMaker: dropping tool with no SageMaker equivalent", {
+          toolType: tool.type,
+          toolName: tool.name,
+        });
+        continue;
       }
-      return tool; // Pass through other tool types
-    });
+      converted.push({
+        type: "function",
+        function: {
+          name: tool.name,
+          description: tool.description || "",
+          parameters: tool.inputSchema || {},
+        },
+      });
+    }
+    return converted;
   }
 
   /**
-   * Convert Vercel AI SDK tool choice to SageMaker format
+   * Convert an AI SDK tool choice (`LanguageModelV3ToolChoice`) into the
+   * SageMaker/OpenAI-style wire format. The AI SDK shape is
+   * `{ type: "auto" | "none" | "required" }` or `{ type: "tool", toolName }`
+   * — never the nested `{ type: "function", function: { name } }` shape.
    */
   private convertToolChoiceToSageMakerFormat(
-    toolChoice: UnknownRecord,
-  ): UnknownRecord {
+    toolChoice: OpenAICompatV3CallToolChoice,
+  ): UnknownRecord | string {
     if (typeof toolChoice === "string") {
-      return toolChoice; // 'auto', 'none', etc.
+      return toolChoice; // Defensive: tolerate a raw string if ever passed.
     }
 
-    if (toolChoice?.type === "function") {
-      return {
-        type: "function",
-        function: {
-          name: (toolChoice.function as UnknownRecord).name,
-        },
-      };
+    switch (toolChoice.type) {
+      case "auto":
+      case "none":
+      case "required":
+        return toolChoice.type;
+      case "tool":
+        return { type: "function", function: { name: toolChoice.toolName } };
+      default:
+        return "auto";
     }
-
-    return toolChoice;
   }
 
   /**
@@ -670,7 +704,7 @@ export class SageMakerLanguageModel implements LanguageModelV1 {
   /**
    * Extract text content from AI SDK prompt format
    */
-  private extractPromptText(options: LanguageModelV1CallOptions): string {
+  private extractPromptText(options: Record<string, unknown>): string {
     // Check for messages first (like Ollama)
     const messages = (options as UnknownRecord).messages;
     if (messages && Array.isArray(messages)) {
@@ -748,13 +782,13 @@ export class SageMakerLanguageModel implements LanguageModelV1 {
    */
   private extractToolCallsFromResponse(
     responseBody: UnknownRecord,
-  ): SageMakerToolCall[] | undefined {
+  ): SageMakerOpenAIToolCall[] | undefined {
     // Handle OpenAI-compatible format (common for many SageMaker models)
     if (responseBody.choices && Array.isArray(responseBody.choices)) {
       const choice = responseBody.choices[0];
       if (choice?.message?.tool_calls) {
         return choice.message.tool_calls.map(
-          (toolCall: UnknownRecord): SageMakerToolCall => ({
+          (toolCall: UnknownRecord): SageMakerOpenAIToolCall => ({
             type: "function",
             id: String(toolCall.id || `call_${randomUUID()}`),
             function: {
@@ -768,7 +802,7 @@ export class SageMakerLanguageModel implements LanguageModelV1 {
 
     // Handle custom SageMaker tool call format
     if (responseBody.tool_calls && Array.isArray(responseBody.tool_calls)) {
-      return responseBody.tool_calls as SageMakerToolCall[];
+      return responseBody.tool_calls as SageMakerOpenAIToolCall[];
     }
 
     // Handle Anthropic-style tool use
@@ -778,7 +812,7 @@ export class SageMakerLanguageModel implements LanguageModelV1 {
       );
       if (toolUses.length > 0) {
         return toolUses.map(
-          (toolUse: UnknownRecord): SageMakerToolCall => ({
+          (toolUse: UnknownRecord): SageMakerOpenAIToolCall => ({
             type: "function",
             id: String(toolUse.id || `call_${randomUUID()}`),
             function: {
@@ -1005,11 +1039,12 @@ export class SageMakerLanguageModel implements LanguageModelV1 {
         results[index] = {
           text: result.text || "",
           usage: {
-            promptTokens: result.usage.promptTokens,
-            completionTokens: result.usage.completionTokens,
+            promptTokens: result.usage.inputTokens ?? 0,
+            completionTokens: result.usage.outputTokens ?? 0,
             total:
               result.usage.totalTokens ??
-              result.usage.promptTokens + result.usage.completionTokens,
+              (result.usage.inputTokens ?? 0) +
+                (result.usage.outputTokens ?? 0),
           },
           finishReason: result.finishReason,
           index,
