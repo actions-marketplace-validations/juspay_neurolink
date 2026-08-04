@@ -118,7 +118,18 @@ import {
   CLI_SOFT_LIMITS_MB,
 } from "../src/cli/utils/inputValidation.js";
 
-import { processLooksLikeProxySupervisor } from "../src/cli/commands/proxy.js";
+import {
+  isRollingHandoffCapable,
+  normalizeSupervisorState,
+  processLooksLikeProxySupervisor,
+} from "../src/cli/commands/proxy.js";
+import {
+  loadUpdateState,
+  recordUpdateInstalled,
+} from "../src/lib/proxy/updateState.js";
+import { ModelRouter } from "../src/lib/proxy/modelRouter.js";
+import { __testHooks as claudeProxyTestHooks } from "../src/lib/server/routes/claudeProxyRoutes.js";
+import type { ProxySupervisorState } from "../src/lib/types/index.js";
 
 import {
   GoogleVertexProvider,
@@ -8988,6 +8999,293 @@ exit 127
         }
         resetImageCache();
       }
+    },
+  },
+
+  // ---------- #1264: updater activation state reported truthfully ----------
+  {
+    // Before this, recordUpdateInstalled() set only pendingRestartVersion, so
+    // nothing recorded what was actually validated onto disk.
+    name: "proxy updateState: recordUpdateInstalled records installedVersion alongside the pending one",
+    category: "proxy",
+    fn: async () => {
+      const dir = mkdtempSync(pathJoin(tmpdir(), "neurolink-update-state-"));
+      try {
+        const statePath = pathJoin(dir, "update-state.json");
+        recordUpdateInstalled("9.88.9", statePath);
+        const state = loadUpdateState(statePath);
+        return (
+          state?.installedVersion === "9.88.9" &&
+          state?.pendingRestartVersion === "9.88.9"
+        );
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  },
+  {
+    // Legacy files: back then recordUpdateInstalled() set ONLY
+    // pendingRestartVersion, leaving lastUpdateVersion on the previously
+    // ACTIVATED build. Reading lastUpdateVersion first would report the
+    // superseded version as installed and re-offer an update already on disk.
+    name: "proxy updateState: legacy state backfills installedVersion from the pending version",
+    category: "proxy",
+    fn: async () => {
+      const dir = mkdtempSync(pathJoin(tmpdir(), "neurolink-update-state-"));
+      try {
+        const statePath = pathJoin(dir, "update-state.json");
+        writeFileSync(
+          statePath,
+          JSON.stringify({
+            lastCheckAt: new Date().toISOString(),
+            lastCheckVersion: "9.90.0",
+            suppressedVersions: {},
+            lastUpdateAt: new Date().toISOString(),
+            lastUpdateVersion: "9.88.0",
+            pendingRestartVersion: "9.90.0",
+          }),
+          "utf8",
+        );
+        const state = loadUpdateState(statePath);
+        return (
+          state?.installedVersion === "9.90.0" &&
+          state?.pendingRestartVersion === "9.90.0" &&
+          state?.lastUpdateVersion === "9.88.0"
+        );
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  },
+  {
+    name: "proxy updateState: an explicit installedVersion wins over the legacy backfill",
+    category: "proxy",
+    fn: async () => {
+      const dir = mkdtempSync(pathJoin(tmpdir(), "neurolink-update-state-"));
+      try {
+        const statePath = pathJoin(dir, "update-state.json");
+        writeFileSync(
+          statePath,
+          JSON.stringify({
+            lastCheckAt: new Date().toISOString(),
+            lastCheckVersion: "9.90.0",
+            suppressedVersions: {},
+            installedVersion: "9.89.0",
+            lastUpdateVersion: "9.88.0",
+            pendingRestartVersion: "9.90.0",
+          }),
+          "utf8",
+        );
+        return loadUpdateState(statePath)?.installedVersion === "9.89.0";
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  },
+  {
+    name: "proxy updateState: falls back to lastUpdateVersion when nothing is pending",
+    category: "proxy",
+    fn: async () => {
+      const dir = mkdtempSync(pathJoin(tmpdir(), "neurolink-update-state-"));
+      try {
+        const statePath = pathJoin(dir, "update-state.json");
+        writeFileSync(
+          statePath,
+          JSON.stringify({
+            lastCheckAt: new Date().toISOString(),
+            lastCheckVersion: "9.88.0",
+            suppressedVersions: {},
+            lastUpdateVersion: "9.88.0",
+          }),
+          "utf8",
+        );
+        const state = loadUpdateState(statePath);
+        return (
+          state?.installedVersion === "9.88.0" &&
+          state?.pendingRestartVersion === null
+        );
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  },
+  {
+    // A live supervisor PID alone is not enough to promise a rolling handoff: a
+    // supervisor from a build predating rolling state leaves `rolling` absent,
+    // and calling that a handoff strands the CLI and /status clients waiting for
+    // an activation that can never happen.
+    name: "proxy status: a legacy supervisor with no rolling state is not handoff-capable",
+    category: "proxy",
+    fn: async () => {
+      const alive = () => true;
+      const legacy = {
+        pid: 4242,
+        host: "127.0.0.1",
+        port: 55669,
+        startTime: new Date(0).toISOString(),
+      } as unknown as ProxySupervisorState;
+      return (
+        !isRollingHandoffCapable(legacy, alive) &&
+        !isRollingHandoffCapable(
+          { ...legacy, rolling: null } as never,
+          alive,
+        ) &&
+        // Same unvalidated `as T` load that lets `version` be an object.
+        !isRollingHandoffCapable(
+          { ...legacy, rolling: "yes" } as never,
+          alive,
+        ) &&
+        !isRollingHandoffCapable(null, alive)
+      );
+    },
+  },
+  {
+    name: "proxy status: handoff-capable requires a live process AND rolling state",
+    category: "proxy",
+    fn: async () => {
+      const rolling = {
+        pid: 4242,
+        host: "127.0.0.1",
+        port: 55669,
+        startTime: new Date(0).toISOString(),
+        rolling: {
+          generation: 1,
+          active: null,
+          candidate: null,
+          draining: [],
+          queuedSockets: 0,
+          rejectedSockets: 0,
+          failedTransfers: 0,
+          lastFailure: null,
+        },
+      } satisfies ProxySupervisorState;
+      return (
+        isRollingHandoffCapable(rolling, () => true) &&
+        // Rolling state present but the process is gone — still not a handoff.
+        !isRollingHandoffCapable(rolling, () => false)
+      );
+    },
+  },
+  {
+    // StateFileManager.load() is a bare `as T`, so version really can be an
+    // object. Left alone it renders as "v[object Object]" in every status surface.
+    name: "proxy status: a supervisor version that is not a string is dropped at load",
+    category: "proxy",
+    fn: async () => {
+      const corrupt = {
+        pid: 4242,
+        host: "127.0.0.1",
+        port: 55669,
+        startTime: new Date(0).toISOString(),
+        version: { major: 9 },
+      } as unknown as ProxySupervisorState;
+      return (
+        normalizeSupervisorState(corrupt)?.version === undefined &&
+        normalizeSupervisorState({ ...corrupt, version: "9.88.9" })?.version ===
+          "9.88.9" &&
+        normalizeSupervisorState(null) === null
+      );
+    },
+  },
+
+  // ---------- #1265: account admission is opt-in ----------
+  {
+    // Omitting the cap means unlimited admission, not the old implicit 2.
+    name: "proxy admission: an omitted cap reports no bound",
+    category: "proxy",
+    fn: async () => {
+      const router = new ModelRouter({
+        strategy: "fill-first",
+        modelMappings: [],
+        fallbackChain: [],
+      });
+      return router.getMaxInflightPerAccount() === undefined;
+    },
+  },
+  {
+    // ProxyRoutingConfig is an exported type, so a programmatic caller can hand
+    // ModelRouter a value that never passed through parseProxyConfig(). Echoing
+    // it back would have the router claim a bound the admission path ignores as
+    // unlimited — the two would disagree about whether the account is capped.
+    name: "proxy admission: out-of-range and non-integer caps report no bound",
+    category: "proxy",
+    fn: async () => {
+      const reportsUnlimited = (maxInflightPerAccount: number) =>
+        new ModelRouter({
+          strategy: "fill-first",
+          modelMappings: [],
+          fallbackChain: [],
+          maxInflightPerAccount,
+        }).getMaxInflightPerAccount() === undefined;
+      return (
+        reportsUnlimited(0) &&
+        reportsUnlimited(21) &&
+        reportsUnlimited(1.5) &&
+        reportsUnlimited(Number.NaN)
+      );
+    },
+  },
+  {
+    name: "proxy admission: a cap inside the accepted range is kept",
+    category: "proxy",
+    fn: async () => {
+      const router = new ModelRouter({
+        strategy: "fill-first",
+        modelMappings: [],
+        fallbackChain: [],
+        maxInflightPerAccount: 3,
+      });
+      return router.getMaxInflightPerAccount() === 3;
+    },
+  },
+  {
+    // With no cap configured, admission must not allocate queue state at all —
+    // every request is granted a lease immediately.
+    name: "proxy admission: no queue state is created when no cap is configured",
+    category: "proxy",
+    fn: async () => {
+      const accountKey = "anthropic:unlimited@example.com";
+      const leases = [
+        claudeProxyTestHooks.tryAcquireAccountAdmission(accountKey, undefined),
+        claudeProxyTestHooks.tryAcquireAccountAdmission(accountKey, undefined),
+        claudeProxyTestHooks.tryAcquireAccountAdmission(accountKey, undefined),
+      ];
+      try {
+        const snapshot =
+          claudeProxyTestHooks.getAccountAdmissionSnapshot(accountKey);
+        return (
+          leases.every((lease) => lease !== undefined) &&
+          snapshot.active === 0 &&
+          snapshot.waiting === 0
+        );
+      } finally {
+        leases.forEach((lease) => lease?.release());
+      }
+    },
+  },
+  {
+    // getAccountAdmissionState() inserts into the map as a side effect, and the
+    // throw path never reaches discardAccountAdmissionState() to reap it — so
+    // validation has to happen first or an invalid capacity strands an entry.
+    name: "proxy admission: a rejected enqueue strands no admission state",
+    category: "proxy",
+    fn: async () => {
+      const accountKey = "anthropic:invalid-capacity@example.com";
+      if (claudeProxyTestHooks.hasAccountAdmissionState(accountKey)) {
+        return false;
+      }
+      try {
+        claudeProxyTestHooks.enqueueAccountAdmission(accountKey, 0);
+        return false; // 0 normalizes to unlimited, which must be rejected
+      } catch (error) {
+        if (
+          !(error instanceof Error) ||
+          !/requires an explicit capacity/.test(error.message)
+        ) {
+          return false;
+        }
+      }
+      return !claudeProxyTestHooks.hasAccountAdmissionState(accountKey);
     },
   },
 ];
