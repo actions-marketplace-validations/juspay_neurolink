@@ -21,6 +21,7 @@ import {
   flushAccountQuotaStateForTests,
   getUnifiedRateLimitStatus,
   initAccountQuota,
+  isQuotaOverageAvailable,
   loadAccountQuotas,
   parseQuotaHeaders,
   saveAccountQuota,
@@ -1081,7 +1082,7 @@ describe("upstream attempt classification and retry amplification", () => {
     );
   });
 
-  it("classifies terminal OAuth retry transport failures as non-retryable", async () => {
+  it("returns a terminal error for an ambiguous OAuth retry transport failure", async () => {
     const retryError = Object.assign(new TypeError("invalid URL"), {
       cause: { code: "ERR_INVALID_URL" },
     });
@@ -1105,6 +1106,7 @@ describe("upstream attempt classification and retry amplification", () => {
       type: "oauth" as const,
     };
     const logAttempt = vi.fn();
+    const logFinalRequest = createRecordingErrorFinalRequestLogger();
 
     const result = await __testHooks.handleAnthropicAuthRetry({
       ctx: {} as never,
@@ -1122,7 +1124,7 @@ describe("upstream attempt classification and retry amplification", () => {
       allocateAttemptNumber: () => 2,
       logAttempt,
       logProxyBody: vi.fn(),
-      logFinalRequest: vi.fn(),
+      logFinalRequest,
       lastError: undefined,
       authFailureMessage: null,
       sawRateLimit: false,
@@ -1131,9 +1133,13 @@ describe("upstream attempt classification and retry amplification", () => {
     });
 
     expect(result).toMatchObject({
-      continueLoop: true,
+      continueLoop: false,
       sawNetworkError: true,
       lastError: "network error on retry 1: invalid URL",
+      response: {
+        type: "error",
+        error: { type: "api_error", message: "invalid URL" },
+      },
     });
     expect(logAttempt).toHaveBeenNthCalledWith(
       2,
@@ -1146,6 +1152,13 @@ describe("upstream attempt classification and retry amplification", () => {
         attempt: 2,
         attemptDurationMs: expect.any(Number),
       },
+    );
+    expect(logFinalRequest).toHaveBeenCalledWith(
+      502,
+      account.label,
+      account.type,
+      "network_error",
+      "invalid URL",
     );
   });
 
@@ -1609,9 +1622,200 @@ describe("upstream attempt classification and retry amplification", () => {
     });
     expect(getStats()).toMatchObject({ totalRequests: 1, totalErrors: 1 });
   });
+
+  it("retries only failures that cannot have dispatched an Anthropic POST", () => {
+    const fetchError = (code: string): Error => {
+      const error = new TypeError("fetch failed") as TypeError & {
+        cause?: { code: string };
+      };
+      error.cause = { code };
+      return error;
+    };
+
+    for (const code of [
+      "EADDRNOTAVAIL",
+      "ENOTFOUND",
+      "ECONNREFUSED",
+      "EHOSTUNREACH",
+      "UND_ERR_CONNECT_TIMEOUT",
+      "UND_ERR_CONNECT",
+    ]) {
+      expect(__testHooks.isRetryableNetworkError(fetchError(code))).toBe(true);
+    }
+    for (const code of [
+      "ECONNRESET",
+      "EPIPE",
+      "ETIMEDOUT",
+      "UND_ERR_SOCKET",
+      "UND_ERR_HEADERS_TIMEOUT",
+      "UND_ERR_BODY_TIMEOUT",
+    ]) {
+      expect(__testHooks.isRetryableNetworkError(fetchError(code))).toBe(false);
+    }
+    expect(
+      __testHooks.isRetryableNetworkError(new TypeError("fetch failed")),
+    ).toBe(false);
+    expect(
+      __testHooks.isRetryableNetworkError(
+        new Error("fetch failed: ECONNREFUSED"),
+      ),
+    ).toBe(false);
+  });
 });
 
 describe("authoritative unified rate-limit handling", () => {
+  it("keeps an exhausted subscription window eligible when explicit overage is available", () => {
+    const now = 1_800_000_000_000;
+    const headers = new Headers({
+      "anthropic-ratelimit-unified-status": "rejected",
+      "anthropic-ratelimit-unified-5h-status": "rejected",
+      "anthropic-ratelimit-unified-5h-utilization": "1.0",
+      "anthropic-ratelimit-unified-5h-reset": String(now / 1000 + 3600),
+      "anthropic-ratelimit-unified-7d-status": "allowed",
+      "anthropic-ratelimit-unified-7d-utilization": "0.4",
+      "anthropic-ratelimit-unified-7d-reset": String(now / 1000 + 86400),
+      "anthropic-ratelimit-unified-fallback": "available",
+      "anthropic-ratelimit-unified-overage-status": "allowed",
+      "anthropic-ratelimit-unified-upgrade-paths": "overage",
+    });
+
+    const quota = parseQuotaHeaders(headers);
+    expect(quota).toMatchObject({
+      fallbackStatus: "available",
+      overageStatus: "allowed",
+      upgradePaths: "overage",
+    });
+    expect(isQuotaOverageAvailable(quota)).toBe(true);
+    expect(
+      __testHooks.planCooldownFor429(quota, 5_000, now, "rejected"),
+    ).toEqual({
+      reason: "transient",
+      coolingUntil: now + 5_000,
+      rotateImmediately: false,
+    });
+
+    const runtimeState = {
+      consecutiveRefreshFailures: 0,
+      permanentlyDisabled: false,
+      coolingUntil: now + 3600_000,
+      coolingReason: "session" as const,
+    };
+    expect(
+      __testHooks.reconcileCooldownFromQuota(
+        runtimeState as never,
+        quota!,
+        now,
+      ),
+    ).toEqual({ kind: "cleared", coolingUntil: now + 3600_000 });
+    expect(runtimeState.coolingUntil).toBeUndefined();
+    expect(runtimeState.coolingReason).toBeUndefined();
+  });
+
+  it("does not infer overage availability from a partial header set", () => {
+    expect(
+      isQuotaOverageAvailable({
+        fallbackPercentage: 0,
+        fallbackStatus: "available",
+        overageStatus: "allowed",
+      }),
+    ).toBe(false);
+    expect(
+      isQuotaOverageAvailable({
+        fallbackPercentage: 0.5,
+        fallbackStatus: "unknown",
+        overageStatus: "allowed",
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps absent upgrade paths nullable for routing diagnostics", () => {
+    const quota = parseQuotaHeaders(
+      new Headers({
+        "anthropic-ratelimit-unified-5h-utilization": "0.2",
+        "anthropic-ratelimit-unified-7d-utilization": "0.3",
+      }),
+    );
+    expect(quota?.upgradePaths).toBeUndefined();
+  });
+
+  it("honors the equivalent overage state in older persisted quota snapshots", () => {
+    expect(
+      isQuotaOverageAvailable({
+        fallbackPercentage: 0.5,
+        overageStatus: "allowed",
+      }),
+    ).toBe(true);
+  });
+
+  it("reports an overage-eligible rejected account as usable for routing", () => {
+    const now = 1_800_000_000_000;
+    __testHooks.resetAllRuntimeState();
+    __testHooks.setAccountRuntimeState("anthropic:overage", {
+      quota: {
+        unifiedStatus: "rejected",
+        sessionUsed: 1,
+        sessionStatus: "rejected",
+        sessionResetAt: now / 1000 + 3600,
+        weeklyUsed: 0.4,
+        weeklyStatus: "allowed",
+        weeklyResetAt: now / 1000 + 86400,
+        fallbackPercentage: 0.5,
+        fallbackStatus: "available",
+        overageStatus: "allowed",
+        upgradePaths: "overage",
+        lastUpdated: now,
+      },
+    });
+    const decision = __testHooks.buildQuotaRoutingDecision(
+      [
+        {
+          key: "anthropic:overage",
+          label: "overage",
+          token: "t",
+          type: "oauth",
+        },
+        { key: "anthropic:other", label: "other", token: "t", type: "oauth" },
+      ] as never,
+      now,
+      undefined,
+    );
+    expect(
+      decision?.candidates.find((candidate) => candidate.account === "overage"),
+    ).toMatchObject({ usable: true, overageEligible: true });
+    __testHooks.resetAllRuntimeState();
+  });
+
+  it("preserves weekly exhaustion even when overage is otherwise available", () => {
+    const now = 1_800_000_000_000;
+    const runtimeState = {
+      consecutiveRefreshFailures: 0,
+      permanentlyDisabled: false,
+      coolingUntil: now + 3600_000,
+      coolingReason: "session" as const,
+    };
+    expect(
+      __testHooks.reconcileCooldownFromQuota(
+        runtimeState as never,
+        {
+          unifiedStatus: "rejected",
+          sessionUsed: 1,
+          sessionStatus: "rejected",
+          sessionResetAt: now / 1000 + 3600,
+          weeklyUsed: 1,
+          weeklyStatus: "rejected",
+          weeklyResetAt: now / 1000 + 86_400,
+          fallbackPercentage: 0.5,
+          fallbackStatus: "available",
+          overageStatus: "allowed",
+          upgradePaths: "overage",
+          lastUpdated: now,
+        },
+        now,
+      ),
+    ).toMatchObject({ kind: "cooled", coolingReason: "weekly" });
+    expect(runtimeState.coolingReason).toBe("weekly");
+  });
+
   it("rotates immediately when unified is rejected but 5h and 7d are allowed", () => {
     const now = 1_800_000_000_000;
     const retryAfterMs = 12 * 60 * 60 * 1000;
@@ -1681,6 +1885,50 @@ describe("cooldown persistence", () => {
     await clearAccountCooldown("anthropic:a", coolingUntil + 1);
     expect(await loadAccountCooldowns()).toHaveProperty("anthropic:a");
     await clearAccountCooldown("anthropic:a", coolingUntil);
+    expect(await loadAccountCooldowns()).not.toHaveProperty("anthropic:a");
+  });
+
+  it("clears a legacy session cooldown when persisted quota permits overage", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "neurolink-overage-seed-"));
+    tempDirs.push(dir);
+    const cooldownPath = join(dir, "account-cooldowns.json");
+    const quotaPath = join(dir, "account-quotas.json");
+    const now = Date.now();
+    const coolingUntil = now + 60 * 60_000;
+
+    initAccountCooldown(cooldownPath);
+    initAccountQuota(quotaPath);
+    await saveAccountQuota("a", {
+      unifiedStatus: "rejected",
+      sessionUsed: 1,
+      sessionStatus: "rejected",
+      sessionResetAt: Math.floor(coolingUntil / 1000),
+      weeklyUsed: 0.4,
+      weeklyStatus: "allowed",
+      weeklyResetAt: Math.floor((now + 24 * 60 * 60_000) / 1000),
+      fallbackPercentage: 0.5,
+      overageStatus: "allowed",
+      lastUpdated: now,
+    });
+    await flushAccountQuotaStateForTests();
+    await saveAccountCooldown("anthropic:a", coolingUntil, "session");
+
+    __testHooks.resetAllRuntimeState();
+    initAccountCooldown(cooldownPath);
+    initAccountQuota(quotaPath);
+    await __testHooks.seedRuntimeQuotasFromDisk([
+      {
+        key: "anthropic:a",
+        label: "a",
+        token: "test-token",
+        type: "oauth",
+      },
+    ]);
+
+    expect(__testHooks.getAccountRuntimeState("anthropic:a")).toMatchObject({
+      coolingUntil: undefined,
+      coolingReason: undefined,
+    });
     expect(await loadAccountCooldowns()).not.toHaveProperty("anthropic:a");
   });
 
@@ -2550,6 +2798,73 @@ describe("stream terminal outcomes", () => {
       account.label,
       "stream_rate_limit_before_commit",
     );
+  });
+
+  it("does not replay a stream whose upstream transport fails before client commit", async () => {
+    const transportError = Object.assign(new TypeError("socket reset"), {
+      cause: { code: "ECONNRESET" },
+    });
+    const upstreamStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(transportError);
+      },
+    });
+    const account = {
+      key: "anthropic:primary@example.com",
+      label: "primary@example.com",
+      token: "test-token",
+      type: "oauth" as const,
+    };
+    const logAttempt = vi.fn();
+    const logFinalRequest = createRecordingErrorFinalRequestLogger();
+    const logProxyBody = vi.fn();
+    const upstreamSpan = { end: vi.fn() };
+    recordAttempt(account.label, account.type);
+
+    const result = await __testHooks.handleAnthropicStreamingSuccessResponse({
+      ctx: {} as never,
+      body: { model: "claude-opus-4-8", messages: [], stream: true },
+      account,
+      accountState: {
+        consecutiveRefreshFailures: 0,
+        permanentlyDisabled: false,
+      },
+      response: new Response(upstreamStream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+      responseHeaders: { "content-type": "text/event-stream" },
+      requestStartTime: Date.now(),
+      fetchStartMs: Date.now(),
+      attemptNumber: 1,
+      finalBodyStr: "{}",
+      upstreamSpan: upstreamSpan as never,
+      logAttempt,
+      logProxyBody,
+      logFinalRequest,
+    });
+
+    expect(result).toMatchObject({
+      response: {
+        type: "error",
+        error: { type: "api_error", message: "socket reset (ECONNRESET)" },
+      },
+    });
+    expect(result).not.toHaveProperty("retryNextAccount");
+    expect(logAttempt).toHaveBeenCalledWith(
+      502,
+      "stream_error",
+      "socket reset (ECONNRESET)",
+      { retryable: false },
+    );
+    expect(logFinalRequest).toHaveBeenCalledWith(
+      502,
+      account.label,
+      account.type,
+      "stream_error",
+      "socket reset (ECONNRESET)",
+    );
+    expect(upstreamSpan.end).toHaveBeenCalledOnce();
   });
 
   it("settles failed-stream telemetry exactly once", async () => {
