@@ -45,6 +45,15 @@ import {
 import { ERROR_CODES, NeuroLinkError } from "../../utils/errorHandling.js";
 import { logger } from "../../utils/logger.js";
 import {
+  GEMINI_ELISION_NOTE,
+  planGeminiLoopReclaim,
+  previewGeminiToolResponseText,
+} from "../../context/geminiLoopGuard.js";
+import {
+  getAvailableInputTokens,
+  getContextWindowSize,
+} from "../../constants/contextWindows.js";
+import {
   composeAbortSignals,
   createTimeoutController,
   TimeoutError,
@@ -60,6 +69,7 @@ import {
   collectStreamChunks,
   collectStreamChunksIncremental,
   computeMaxSteps,
+  createContextGuard,
   createTextChannel,
   buildUserPartsWithMultimodal,
   executeNativeToolCalls,
@@ -133,6 +143,88 @@ async function createGoogleGenAIClient(apiKey: string): Promise<GenAIClient> {
  * @note "Too many states for serving" errors can occur with complex schemas + tools.
  *       Solution: Simplify schema or use disableTools: true
  */
+
+/**
+ * Reclaim context from an AI Studio loop history IN PLACE.
+ *
+ * This loop had NO in-turn guard at all — it appended a model turn plus a tool
+ * turn every step with nothing bounding growth, so a long agentic run walked
+ * into a provider "context length exceeded" and lost every completed step.
+ * Shares its reclaim policy with the other provider loops via loopGuardCore.
+ *
+ * Returns true when something was reclaimed.
+ */
+function reclaimAiStudioContext(
+  contents: Array<{ role: string; parts: unknown[] }>,
+  modelName: string,
+  observedPromptTokens?: number,
+): boolean {
+  const plan = planGeminiLoopReclaim({
+    contents,
+    availableInputTokens: getAvailableInputTokens("googleAiStudio", modelName),
+    provider: "googleAiStudio",
+    ...(observedPromptTokens ? { observedPromptTokens } : {}),
+  });
+  if (!plan) {
+    return false;
+  }
+  const dropSet = new Set(plan.drop);
+  const truncateSet = new Set(plan.truncate);
+  const rebuilt: Array<{ role: string; parts: unknown[] }> = [];
+  for (let i = 0; i < contents.length; i++) {
+    if (dropSet.has(i)) {
+      continue;
+    }
+    const content = contents[i];
+    if (truncateSet.has(i) && Array.isArray(content.parts)) {
+      rebuilt.push({
+        ...content,
+        parts: content.parts.map((part) => {
+          const record = part as {
+            functionResponse?: { name?: string; response?: unknown };
+          };
+          if (!record.functionResponse) {
+            return part;
+          }
+          const text = JSON.stringify(record.functionResponse.response) ?? "";
+          if (text.length <= 2048) {
+            return part;
+          }
+          return {
+            functionResponse: {
+              name: record.functionResponse.name,
+              response: { result: previewGeminiToolResponseText(text) },
+            },
+          };
+        }),
+      });
+      continue;
+    }
+    rebuilt.push(content);
+  }
+  if (dropSet.size > 0) {
+    let noteIndex = rebuilt.findIndex(
+      (c) =>
+        Array.isArray(c.parts) &&
+        c.parts.some(
+          (part) =>
+            !!(part as { functionCall?: unknown }).functionCall ||
+            !!(part as { functionResponse?: unknown }).functionResponse,
+        ),
+    );
+    if (noteIndex < 0) {
+      noteIndex = Math.min(1, rebuilt.length);
+    }
+    rebuilt.splice(noteIndex, 0, {
+      role: "user",
+      parts: [{ text: GEMINI_ELISION_NOTE }],
+    });
+  }
+  contents.length = 0;
+  contents.push(...rebuilt);
+  return true;
+}
+
 export class GoogleAIStudioProvider extends BaseProvider {
   private credentials?: { apiKey?: string };
 
@@ -842,10 +934,36 @@ export class GoogleAIStudioProvider extends BaseProvider {
               string,
               { count: number; lastError: string }
             >();
+            // Cheap trigger for the in-turn reclaim, mirroring the Vertex twin.
+            // Planning serializes the WHOLE accumulated history to estimate it,
+            // so running it unconditionally charges that once per step for the
+            // life of the turn; the guard tracks real prompt counts plus
+            // measured growth instead, and it supplies the observed count that
+            // calibrates the planner's char estimate.
+            const contextGuard = createContextGuard(
+              getContextWindowSize("googleAiStudio", modelName),
+            );
 
             try {
               // Agentic loop for tool calling
               while (step < maxSteps) {
+                // In-turn context guard: this loop appends a model turn plus a
+                // tool turn every step with nothing bounding growth. No-op
+                // while the request still fits, so a loop that fits never pays
+                // a cache invalidation. Step 0 still plans unconditionally —
+                // the guard has no usage to go on yet, and the incoming history
+                // can already be oversized before the first call.
+                if (step === 0 || contextGuard.shouldStop()) {
+                  if (
+                    reclaimAiStudioContext(
+                      currentContents,
+                      modelName,
+                      contextGuard.projectedNextPromptTokens,
+                    )
+                  ) {
+                    contextGuard.resetAfterReclaim();
+                  }
+                }
                 if (composedSignal?.aborted) {
                   throw composedSignal.reason instanceof Error
                     ? composedSignal.reason
@@ -887,6 +1005,13 @@ export class GoogleAIStudioProvider extends BaseProvider {
                   totalOutputTokens += chunkResult.outputTokens;
                   totalCacheReadTokens += chunkResult.cacheReadTokens ?? 0;
                   totalReasoningTokens += chunkResult.reasoningTokens ?? 0;
+                  // `inputTokens` is this step's promptTokenCount — the FULL
+                  // prompt size for the request just made, which is what the
+                  // guard projects the next request from.
+                  contextGuard.noteUsage(
+                    chunkResult.inputTokens,
+                    chunkResult.outputTokens,
+                  );
 
                   const stepText = extractTextFromParts(
                     chunkResult.rawResponseParts,
@@ -988,6 +1113,15 @@ export class GoogleAIStudioProvider extends BaseProvider {
                     role: "user",
                     parts: functionResponses as unknown[],
                   });
+                  // Project this step's growth: the appended tool results ride
+                  // the next prompt, which the provider has not reported on yet.
+                  try {
+                    contextGuard.noteAppendedChars(
+                      JSON.stringify(functionResponses).length,
+                    );
+                  } catch {
+                    /* estimation is best-effort — never break the loop */
+                  }
                 } catch (error) {
                   logger.error("[GoogleAIStudio] Native SDK error", error);
                   throw this.handleProviderError(error);
@@ -1252,9 +1386,25 @@ export class GoogleAIStudioProvider extends BaseProvider {
             string,
             { count: number; lastError: string }
           >();
+          // Cheap reclaim trigger — see the stream twin.
+          const contextGuard = createContextGuard(
+            getContextWindowSize("googleAiStudio", modelName),
+          );
 
           // Agentic loop for tool calling
           while (step < maxSteps) {
+            // In-turn context guard — see the stream twin.
+            if (step === 0 || contextGuard.shouldStop()) {
+              if (
+                reclaimAiStudioContext(
+                  currentContents,
+                  modelName,
+                  contextGuard.projectedNextPromptTokens,
+                )
+              ) {
+                contextGuard.resetAfterReclaim();
+              }
+            }
             if (composedSignal?.aborted) {
               throw composedSignal.reason instanceof Error
                 ? composedSignal.reason
@@ -1284,6 +1434,10 @@ export class GoogleAIStudioProvider extends BaseProvider {
               totalOutputTokens += chunkResult.outputTokens;
               totalCacheReadTokens += chunkResult.cacheReadTokens ?? 0;
               totalReasoningTokens += chunkResult.reasoningTokens ?? 0;
+              contextGuard.noteUsage(
+                chunkResult.inputTokens,
+                chunkResult.outputTokens,
+              );
 
               const stepText = extractTextFromParts(
                 chunkResult.rawResponseParts,
@@ -1380,6 +1534,15 @@ export class GoogleAIStudioProvider extends BaseProvider {
                 role: "user",
                 parts: functionResponses,
               });
+              // Project this step's growth: the appended tool results ride
+              // the next prompt, which the provider has not reported on yet.
+              try {
+                contextGuard.noteAppendedChars(
+                  JSON.stringify(functionResponses).length,
+                );
+              } catch {
+                /* estimation is best-effort — never break the loop */
+              }
             } catch (error) {
               logger.error("[GoogleAIStudio] Native SDK generate error", error);
               throw this.handleProviderError(error);

@@ -1,6 +1,6 @@
 {
   "name": "@juspay/neurolink",
-  "version": "10.10.4",
+  "version": "10.10.6",
   "packageManager": "pnpm@10.15.1",
   "description": "TypeScript AI SDK with 24+ LLM providers behind one consistent API. MCP-native (connect any MCP server), voice TTS/STT/realtime, RAG, agents, memory, context compaction. OpenAI · Anthropic · Gemini · Bedrock · Azure · Ollama · DeepSeek · NVIDIA NIM and more.",
   "author": {
@@ -85,6 +85,12 @@
     "test:tool-pairing": "npx tsx test/continuous-test-suite-tool-pairing.ts",
     "test:token-accounting": "npx tsx test/continuous-test-suite-token-accounting.ts",
     "test:step-guard": "npx tsx test/continuous-test-suite-step-guard.ts",
+    "test:loop-guard-core": "npx tsx test/continuous-test-suite-loop-guard-core.ts",
+    "test:openai-compat-guard": "npx tsx test/continuous-test-suite-openai-compat-guard.ts",
+    "test:anthropic-guard": "npx tsx test/continuous-test-suite-anthropic-guard.ts",
+    "test:tool-storage-parity": "npx tsx test/continuous-test-suite-tool-storage-parity.ts",
+    "test:redis-append-only": "npx tsx test/continuous-test-suite-redis-append-only.ts",
+    "test:gemini-guard": "npx tsx test/continuous-test-suite-gemini-guard.ts",
     "test:middleware": "npx tsx test/continuous-test-suite-middleware.ts",
     "test:observability": "npx tsx test/continuous-test-suite-observability.ts",
     "test:ppt": "npx tsx test/continuous-test-suite-ppt.ts",
