@@ -1,3 +1,21 @@
+## [10.10.4](https://github.com/juspay/neurolink/compare/v10.10.3...v10.10.4) (2026-08-06)
+
+### Bug Fixes
+
+- **(context):** reclaim to a low-water mark in the step budget guard ([4866db8](https://github.com/juspay/neurolink/commit/4866db8b9a04ff3c4bc8ca479dc019eb1471955d))
+
+## [10.10.3](https://github.com/juspay/neurolink/compare/v10.10.2...v10.10.3) (2026-08-06)
+
+### Bug Fixes
+
+- **(context):** count tool args and target history budget when compacting ([613709b](https://github.com/juspay/neurolink/commit/613709b3473b38f897d61393a53abf416e07c46f))
+
+## [10.10.2](https://github.com/juspay/neurolink/compare/v10.10.1...v10.10.2) (2026-08-06)
+
+### Bug Fixes
+
+- **(context):** pair tool calls by id instead of adjacency ([a0f49e4](https://github.com/juspay/neurolink/commit/a0f49e4073e9f2ad02d39dbe0647eb4bf04b4b16))
+
 ## [10.10.1](https://github.com/juspay/neurolink/compare/v10.10.0...v10.10.1) (2026-08-06)
 
 ### Bug Fixes

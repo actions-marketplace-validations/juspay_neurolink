@@ -1,6 +1,6 @@
 {
   "name": "@juspay/neurolink",
-  "version": "10.10.1",
+  "version": "10.10.4",
   "packageManager": "pnpm@10.15.1",
   "description": "TypeScript AI SDK with 24+ LLM providers behind one consistent API. MCP-native (connect any MCP server), voice TTS/STT/realtime, RAG, agents, memory, context compaction. OpenAI · Anthropic · Gemini · Bedrock · Azure · Ollama · DeepSeek · NVIDIA NIM and more.",
   "author": {
@@ -82,6 +82,9 @@
     "test:media": "npx tsx test/continuous-test-suite-media-gen.ts",
     "test:litellm-parity": "npx tsx test/continuous-test-suite-litellm-parity.ts",
     "test:memory": "npx tsx test/continuous-test-suite-memory.ts",
+    "test:tool-pairing": "npx tsx test/continuous-test-suite-tool-pairing.ts",
+    "test:token-accounting": "npx tsx test/continuous-test-suite-token-accounting.ts",
+    "test:step-guard": "npx tsx test/continuous-test-suite-step-guard.ts",
     "test:middleware": "npx tsx test/continuous-test-suite-middleware.ts",
     "test:observability": "npx tsx test/continuous-test-suite-observability.ts",
     "test:ppt": "npx tsx test/continuous-test-suite-ppt.ts",
