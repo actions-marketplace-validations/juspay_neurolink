@@ -353,6 +353,22 @@ export type AudioProcessorOptions = {
 };
 
 /**
+ * Keyframe-extraction knobs for an attached video (#478).
+ *
+ * These back the `--video-frames` / `--video-quality` / `--video-format` CLI
+ * flags and `GenerateOptions.videoOptions`. Each is clamped to the processor's
+ * own ceiling — a caller cannot raise `frames` above VIDEO_CONFIG.MAX_FRAMES.
+ */
+export type VideoProcessorOptions = {
+  /** Max keyframes to extract. Clamped to the processor's MAX_FRAMES ceiling. */
+  frames?: number;
+  /** Encoder quality 1-100 for the extracted frames. */
+  quality?: number;
+  /** Frame encoding. Defaults to jpeg. */
+  format?: "jpeg" | "png";
+};
+
+/**
  * Office processor options for Word, PowerPoint, and Excel documents
  *
  * @example Word document processing (docx)
@@ -417,6 +433,7 @@ export type FileDetectorOptions = {
   audioOptions?: AudioProcessorOptions;
   csvOptions?: CSVProcessorOptions;
   officeOptions?: OfficeProcessorOptions;
+  videoOptions?: VideoProcessorOptions;
   confidenceThreshold?: number;
   provider?: string;
   /** Maximum number of retry attempts for network requests (default: 3) */
@@ -496,6 +513,28 @@ export type PDFImagePage = {
   imageSizeBytes: number;
   /** Populated when this page failed to render (#294). */
   error?: string;
+};
+
+/**
+ * A single PDF queued for multimodal message building, normalised from either
+ * submission surface — `input.pdfFiles` or `input.content` with `type: "pdf"`
+ * — so both can share the aggregate page/size guard (#309).
+ */
+export type MultimodalPdfEntry = {
+  /** Raw PDF bytes. */
+  buffer: Buffer;
+  /** Display name; may be a full path, so log only its basename. */
+  filename: string;
+  /**
+   * Page count when known. Null/undefined on the `input.content` path whenever
+   * the caller omitted `metadata.pages`; the aggregate guard resolves those
+   * from `buffer` rather than treating them as zero.
+   */
+  pageCount?: number | null;
+  /** Password for an encrypted PDF (#258). */
+  password?: string;
+  /** Per-page pixel ceiling for the image fallback (#260). */
+  maxCanvasPixels?: number;
 };
 
 /** Result of PDF to image conversion. */
