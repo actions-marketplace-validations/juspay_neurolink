@@ -244,6 +244,12 @@ export type CSVProcessorOptions = {
    * rather than hanging forever. Defaults: 30s for strings, 5min for files.
    */
   parseTimeoutMs?: number;
+  /**
+   * Skip blank / whitespace-only data rows (#373). Default `true`: blank lines
+   * are excluded from the returned content (including raw CSV text) and from
+   * `metadata.rowCount`. Set to `false` to preserve empty lines literally.
+   */
+  skipEmptyLines?: boolean;
 };
 
 /**
@@ -535,6 +541,10 @@ export type MultimodalPdfEntry = {
   password?: string;
   /** Per-page pixel ceiling for the image fallback (#260). */
   maxCanvasPixels?: number;
+  /** Render scale for the image fallback (#297). */
+  scale?: number;
+  /** Max pages converted by the image fallback (#297). */
+  maxPages?: number;
 };
 
 /** Result of PDF to image conversion. */
