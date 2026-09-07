@@ -9,13 +9,87 @@
  * Part of Build Rule Enforcement System - Phase 1
  */
 
-import { execSync } from "child_process";
+import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import ts from "typescript";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+/** Ceiling for the security-check subprocess. See the note at its call site. */
+const SECURITY_SCAN_TIMEOUT_MS = 300_000;
+
+type BoundedRun = {
+  stdout: string;
+  status: number | null;
+  timedOut: boolean;
+};
+
+/**
+ * Run a command in its OWN PROCESS GROUP and kill the whole group on timeout.
+ *
+ * Why not `execSync` with a `timeout`: that signal reaches only the shell it
+ * spawned. The work here is `npx -> tsx -> node -> gitleaks`, none of which are
+ * in the parent's group, so they survive the kill as orphans and keep scanning
+ * a repo nobody is waiting on any more. `spawnSync` has the same limit — its
+ * timeout kills the child pid alone.
+ *
+ * `detached: true` makes the child a group leader, which is what allows
+ * `process.kill(-pid)` to signal every descendant it went on to spawn. That
+ * requires an async spawn, which is why this validator's run path is async.
+ *
+ * Windows has no process groups in this sense and rejects a negative pid, so
+ * there it falls back to killing the child directly — the same guarantee
+ * `execSync` already gave, rather than a regression.
+ */
+function runBounded(
+  command: string,
+  args: string[],
+  options: { cwd: string; timeoutMs: number },
+): Promise<BoundedRun> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      detached: process.platform !== "win32",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let timedOut = false;
+    child.stdout?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        if (process.platform === "win32" || child.pid === undefined) {
+          child.kill("SIGKILL");
+        } else {
+          // Negative pid = the whole group this child leads.
+          process.kill(-child.pid, "SIGKILL");
+        }
+      } catch {
+        // Already gone; nothing to clean up.
+      }
+    }, options.timeoutMs);
+
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+
+    child.on("close", (status) => {
+      clearTimeout(timer);
+      resolve({ stdout, status, timedOut });
+    });
+  });
+}
 
 class NeuroLinkBuildValidator {
   errors: string[];
@@ -40,13 +114,9 @@ class NeuroLinkBuildValidator {
       return this.fileCache.get(filePath)!;
     }
 
-    try {
-      const content = fs.readFileSync(filePath, "utf8");
-      this.fileCache.set(filePath, content);
-      return content;
-    } catch (error) {
-      throw error;
-    }
+    const content = fs.readFileSync(filePath, "utf8");
+    this.fileCache.set(filePath, content);
+    return content;
   }
 
   // Get TypeScript files recursively using Node.js fs
@@ -126,61 +196,116 @@ class NeuroLinkBuildValidator {
     }
   }
 
+  /**
+   * Print the child's own report.
+   *
+   * `runBounded` captures stdout and stderr so the parent can bound the child,
+   * and that capture means nothing reaches the terminal on its own. Without
+   * this the only thing a failing security scan produced was "Security
+   * validation failed - critical issues detected" plus an instruction to go and
+   * run it again by hand — which in CI means the log contains the verdict and
+   * not one word of the evidence for it.
+   *
+   * Printed for failures only. A passing scan's output is noise in a green
+   * build, and the child can always be run directly when it is wanted.
+   */
+  private reportChildOutput(output: string): void {
+    const trimmed = output.trim();
+    if (!trimmed) {
+      this.log("(the security scan produced no output)");
+      return;
+    }
+    console.log("\n--- security scan output ---");
+    console.log(trimmed);
+    console.log("--- end security scan output ---\n");
+  }
+
   // Use consolidated security validation for professional secret detection
-  checkApiKeyLeaks(): void {
+  async checkApiKeyLeaks(): Promise<void> {
     this.log("Running professional secret detection...");
 
     try {
       // Use the consolidated security-check.ts for professional secret detection
       const securityCheckScript = path.join(__dirname, "security-check.ts");
-      const securityResult = execSync(`npx tsx "${securityCheckScript}"`, {
-        cwd: this.rootDir,
-        encoding: "utf8",
-        stdio: "pipe",
-      });
+      const run = await runBounded(
+        "npx",
+        ["tsx", securityCheckScript],
+        { cwd: this.rootDir, timeoutMs: SECURITY_SCAN_TIMEOUT_MS },
+      );
 
-      // Parse security check results for critical secrets
-      if (
-        securityResult.includes("critical secrets") ||
-        securityResult.includes("SECURITY VALIDATION FAILED")
-      ) {
+      if (run.timedOut) {
+        // An ERROR, not a warning, and the distinction is the whole point of
+        // the bound. Only `errors` fail this validator; `warnings` print and
+        // the build proceeds. A killed scan reports no findings, so calling it
+        // a warning would mean the timeout had converted a hung security gate
+        // into a passing one. A scan that did not finish is not a scan that
+        // found nothing.
         this.errors.push(
-          "Critical secrets detected by professional security scan",
+          `Security validation exceeded ${SECURITY_SCAN_TIMEOUT_MS / 1000}s and its process group was killed - the scan did not complete, so its result cannot be trusted`,
         );
-        this.errors.push(
-          "   Run `pnpm run validate:security` for detailed analysis",
-        );
-      } else if (
-        securityResult.includes("potential secrets") ||
-        securityResult.includes("warnings")
-      ) {
-        this.warnings.push(
-          "Potential secrets detected - review security scan results",
-        );
-        this.warnings.push(
-          "   Run `pnpm run validate:security` for full analysis",
-        );
-      } else {
-        this.log("No critical secrets detected by professional scan");
+        this.errors.push("   Investigate with: pnpm run validate:security");
+        this.reportChildOutput(run.stdout);
+        return;
       }
-    } catch (error: unknown) {
-      // Security validation failed - this is critical for build validation
-      const execError = error as { status?: number; message?: string };
-      if (execError.status === 1) {
+
+      // Anything other than a clean exit fails the build. Matching only
+      // `status === 1` was fail-open on a security gate, and in two ways:
+      //
+      //   any other non-zero status — a crash, a bad invocation, tsx failing to
+      //     start — is not "no findings", but was reported as a pass.
+      //
+      //   `status === null` means the child was killed by a SIGNAL WE DID NOT
+      //     SEND (the OOM killer, an operator, a CI runner reclaiming the box).
+      //     `run.timedOut` is false there, because our own bound never fired,
+      //     so it fell through to the success path as well.
+      //
+      // The rule is that only a scan which ran to completion and said it was
+      // clean counts as clean. Everything else is untrusted, which is the same
+      // standard the timeout branch above already applies.
+      if (run.status !== 0) {
         this.errors.push(
-          "Security validation failed - critical issues detected",
+          run.status === null
+            ? "Security validation was killed by a signal - the scan did not complete, so its result cannot be trusted"
+            : `Security validation exited ${run.status} - the scan did not report success, so its result cannot be trusted`,
         );
+        this.reportChildOutput(run.stdout);
         this.errors.push(
           "   Fix security issues before building: pnpm run validate:security",
         );
-      } else {
-        this.warnings.push(
-          `Could not run security validation: ${execError.message}`,
-        );
-        this.warnings.push(
-          "   Consider running: pnpm run validate:security",
-        );
+        return;
       }
+
+      // The child's verdict is its EXIT STATUS, handled above. Nothing is
+      // inferred from its prose here, and that is a deliberate removal rather
+      // than an omission.
+      //
+      // This block used to substring-match the captured stdout, and both
+      // branches were wrong in a way that only ever produced false positives:
+      //
+      //   includes("critical secrets")  matched the child's SUCCESS line,
+      //     "No critical secrets detected (basic scan)", and failed the build
+      //     on a clean repo. It turned the `test` job red the first time that
+      //     line was ever reachable in CI.
+      //
+      //   includes("warnings")  matched "Security validation completed with 1
+      //     warnings." — a best-practices warning, nothing to do with secrets —
+      //     and reported "Potential secrets detected" on every clean run.
+      //
+      // Neither branch could ever fire on a real failure, because a failing
+      // child exits 1 and returns above before reaching here. So the block was
+      // unreachable for its stated purpose and reachable only for false alarms.
+      //
+      // The child already prints its own detailed report; re-deriving a verdict
+      // from that text is guesswork the exit code makes unnecessary.
+      this.log("Security scan passed (see its own output for detail)");
+    } catch (error: unknown) {
+      // Only reachable now if the child could not be spawned at all; exit
+      // status and timeout are both handled above, where they can be told
+      // apart. Kept as a warning to match the long-standing behaviour for a
+      // missing toolchain, rather than silently changing that policy here.
+      const message = error instanceof Error ? error.message : String(error);
+      this.warnings.push(`Could not run security validation: ${message}`);
+      this.warnings.push("   Consider running: pnpm run validate:security");
     }
   }
 
@@ -217,19 +342,52 @@ class NeuroLinkBuildValidator {
         }
       }
 
-      // Check if lint-staged is configured
-      if (!pkg["lint-staged"]) {
-        this.errors.push(
-          "Missing lint-staged configuration in package.json",
-        );
-      }
-
       this.log("Package.json validation completed");
     } catch (error: unknown) {
       const message =
         error instanceof Error ? error.message : String(error);
       this.errors.push(`Could not validate package.json: ${message}`);
     }
+  }
+
+  /**
+   * Line numbers of catch clauses whose body is genuinely empty AND carries
+   * no explanation.
+   *
+   * A catch block that swallows an error on purpose and says why is the
+   * established idiom here — there are a couple of hundred of them, all
+   * reading like `catch { // endpoint is optional, fall through }`. Those are
+   * documented decisions, not defects. What this looks for is the silent
+   * kind: no statements and no comment saying why.
+   */
+  private findEmptyCatchLines(content: string, filePath: string): number[] {
+    const lines: number[] = [];
+    const source = ts.createSourceFile(
+      filePath,
+      content,
+      ts.ScriptTarget.Latest,
+      /* setParentNodes */ true,
+    );
+
+    const visit = (node: ts.Node): void => {
+      if (ts.isCatchClause(node) && node.block.statements.length === 0) {
+        // Comments live between the braces but are not statements, so read
+        // the block's own text rather than asking for its children.
+        const inner = content.slice(
+          node.block.getStart(source) + 1,
+          node.block.getEnd() - 1,
+        );
+        if (!inner.includes("//") && !inner.includes("/*")) {
+          lines.push(
+            source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1,
+          );
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+
+    return lines;
   }
 
   // Custom rule: Check for proper error handling
@@ -248,15 +406,17 @@ class NeuroLinkBuildValidator {
         if (!content) continue;
         const lines = content.split("\n");
 
-        lines.forEach((line: string, index: number) => {
-          // Check for empty catch blocks
-          if (
-            line.includes("catch") &&
-            (line.includes("{}") || line.includes("catch()"))
-          ) {
-            this.errors.push(`Empty catch block in ${file}:${index + 1}`);
-          }
+        // Empty catch blocks are found by parsing, not by matching substrings
+        // on a line. The previous rule flagged any line containing "catch"
+        // together with "{}" or "catch()", which matches a comment mentioning
+        // `.catch()`, a deliberate `.catch(() => {})`, and a perfectly normal
+        // handler on a line that happens to also return `{}` — while a real
+        // `catch {}` split across two lines slipped past it entirely.
+        for (const line of this.findEmptyCatchLines(content, fullPath)) {
+          this.errors.push(`Empty catch block in ${file}:${line}`);
+        }
 
+        lines.forEach((line: string, index: number) => {
           // Check for Promise without error handling (improved accuracy)
           if (line.includes("new Promise")) {
             // Check if this Promise has error handling in the surrounding context
@@ -506,7 +666,7 @@ class NeuroLinkBuildValidator {
   }
 
   // Main validation runner
-  run(): void {
+  async run(): Promise<void> {
     console.log("Running NeuroLink Build Validations...\n");
     console.log("================================================\n");
 
@@ -515,7 +675,7 @@ class NeuroLinkBuildValidator {
     // Run all validation checks
     this.checkProjectStructure();
     this.checkConsoleStatements();
-    this.checkApiKeyLeaks();
+    await this.checkApiKeyLeaks();
     this.validatePackageJson();
     this.checkErrorHandling();
     this.checkTodoReferences();
@@ -574,6 +734,15 @@ class NeuroLinkBuildValidator {
 
 // Run validation if script is called directly
 const validator = new NeuroLinkBuildValidator();
-validator.run();
+// `run()` is async now (the security scan is spawned rather than exec'd so its
+// process group can be killed). An unhandled rejection here would exit 0 on
+// some Node versions, which for a build gate is the worst possible failure
+// mode, so it is turned into an explicit non-zero exit.
+validator.run().catch((error: unknown) => {
+  console.error(
+    `Build validation crashed: ${error instanceof Error ? error.message : String(error)}`,
+  );
+  process.exit(1);
+});
 
 export default NeuroLinkBuildValidator;

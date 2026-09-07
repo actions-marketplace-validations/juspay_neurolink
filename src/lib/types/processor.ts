@@ -883,8 +883,58 @@ export type ArchiveFormat =
   | "tar.gz"
   | "tar.bz2"
   | "gz"
+  | "bz2"
+  | "xz"
+  | "zst"
   | "rar"
   | "7z";
+
+/**
+ * Outcome of decompressing a single-stream archive (.bz2, .xz, .zst).
+ *
+ * A plain `Buffer | null` collapsed two very different failures into one: a
+ * machine that has no `xz` installed and a `.xz` file that is corrupt both
+ * returned null, and the caller reported both as "the command is unavailable on
+ * this machine" — actively misleading for the second. The reason is carried so
+ * the message can match the fact.
+ */
+export type ArchiveDecompressionResult =
+  | { readonly status: "ok"; readonly buffer: Buffer }
+  | { readonly status: "tool-unavailable" }
+  | { readonly status: "too-large" }
+  | { readonly status: "failed" };
+
+/**
+ * Outcome of reading one ZIP entry under an explicit output bound.
+ *
+ * Separate from {@link ArchiveDecompressionResult} because the failures differ:
+ * a single-stream archive can fail for want of an external tool, while a ZIP
+ * entry can instead use a compression method this reader does not implement.
+ * Collapsing them would force one caller to handle a state it can never see.
+ *
+ * `too-large` is a distinct outcome rather than a corrupt-file error because it
+ * is a verdict about our limit, not about the archive: the entry may be
+ * perfectly well-formed, and telling the user it is damaged would send them to
+ * re-create a file that was never broken.
+ */
+/**
+ * The slice of an adm-zip entry the bounded reader depends on.
+ *
+ * Structural rather than adm-zip's own `IZipEntry` so the reader states what it
+ * actually needs — the compressed bytes and the header fields it refuses to
+ * trust — instead of importing a library type it would then have to satisfy in
+ * full when building a test double.
+ */
+export type BoundedZipEntry = {
+  getCompressedData: () => Buffer;
+  header: { method: number; crc: number };
+};
+
+export type ArchiveEntryReadResult =
+  | { readonly status: "ok"; readonly buffer: Buffer }
+  | { readonly status: "too-large" }
+  | { readonly status: "unsupported-method" }
+  | { readonly status: "corrupt" };
 
 /**
  * Metadata about an individual entry within an archive.

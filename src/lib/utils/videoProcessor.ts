@@ -20,17 +20,25 @@ import {
   getMetricsAggregator,
 } from "../observability/index.js";
 import type {
+  VideoGenerateOptions,
   VideoGenerationResult,
   VideoHandler,
   VideoOutputOptions,
   VideoTransitionOptions,
 } from "../types/index.js";
 import { logger } from "./logger.js";
+import { withTimeout } from "./async/withTimeout.js";
+
+// Video generation is legitimately minutes-long (Kling/Runway render queues),
+// so the bound is generous — its job is to convert a wedged handler into an
+// error rather than an eternal hang, not to police normal latency.
+const VIDEO_GENERATION_TIMEOUT_MS = 600_000;
 // VideoError is canonical in vertexVideoHandler.ts (existing). Re-export
 // here so consumers of `VideoProcessor` can import the typed error from
 // the same module. Both throws and instanceof checks resolve to the same
 // class.
 import { VideoError } from "../adapters/video/vertexVideoHandler.js";
+import { HandlerRegistry } from "../core/handlerRegistry.js";
 
 export { VideoError, VIDEO_ERROR_CODES };
 
@@ -42,25 +50,16 @@ export { VideoError, VIDEO_ERROR_CODES };
  * O(1) on a normalised lower-case provider key.
  */
 export class VideoProcessor {
-  private static readonly handlers = new Map<string, VideoHandler>();
+  private static readonly registry = new HandlerRegistry<VideoHandler>(
+    "VideoProcessor",
+  );
 
   /**
    * Register a video handler for a specific provider.
    */
   static registerHandler(providerName: string, handler: VideoHandler): void {
-    if (!providerName) {
-      throw new Error("Provider name is required");
-    }
-    if (!handler) {
-      throw new Error("Handler is required");
-    }
-    const key = providerName.toLowerCase();
-    if (this.handlers.has(key)) {
-      logger.warn(
-        `[VideoProcessor] Overwriting existing handler for provider: ${key}`,
-      );
-    }
-    this.handlers.set(key, handler);
+    const key = providerName ? providerName.toLowerCase() : providerName;
+    this.registry.register(providerName, handler);
     logger.debug(`[VideoProcessor] Registered video handler: ${key}`);
   }
 
@@ -68,21 +67,25 @@ export class VideoProcessor {
    * Check if a provider has a registered video handler.
    */
   static supports(providerName: string): boolean {
-    if (!providerName) {
-      return false;
-    }
-    return this.handlers.has(providerName.toLowerCase());
+    return this.registry.supports(providerName);
   }
 
   /**
    * List the names of all registered providers.
    */
   static listProviders(): string[] {
-    return Array.from(this.handlers.keys());
+    return this.registry.list();
   }
 
   private static getHandler(providerName: string): VideoHandler | undefined {
-    return this.handlers.get(providerName.toLowerCase());
+    return this.registry.get(providerName);
+  }
+
+  /**
+   * Clear all registered handlers (for testing).
+   */
+  static clearHandlers(): void {
+    this.registry.clear();
   }
 
   private static buildSpanAttributes(
@@ -103,12 +106,21 @@ export class VideoProcessor {
    * Generate a single video clip via the registered handler.
    *
    * @param provider - Registered provider name (e.g. "vertex", "kling")
-   * @param image - Source image buffer
-   * @param prompt - Text prompt describing the desired motion / content
-   * @param options - Resolution / length / aspect-ratio / audio options
-   * @param region - Optional region override (Vertex location, etc.)
+   * @param options - Bag of the source image, prompt, optional region
+   *   override, and resolution / length / aspect-ratio / audio options.
+   *   Translated internally into the handler-level 4-positional-argument
+   *   call — `VideoHandler.generate()`'s own signature is unchanged.
    * @throws VideoError on registry miss, handler-not-configured, or
    *         generation failure
+   */
+  static async generate(
+    provider: string,
+    options: VideoGenerateOptions,
+  ): Promise<VideoGenerationResult>;
+  /**
+   * @deprecated Positional form kept for backward compatibility with
+   * pre-bag callers (VideoProcessor is a public export). Use the
+   * options-bag overload.
    */
   static async generate(
     provider: string,
@@ -116,11 +128,37 @@ export class VideoProcessor {
     prompt: string,
     options: VideoOutputOptions,
     region?: string,
+  ): Promise<VideoGenerationResult>;
+  static async generate(
+    provider: string,
+    optionsOrImage: VideoGenerateOptions | Buffer,
+    legacyPrompt?: string,
+    legacyOptions?: VideoOutputOptions,
+    legacyRegion?: string,
   ): Promise<VideoGenerationResult> {
+    const bag: VideoGenerateOptions = Buffer.isBuffer(optionsOrImage)
+      ? {
+          image: optionsOrImage,
+          prompt: legacyPrompt ?? "",
+          ...(legacyRegion !== undefined ? { region: legacyRegion } : {}),
+          ...(legacyOptions ?? {}),
+        }
+      : optionsOrImage;
+    const { image, prompt, region, ...videoOptions } = bag;
+    // A fired timeout must also cancel the handler's own request/polling
+    // loop — otherwise the caller sees the rejection while a ghost
+    // generation keeps polling (and possibly billing) for the rest of the
+    // render. Chain the internal controller onto any caller-supplied
+    // signal so both cancellation sources reach the handler.
+    const timeoutAbort = new AbortController();
+    const abortSignal = videoOptions.abortSignal
+      ? AbortSignal.any([videoOptions.abortSignal, timeoutAbort.signal])
+      : timeoutAbort.signal;
+    const handlerOptions: VideoOutputOptions = { ...videoOptions, abortSignal };
     const span = SpanSerializer.createSpan(
       SpanType.MEDIA_GENERATION,
       "video.generate",
-      this.buildSpanAttributes(provider, options),
+      this.buildSpanAttributes(provider, videoOptions),
     );
 
     try {
@@ -150,7 +188,14 @@ export class VideoProcessor {
         `[VideoProcessor] Starting video generation with provider: ${provider}`,
       );
 
-      const result = await handler.generate(image, prompt, options, region);
+      // Bounded per repo guideline (async provider calls wrap withTimeout):
+      // video generation is legitimately slow, so the deadline is generous —
+      // but a wedged handler must error, never hang the caller forever.
+      const result = await withTimeout(
+        handler.generate(image, prompt, handlerOptions, region),
+        VIDEO_GENERATION_TIMEOUT_MS,
+        `Video generation via "${provider}" timed out after ${VIDEO_GENERATION_TIMEOUT_MS}ms`,
+      );
 
       const ended = SpanSerializer.endSpan(span, SpanStatus.OK);
       getMetricsAggregator().recordSpan(ended);
@@ -160,6 +205,10 @@ export class VideoProcessor {
       );
       return result;
     } catch (err: unknown) {
+      // Cancel the ghost: on timeout the handler promise is still pending;
+      // aborting here stops its polling loop. On handler-originated errors
+      // the promise has already settled, so the abort is a no-op.
+      timeoutAbort.abort();
       const ended = SpanSerializer.endSpan(
         span,
         SpanStatus.ERROR,
@@ -178,7 +227,7 @@ export class VideoProcessor {
         category: ErrorCategory.EXECUTION,
         severity: ErrorSeverity.HIGH,
         retriable: true,
-        context: { provider, options, region },
+        context: { provider, options: videoOptions, region },
         originalError: err instanceof Error ? err : undefined,
       });
     }
@@ -231,15 +280,32 @@ export class VideoProcessor {
       });
     }
 
+    // Same ghost-cancellation contract as generate(): a fired timeout
+    // aborts the handler's polling loop, chained onto any caller signal.
+    const timeoutAbort = new AbortController();
+    const abortSignal = options?.abortSignal
+      ? AbortSignal.any([options.abortSignal, timeoutAbort.signal])
+      : timeoutAbort.signal;
+    const handlerOptions: VideoTransitionOptions = {
+      ...(options ?? {}),
+      abortSignal,
+    };
+
     try {
-      return await handler.generateTransition(
-        firstFrame,
-        lastFrame,
-        prompt,
-        options,
-        region,
+      // Same bound as generate(): a wedged transition must error, not hang.
+      return await withTimeout(
+        handler.generateTransition(
+          firstFrame,
+          lastFrame,
+          prompt,
+          handlerOptions,
+          region,
+        ),
+        VIDEO_GENERATION_TIMEOUT_MS,
+        `Video transition via "${provider}" timed out after ${VIDEO_GENERATION_TIMEOUT_MS}ms`,
       );
     } catch (err: unknown) {
+      timeoutAbort.abort();
       if (err instanceof VideoError) {
         throw err;
       }

@@ -39,15 +39,34 @@ import {
 import type {
   AccountQuota,
   AuthCommandArgs,
+  AuthListQuotaRefreshAdapter,
+  AuthListRefreshResultSetter,
+  AuthListRefreshOutcome,
   AuthStatusResult,
   CliProxyConfigDoc,
   OAuthTokens as OAuthTokensType,
+  ProxyPassthroughAccount,
+  ProxyLimitsRefreshResponse,
   ProxyState,
   StoredCredentials,
   SupportedProvider,
   YamlModule,
 } from "../../lib/types/index.js";
-import { loadAccountQuotas } from "../../lib/proxy/accountQuota.js";
+import {
+  flushAccountQuotas,
+  loadAccountQuotas,
+  saveAccountQuota,
+} from "../../lib/proxy/accountQuota.js";
+import {
+  fetchAccountUsage,
+  listAnthropicAccountsForUsage,
+  usageToQuota,
+} from "../../lib/proxy/accountUsage.js";
+import { importCodexAuthFile } from "../../lib/auth/codexOAuth.js";
+import {
+  fetchCodexAccountUsage,
+  listCodexAccountsForUsage,
+} from "../../lib/proxy/codexAccountUsage.js";
 
 // =============================================================================
 // CONSTANTS
@@ -89,8 +108,10 @@ const ANTHROPIC_CONSOLE_OAUTH_CONFIG = {
     "https://api.anthropic.com/api/oauth/claude_cli/create_api_key",
 };
 
-// Supported providers
-const SUPPORTED_PROVIDERS = ["anthropic"] as const;
+// Providers with first-class credential flows in `neurolink auth`. This is
+// intentionally narrower than the CLI's full AI-provider catalog: `auth list`
+// renders every provider-qualified account stored by the CLI.
+const AUTH_LOGIN_PROVIDERS = ["anthropic", "codex"] as const;
 
 // =============================================================================
 // SUBCOMMAND HANDLERS
@@ -108,13 +129,20 @@ export async function handleLogin(argv: AuthCommandArgs): Promise<void> {
     const provider = argv.provider?.toLowerCase() as SupportedProvider;
 
     // Validate provider
-    if (!SUPPORTED_PROVIDERS.includes(provider)) {
+    if (!AUTH_LOGIN_PROVIDERS.includes(provider)) {
       logger.error(
         chalk.red(
-          `Unsupported provider: ${provider}. Supported: ${SUPPORTED_PROVIDERS.join(", ")}`,
+          `Unsupported provider: ${provider}. Supported: ${AUTH_LOGIN_PROVIDERS.join(", ")}`,
         ),
       );
       process.exit(1);
+    }
+
+    // Codex has a dedicated import-based login path (imports the current
+    // ChatGPT credential from ~/.codex/auth.json into the pool).
+    if (provider === "codex") {
+      await handleCodexLogin(argv);
+      return;
     }
 
     // If method is specified, use it directly
@@ -152,6 +180,113 @@ export async function handleLogin(argv: AuthCommandArgs): Promise<void> {
     );
     process.exit(1);
   }
+}
+
+/**
+ * Handle Codex (ChatGPT) login by importing the current credential from
+ * `~/.codex/auth.json` into the account pool under a `codex:<label>` key.
+ *
+ * To add multiple ChatGPT accounts: `codex login` as account A, then
+ * `neurolink auth login codex --label a`; repeat for account B, etc. The proxy
+ * then pools all imported accounts and rotates automatically — no manual
+ * account switching during use.
+ */
+export async function handleCodexLogin(argv: AuthCommandArgs): Promise<void> {
+  const spinner = ora("Importing Codex (ChatGPT) credential…").start();
+  try {
+    const credential = await importCodexAuthFile();
+    const rawLabel =
+      argv.label ??
+      credential.email ??
+      credential.accountId?.slice(0, 8) ??
+      Date.now().toString(36).slice(-6);
+    const label = rawLabel.trim();
+    const compoundKey = `codex:${label}`;
+
+    const scopeParts = ["codex"];
+    if (credential.planType) {
+      scopeParts.push(`plan:${credential.planType}`);
+    }
+    if (credential.email) {
+      scopeParts.push(`email:${credential.email}`);
+    }
+    if (credential.accountId) {
+      scopeParts.push(`account:${credential.accountId}`);
+    }
+
+    await defaultTokenStore.saveTokens(compoundKey, {
+      accessToken: credential.accessToken,
+      refreshToken: credential.refreshToken,
+      expiresAt: credential.expiresAt ?? Date.now() + 3_600_000,
+      tokenType: "Bearer",
+      scope: scopeParts.join(" "),
+    });
+    await defaultTokenStore.markEnabled(compoundKey);
+
+    spinner.succeed(`Codex account added to pool: ${chalk.cyan(compoundKey)}`);
+    if (credential.planType) {
+      logger.always(chalk.gray(`  plan: ${credential.planType}`));
+    }
+    if (credential.email) {
+      logger.always(chalk.gray(`  email: ${credential.email}`));
+    }
+    logger.always(
+      chalk.gray(
+        "  Add more accounts: `codex login` (new account) then `neurolink auth login codex --label <name>`",
+      ),
+    );
+  } catch (error) {
+    spinner.fail("Codex login failed");
+    logger.error(
+      chalk.red(error instanceof Error ? error.message : String(error)),
+    );
+    process.exit(1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pool-state display helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * One line per account explaining why the proxy is or isn't routing to it.
+ *
+ * The proxy skips accounts on two independent grounds — a persisted `disabled`
+ * flag and an active cooldown — and neither was previously visible from
+ * `auth list`, so an account could silently drop out of rotation.
+ */
+async function collectAccountPoolState(
+  accountKeys: string[],
+): Promise<Record<string, string>> {
+  const notes: Record<string, string> = {};
+  try {
+    const { loadAccountCooldowns } =
+      await import("../../lib/proxy/accountCooldown.js");
+    const cooldowns = await loadAccountCooldowns();
+    const now = Date.now();
+    for (const key of accountKeys) {
+      if (await defaultTokenStore.isDisabled(key)) {
+        const reason = (await defaultTokenStore.getDisabledReason(key)) ?? "";
+        notes[key] = chalk.red(
+          `disabled${reason ? ` (${reason})` : ""} — re-enable: neurolink auth enable ${key}`,
+        );
+        continue;
+      }
+      const cooldown = cooldowns[key];
+      if (cooldown && cooldown.coolingUntil > now) {
+        const minutes = Math.max(
+          1,
+          Math.round((cooldown.coolingUntil - now) / 60000),
+        );
+        notes[key] = chalk.yellow(
+          `cooling (${cooldown.reason}) for ~${minutes}m`,
+        );
+      }
+    }
+  } catch {
+    // Pool state is advisory — never block the listing on it.
+  }
+  return notes;
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +349,343 @@ function formatQuotaColumns(quota: AccountQuota): {
 }
 
 /**
+ * Format the dynamic per-plan limit windows (model-scoped weeklies such as
+ * Fable, plus any future kinds) as extra display lines. `session` and
+ * `weekly_all` are omitted — they already render as the SESSION / WEEKLY
+ * columns. Exported for the continuous test suite.
+ */
+export function formatQuotaWindowRows(quota: AccountQuota): string[] {
+  if (!quota.windows?.length) {
+    return [];
+  }
+  const colorize = (pct: number, text: string): string => {
+    if (pct <= 10) {
+      return chalk.red(text);
+    }
+    if (pct <= 30) {
+      return chalk.yellow(text);
+    }
+    return chalk.green(text);
+  };
+  const rows: string[] = [];
+  for (const window of quota.windows) {
+    if (window.kind === "session" || window.kind === "weekly_all") {
+      continue;
+    }
+    const remaining = Math.round((1 - window.used) * 100);
+    const label = window.scopeModel
+      ? `${window.group ?? window.kind} (${window.scopeModel})`
+      : window.kind;
+    const reset =
+      window.resetsAt > 0
+        ? chalk.gray(`  resets ${formatTimeUntil(window.resetsAt)}`)
+        : "";
+    rows.push(
+      `${chalk.gray(`${label}:`)} ${colorize(remaining, `${remaining}% left`)}${reset}`,
+    );
+  }
+  return rows;
+}
+
+/**
+ * Fetch fresh limits for `auth list --refresh`.
+ *
+ * Every provider-qualified token-store account receives an explicit result.
+ * The running proxy is authoritative for provider adapters that declare proxy
+ * support, or for namespaces it returns. Registered direct adapters fill in
+ * the remaining namespaces. Providers with no quota adapter are shown as
+ * `not_supported`, never silently omitted.
+ */
+function providerFromAccountKey(key: string): string {
+  const separator = key.indexOf(":");
+  const provider = (separator === -1 ? key : key.slice(0, separator))
+    .trim()
+    .toLowerCase();
+  return provider || "unknown";
+}
+
+const DIRECT_QUOTA_REFRESH_CONCURRENCY = 3;
+
+// Provider-specific protocol knowledge is kept behind this capability map.
+// The CLI result itself remains provider-generic: adding a new adapter only
+// requires registering it here, while every other configured provider still
+// receives an explicit `not_supported` result.
+const PROVIDER_QUOTA_ADAPTERS: Readonly<
+  Record<string, AuthListQuotaRefreshAdapter>
+> = {
+  anthropic: {
+    supportsProxyRefresh: true,
+    listAccounts: () => listAnthropicAccountsForUsage(),
+    priorQuotaKeys: (account) => [account.key, account.label],
+    async refreshAccount(account, { prior }) {
+      if (account.type !== "oauth") {
+        return { status: "not_supported" };
+      }
+      const result = await fetchAccountUsage(account);
+      if (result.ok === false) {
+        return { status: "unavailable", error: result.error };
+      }
+      const quota = usageToQuota(result.usage, { now: Date.now(), prior });
+      if (!quota) {
+        return {
+          status: "unavailable",
+          error: "usage payload had no recognizable limit windows",
+        };
+      }
+      return { status: "refreshed", quota };
+    },
+  },
+  codex: {
+    listAccounts: () => listCodexAccountsForUsage(),
+    priorQuotaKeys: (account) => [account.key],
+    async refreshAccount(account) {
+      if (account.type !== "oauth") {
+        return { status: "not_supported" };
+      }
+      const result = await fetchCodexAccountUsage(account);
+      if (result.ok === false) {
+        return result.reason === "not_oauth"
+          ? { status: "not_supported" }
+          : { status: "unavailable", error: `usage ${result.reason}` };
+      }
+      return { status: "refreshed", quota: result.quota };
+    },
+  },
+};
+
+async function refreshDirectProviderLimits(options: {
+  provider: string;
+  adapter: AuthListQuotaRefreshAdapter;
+  accountKeys: readonly string[];
+  prior: Record<string, AccountQuota>;
+  quotas: Record<string, AccountQuota>;
+  errors: string[];
+  accountResults: AuthListRefreshOutcome["accounts"];
+  setAccountResult: AuthListRefreshResultSetter;
+}): Promise<boolean> {
+  const {
+    provider,
+    adapter,
+    accountKeys,
+    prior,
+    quotas,
+    errors,
+    accountResults,
+    setAccountResult,
+  } = options;
+  let accounts: ProxyPassthroughAccount[];
+  try {
+    accounts = await adapter.listAccounts();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    for (const key of accountKeys) {
+      if (providerFromAccountKey(key) === provider) {
+        setAccountResult(key, "unavailable", message);
+      }
+    }
+    errors.push(`${provider} accounts: ${message}`);
+    return false;
+  }
+
+  let attemptedDirectRefresh = false;
+  let nextIndex = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = nextIndex++;
+      if (index >= accounts.length) {
+        return;
+      }
+      const account = accounts[index];
+      if (
+        accountResults[account.key]?.status === "refreshed" ||
+        accountResults[account.key]?.status === "snapshot"
+      ) {
+        continue;
+      }
+
+      if (account.type === "oauth") {
+        attemptedDirectRefresh = true;
+      }
+      try {
+        const priorQuota =
+          adapter
+            .priorQuotaKeys(account)
+            .map((key) => prior[key])
+            .find((quota) => quota !== undefined) ?? null;
+        const result = await adapter.refreshAccount(account, {
+          prior: priorQuota,
+        });
+        if (result.status === "refreshed") {
+          await saveAccountQuota(account.key, result.quota);
+          quotas[account.key] = result.quota;
+          setAccountResult(account.key, "refreshed");
+          continue;
+        }
+
+        setAccountResult(account.key, result.status, result.error);
+        if (result.status === "unavailable" && result.error) {
+          errors.push(`${provider}:${account.label}: ${result.error}`);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setAccountResult(account.key, "unavailable", message);
+        errors.push(`${provider}:${account.label}: ${message}`);
+      }
+    }
+  };
+
+  await Promise.all(
+    Array.from(
+      {
+        length: Math.min(
+          DIRECT_QUOTA_REFRESH_CONCURRENCY,
+          accounts.length || 1,
+        ),
+      },
+      () => worker(),
+    ),
+  );
+  return attemptedDirectRefresh;
+}
+
+async function refreshAccountLimitsForList(
+  accountKeys: readonly string[],
+): Promise<AuthListRefreshOutcome> {
+  const errors: string[] = [];
+  const quotas: Record<string, AccountQuota> = {};
+  const accountResults: AuthListRefreshOutcome["accounts"] = {};
+  const proxyRefreshedProviders = new Set<string>();
+  let refreshedViaProxy = false;
+  let refreshedDirectly = false;
+
+  const setAccountResult: AuthListRefreshResultSetter = (
+    key,
+    status,
+    error,
+  ): void => {
+    accountResults[key] = {
+      provider: providerFromAccountKey(key),
+      status,
+      ...(error ? { error } : {}),
+    };
+  };
+
+  // `auth list` supports arbitrary provider-prefixed token-store entries.
+  // Providers with no quota adapter stay visible as explicitly unsupported
+  // rather than being rendered as an unexplained unavailable account.
+  for (const accountKey of accountKeys) {
+    setAccountResult(accountKey, "not_supported");
+  }
+
+  const configuredProviders = new Set(
+    accountKeys.map((accountKey) => providerFromAccountKey(accountKey)),
+  );
+
+  const proxyState = detectRunningProxyState();
+  if (proxyState?.port) {
+    const host =
+      proxyState.host && proxyState.host !== "0.0.0.0"
+        ? proxyState.host
+        : "127.0.0.1";
+    try {
+      const response = await fetch(`http://${host}:${proxyState.port}/limits`, {
+        signal: AbortSignal.timeout(45_000),
+      });
+      if (response.ok) {
+        const payload = (await response.json()) as ProxyLimitsRefreshResponse;
+        for (const provider of configuredProviders) {
+          if (PROVIDER_QUOTA_ADAPTERS[provider]?.supportsProxyRefresh) {
+            proxyRefreshedProviders.add(provider);
+            refreshedViaProxy = true;
+          }
+        }
+        for (const result of payload.results) {
+          // The proxy already returns the canonical key. Keep the fallback for
+          // a pre-provider-key proxy during a rolling package transition.
+          const key = result.key || `anthropic:${result.account}`;
+          proxyRefreshedProviders.add(providerFromAccountKey(key));
+          refreshedViaProxy = true;
+          if (result.quota) {
+            quotas[key] = result.quota;
+          }
+          setAccountResult(
+            key,
+            result.status === "refreshed"
+              ? "refreshed"
+              : result.quota
+                ? "snapshot"
+                : result.status === "skipped_api_key"
+                  ? "not_supported"
+                  : "unavailable",
+            result.error,
+          );
+          if (result.status === "error" && result.error) {
+            errors.push(
+              `${providerFromAccountKey(key)}:${result.account}: ${result.error}`,
+            );
+          }
+        }
+      }
+      if (!response.ok) {
+        errors.push(
+          `running proxy /limits returned HTTP ${response.status}; trying direct quota adapters`,
+        );
+      }
+    } catch {
+      // Keep the message generic: a raw fetch error can echo the requested
+      // URL, and this string reaches the text and JSON CLI output.
+      errors.push(
+        "running proxy /limits unreachable; trying direct quota adapters",
+      );
+    }
+  }
+
+  const prior = await loadAccountQuotas().catch(
+    () => ({}) as Record<string, AccountQuota>,
+  );
+  try {
+    for (const [provider, adapter] of Object.entries(PROVIDER_QUOTA_ADAPTERS)) {
+      if (
+        !configuredProviders.has(provider) ||
+        proxyRefreshedProviders.has(provider)
+      ) {
+        continue;
+      }
+      refreshedDirectly =
+        (await refreshDirectProviderLimits({
+          provider,
+          adapter,
+          accountKeys,
+          prior,
+          quotas,
+          errors,
+          accountResults,
+          setAccountResult,
+        })) || refreshedDirectly;
+    }
+  } finally {
+    // The quota store's debounced flush timer is unref()'d and this process is
+    // short-lived — flush every completed provider snapshot before returning.
+    await flushAccountQuotas().catch(() => undefined);
+  }
+
+  const via =
+    refreshedViaProxy && refreshedDirectly
+      ? "mixed"
+      : refreshedViaProxy
+        ? "proxy"
+        : refreshedDirectly
+          ? "direct"
+          : "none";
+  return {
+    via,
+    quotas: Object.keys(quotas).length > 0 ? quotas : null,
+    accounts: accountResults,
+    errors,
+  };
+}
+
+/**
  * Handle the list subcommand
  * `neurolink auth list`
  *
@@ -247,6 +719,7 @@ export async function handleList(argv: AuthCommandArgs): Promise<void> {
         let email: string | undefined;
         let tokenStatus: "valid" | "expired" | "unknown" = "unknown";
         let expiresAt: number | undefined;
+        let tokenType: string | undefined;
 
         // Derive email from the compound key label when it looks like an email.
         // The credentials file is a shared singleton that gets overwritten on
@@ -285,6 +758,7 @@ export async function handleList(argv: AuthCommandArgs): Promise<void> {
           const tokens = await defaultTokenStore.loadTokens(key);
           if (tokens) {
             expiresAt = tokens.expiresAt;
+            tokenType = tokens.tokenType;
             const isExpired = defaultTokenStore.isTokenExpired(tokens, 0);
             tokenStatus = isExpired ? "expired" : "valid";
             // Extract per-account metadata from scope (e.g. "tier:pro email:user@example.com")
@@ -307,46 +781,119 @@ export async function handleList(argv: AuthCommandArgs): Promise<void> {
           // Token load failed — show as unknown
         }
 
-        return { key, provider, label, email, tier, tokenStatus, expiresAt };
+        return {
+          key,
+          provider,
+          label,
+          email,
+          tier,
+          tokenStatus,
+          expiresAt,
+          tokenType,
+        };
       }),
     );
 
-    // Load persisted quota data (captured from proxy responses).
+    // Optionally fetch fresh provider limits before rendering.
+    let refreshOutcome: AuthListRefreshOutcome | undefined;
+    if (argv.refresh) {
+      refreshOutcome = await refreshAccountLimitsForList(allKeys);
+    }
+
+    // Load persisted quota data (captured from proxy responses), then overlay
+    // anything just refreshed — freshly fetched values win over the snapshot.
     let quotas: Record<string, AccountQuota> = {};
     try {
       quotas = await loadAccountQuotas();
     } catch {
       // Non-fatal — quota display is best-effort
     }
+    if (refreshOutcome?.quotas) {
+      quotas = { ...quotas, ...refreshOutcome.quotas };
+    }
 
     if (argv.format === "json") {
       // Merge quota data into each account object for JSON output
       const withQuota = enrichedAccounts.map((acct) => {
-        const quotaKey = acct.label ?? acct.key;
-        const quota = quotas[quotaKey] ?? null;
-        return { ...acct, quota };
+        const quota =
+          quotas[acct.key] ??
+          // Old Anthropic snapshots used bare labels. Read them once so an
+          // upgrade does not hide a useful historic reading, but all new
+          // writes use the provider-qualified key above.
+          (acct.provider === "anthropic" && acct.label
+            ? quotas[acct.label]
+            : undefined) ??
+          null;
+        return {
+          ...acct,
+          quota,
+          refresh: refreshOutcome?.accounts[acct.key] ?? null,
+        };
       });
-      logger.always(JSON.stringify(withQuota, null, 2));
+      if (refreshOutcome) {
+        // --refresh envelopes the array so the fetch outcome travels with it.
+        logger.always(
+          JSON.stringify(
+            {
+              refresh: {
+                via: refreshOutcome.via,
+                errors: refreshOutcome.errors,
+                accounts: refreshOutcome.accounts,
+              },
+              accounts: withQuota,
+            },
+            null,
+            2,
+          ),
+        );
+      } else {
+        logger.always(JSON.stringify(withQuota, null, 2));
+      }
     } else {
+      if (refreshOutcome) {
+        if (refreshOutcome.via !== "none") {
+          logger.always(
+            chalk.gray(
+              `\nFetched fresh limits (${refreshOutcome.via === "proxy" ? "via running proxy" : refreshOutcome.via === "direct" ? "direct provider APIs" : "via the running proxy and direct provider APIs"}).`,
+            ),
+          );
+        }
+        for (const refreshError of refreshOutcome.errors) {
+          logger.always(chalk.yellow(`⚠ ${refreshError}`));
+        }
+      }
       logger.always(chalk.bold("\nAuthenticated Accounts:\n"));
 
-      // Check if any account has quota data to decide column layout
-      const hasQuota = enrichedAccounts.some((acct) => {
-        const quotaKey = acct.label ?? acct.key;
-        return quotas[quotaKey] !== undefined;
-      });
+      // `--refresh` always shows the limit columns, including an explicit
+      // unavailable/not-supported state. A blank table silently looked like a
+      // healthy Codex account had no quota information.
+      const hasQuota =
+        !!refreshOutcome ||
+        enrichedAccounts.some(
+          (acct) =>
+            quotas[acct.key] !== undefined ||
+            (acct.provider === "anthropic" && acct.label
+              ? quotas[acct.label] !== undefined
+              : false),
+        );
 
       // Table header
+      // Why an account is (or isn't) in the proxy pool. Without this a
+      // disabled or parked account simply vanishes from routing with no clue.
+      const poolState = await collectAccountPoolState(
+        enrichedAccounts.map((acct) => acct.key),
+      );
+
       const colKey = "LABEL".padEnd(20);
       const colEmail = "EMAIL".padEnd(28);
       const colStatus = "TOKEN STATUS".padEnd(14);
       const colProvider = "PROVIDER".padEnd(12);
-      const colSession = hasQuota ? "SESSION".padEnd(10) : "";
-      const colWeekly = hasQuota ? "WEEKLY".padEnd(10) : "";
+      const colSession = hasQuota ? "SESSION".padEnd(14) : "";
+      const colWeekly = hasQuota ? "WEEKLY".padEnd(14) : "";
       logger.always(
         `  ${chalk.gray(colKey)} ${chalk.gray(colProvider)} ${chalk.gray(colEmail)} ${chalk.gray(colStatus)}${hasQuota ? ` ${chalk.gray(colSession)} ${chalk.gray(colWeekly)}` : ""}`,
       );
-      logger.always(`  ${chalk.gray("-".repeat(hasQuota ? 100 : 78))}`);
+      logger.always(`  ${chalk.gray("-".repeat(hasQuota ? 108 : 78))}`);
 
       for (const acct of enrichedAccounts) {
         const displayLabel = (acct.label ?? acct.key).padEnd(20);
@@ -362,25 +909,50 @@ export async function handleList(argv: AuthCommandArgs): Promise<void> {
           statusText = chalk.yellow("unknown".padEnd(14));
         }
 
-        const quotaKey = acct.label ?? acct.key;
-        const quota = quotas[quotaKey];
+        const quota =
+          quotas[acct.key] ??
+          (acct.provider === "anthropic" && acct.label
+            ? quotas[acct.label]
+            : undefined);
+        const poolNote = poolState[acct.key];
 
         if (hasQuota && quota) {
           const qc = formatQuotaColumns(quota);
           logger.always(
-            `  ${chalk.cyan(displayLabel)} ${displayProvider} ${displayEmail} ${statusText} ${qc.sessionText.padEnd(10)} ${qc.weeklyText.padEnd(10)}`,
+            `  ${chalk.cyan(displayLabel)} ${displayProvider} ${displayEmail} ${statusText} ${qc.sessionText.padEnd(14)} ${qc.weeklyText.padEnd(14)}`,
           );
+          const indent = " ".repeat(2 + 20 + 1 + 12 + 1 + 28 + 1 + 14 + 1);
           // Second line: reset times (indented under session/weekly columns)
           if (qc.sessionReset || qc.weeklyReset) {
-            const indent = " ".repeat(2 + 20 + 1 + 12 + 1 + 28 + 1 + 14 + 1);
             logger.always(
-              `${indent}${(qc.sessionReset || "").padEnd(10)} ${qc.weeklyReset || ""}`,
+              `${indent}${(qc.sessionReset || "").padEnd(14)} ${qc.weeklyReset || ""}`,
             );
           }
+          // Dynamic per-plan windows (e.g. the Fable-only weekly limit)
+          for (const windowRow of formatQuotaWindowRows(quota)) {
+            logger.always(`${indent}${windowRow}`);
+          }
+          if (poolNote) {
+            logger.always(`${indent}${poolNote}`);
+          }
         } else {
+          const refreshState = refreshOutcome?.accounts[acct.key];
+          const unavailableText =
+            refreshState?.status === "not_supported"
+              ? "not supported"
+              : refreshOutcome
+                ? "unavailable"
+                : "-";
+          const apiKeyNote =
+            refreshOutcome && acct.tokenType && acct.tokenType !== "Bearer"
+              ? chalk.gray("  (api key — not refreshed)")
+              : "";
           logger.always(
-            `  ${chalk.cyan(displayLabel)} ${displayProvider} ${displayEmail} ${statusText}${hasQuota ? "  -          -" : ""}`,
+            `  ${chalk.cyan(displayLabel)} ${displayProvider} ${displayEmail} ${statusText}${hasQuota ? ` ${chalk.yellow(unavailableText.padEnd(14))} ${chalk.gray("n/a".padEnd(14))}` : ""}${apiKeyNote}`,
           );
+          if (poolNote) {
+            logger.always(`  ${poolNote}`);
+          }
         }
       }
       logger.always("");
@@ -469,10 +1041,10 @@ export async function handleLogout(argv: AuthCommandArgs): Promise<void> {
     const provider = argv.provider?.toLowerCase() as SupportedProvider;
 
     // Validate provider
-    if (!SUPPORTED_PROVIDERS.includes(provider)) {
+    if (!AUTH_LOGIN_PROVIDERS.includes(provider)) {
       logger.error(
         chalk.red(
-          `Unsupported provider: ${provider}. Supported: ${SUPPORTED_PROVIDERS.join(", ")}`,
+          `Unsupported provider: ${provider}. Supported: ${AUTH_LOGIN_PROVIDERS.join(", ")}`,
         ),
       );
       process.exit(1);
@@ -587,7 +1159,7 @@ export async function handleStatus(argv: AuthCommandArgs): Promise<void> {
     // If provider specified, show just that provider
     const providersToCheck: SupportedProvider[] = provider
       ? [provider]
-      : [...SUPPORTED_PROVIDERS];
+      : [...AUTH_LOGIN_PROVIDERS];
 
     const results: AuthStatusResult[] = [];
 
@@ -666,6 +1238,64 @@ export async function handleStatus(argv: AuthCommandArgs): Promise<void> {
 }
 
 /**
+ * Refresh every pooled Codex account in place.
+ *
+ * Unlike the Anthropic path there is no single credentials file to rewrite:
+ * accounts live under `codex:<label>` in the token store, so each is refreshed
+ * and saved back individually. A failure on one account never stops the rest.
+ */
+async function handleCodexRefresh(argv: AuthCommandArgs): Promise<void> {
+  const { refreshCodexToken } = await import("../../lib/auth/codexOAuth.js");
+  const keys = await defaultTokenStore.listByPrefix("codex:");
+  if (keys.length === 0) {
+    logger.error(
+      chalk.red(
+        "No Codex accounts found. Run 'codex login', then 'neurolink auth login codex --label <name>'.",
+      ),
+    );
+    process.exit(1);
+  }
+
+  logger.always(
+    chalk.blue(`\nRefreshing ${keys.length} Codex account(s)...\n`),
+  );
+  let failed = 0;
+  for (const key of keys) {
+    const label = key.slice("codex:".length) || key;
+    const spinner = argv.quiet ? null : ora(`${label}`).start();
+    try {
+      const tokens = await defaultTokenStore.peekTokens(key);
+      if (!tokens?.refreshToken) {
+        throw new Error("no refresh token stored");
+      }
+      const refreshed = await refreshCodexToken(tokens.refreshToken);
+      await defaultTokenStore.saveTokens(key, {
+        accessToken: refreshed.accessToken,
+        refreshToken: refreshed.refreshToken ?? tokens.refreshToken,
+        expiresAt: refreshed.expiresAt ?? Date.now() + 3_600_000,
+        tokenType: "Bearer",
+        ...(tokens.scope ? { scope: tokens.scope } : {}),
+      });
+      spinner?.succeed(`${label} refreshed`);
+    } catch (error) {
+      failed += 1;
+      spinner?.fail(
+        `${label}: ${error instanceof Error ? error.message : "refresh failed"}`,
+      );
+    }
+  }
+  if (failed > 0) {
+    logger.always(
+      chalk.yellow(
+        `\n${failed} account(s) need re-import: codex login, then neurolink auth login codex --label <name>\n`,
+      ),
+    );
+    process.exit(1);
+  }
+  logger.always(chalk.green("\nAll Codex accounts refreshed.\n"));
+}
+
+/**
  * Handle the refresh subcommand
  * `neurolink auth refresh <provider>`
  */
@@ -674,13 +1304,20 @@ export async function handleRefresh(argv: AuthCommandArgs): Promise<void> {
     const provider = argv.provider?.toLowerCase() as SupportedProvider;
 
     // Validate provider
-    if (!SUPPORTED_PROVIDERS.includes(provider)) {
+    if (!AUTH_LOGIN_PROVIDERS.includes(provider)) {
       logger.error(
         chalk.red(
-          `Unsupported provider: ${provider}. Supported: ${SUPPORTED_PROVIDERS.join(", ")}`,
+          `Unsupported provider: ${provider}. Supported: ${AUTH_LOGIN_PROVIDERS.join(", ")}`,
         ),
       );
       process.exit(1);
+    }
+
+    // Codex credentials live only in the pooled token store — there is no
+    // `codex-credentials.json` for the shared path below to read.
+    if (provider === "codex") {
+      await handleCodexRefresh(argv);
+      return;
     }
 
     logger.always(chalk.blue(`\nRefreshing ${provider} OAuth tokens...\n`));
@@ -830,6 +1467,23 @@ export async function handleRefresh(argv: AuthCommandArgs): Promise<void> {
  *   1. Expired entries with no refresh token (via pruneExpired)
  *   2. Permanently disabled entries (after confirmation)
  */
+/**
+ * Disable reasons whose credential is still valid — the account is out of the
+ * pool because of an external condition, not because the login broke. Cleanup
+ * must not delete these.
+ *
+ * Expressed as the set of reasons that DO mean the credential is broken, so an
+ * unrecognised reason — notably the free text an operator passes to
+ * `auth disable --reason` — is retained rather than deleted. The inverse
+ * allowlist fails open: any reason not enumerated would silently become a
+ * delete.
+ */
+const BROKEN_CREDENTIAL_DISABLE_REASONS = new Set([
+  "missing_refresh_token",
+  "refresh_invalid",
+  "refresh_failed",
+]);
+
 export async function handleCleanup(argv: AuthCommandArgs): Promise<void> {
   try {
     const removed: Array<{ key: string; reason: string }> = [];
@@ -843,7 +1497,38 @@ export async function handleCleanup(argv: AuthCommandArgs): Promise<void> {
     // Step 2: Find disabled entries (pruneExpired already removes disabled
     // entries, but in case the user runs cleanup with entries that were
     // disabled between the prune call and now, check again)
-    const disabledKeys = await defaultTokenStore.listDisabled();
+    const allDisabledKeys = await defaultTokenStore.listDisabled();
+
+    // Only credentials the proxy itself gave up on are deletable. A disable that
+    // describes a condition outside the credential — an organization policy, or
+    // an operator taking the account out of rotation — leaves a perfectly good
+    // login that deleting would destroy for a condition someone else can revert.
+    const disabledKeys: string[] = [];
+    const retained: Array<{ key: string; reason: string }> = [];
+    for (const key of allDisabledKeys) {
+      const reason = (await defaultTokenStore.getDisabledReason(key)) ?? "";
+      if (!BROKEN_CREDENTIAL_DISABLE_REASONS.has(reason)) {
+        retained.push({ key, reason: reason || "unspecified" });
+      } else {
+        disabledKeys.push(key);
+      }
+    }
+
+    if (retained.length > 0) {
+      logger.always(
+        chalk.blue(
+          `\nKeeping ${retained.length} recoverable disabled account(s):`,
+        ),
+      );
+      for (const entry of retained) {
+        logger.always(`  - ${entry.key} (${entry.reason})`);
+      }
+      logger.always(
+        chalk.gray(
+          "  Credentials are still valid. Use 'neurolink auth enable <account>' to restore, or 'auth remove' to delete.",
+        ),
+      );
+    }
 
     if (disabledKeys.length > 0) {
       let shouldRemove = false;
@@ -871,8 +1556,10 @@ export async function handleCleanup(argv: AuthCommandArgs): Promise<void> {
 
       if (shouldRemove) {
         for (const key of disabledKeys) {
+          const reason =
+            (await defaultTokenStore.getDisabledReason(key)) ?? "unspecified";
           await defaultTokenStore.clearTokens(key);
-          removed.push({ key, reason: "disabled: refresh_failed" });
+          removed.push({ key, reason: `disabled: ${reason}` });
         }
       }
     }
@@ -939,6 +1626,173 @@ export async function handleEnable(argv: AuthCommandArgs): Promise<void> {
     logger.always(chalk.green(`\nRe-enabled account: ${accountKey}\n`));
   } catch (error) {
     logger.error(chalk.red("Failed to enable account:"));
+    logger.error(
+      chalk.red(error instanceof Error ? error.message : "Unknown error"),
+    );
+    process.exit(1);
+  }
+}
+
+/**
+ * The proxy re-reads the token store on every request, so a disable takes
+ * effect on the next request with no restart.
+ *
+ * "refresh_failed" is refused deliberately: the proxy treats that exact reason
+ * as a legacy entry and re-enables it automatically, which would silently undo
+ * an operator's disable.
+ */
+const RESERVED_DISABLE_REASON = "refresh_failed";
+
+export async function handleDisable(argv: AuthCommandArgs): Promise<void> {
+  try {
+    const accountKey =
+      argv.account || (argv._ && argv._[2] ? String(argv._[2]) : undefined);
+
+    if (!accountKey) {
+      logger.error(chalk.red("Missing required argument: <account>"));
+      logger.always(
+        chalk.blue(
+          "\nUsage: neurolink auth disable <account>\n" +
+            "Run 'neurolink auth list' to see all accounts.\n",
+        ),
+      );
+      process.exit(1);
+    }
+
+    const allKeys = await defaultTokenStore.listProviders();
+    if (!allKeys.includes(accountKey)) {
+      logger.error(chalk.red(`Account not found: ${accountKey}`));
+      logger.always(
+        chalk.blue(
+          "\nRun 'neurolink auth list' to see all authenticated accounts.\n",
+        ),
+      );
+      process.exit(1);
+    }
+
+    const reason = argv.reason?.trim() || "manual";
+    if (reason === RESERVED_DISABLE_REASON) {
+      logger.error(
+        chalk.red(
+          `Reason "${RESERVED_DISABLE_REASON}" is reserved — the proxy re-enables accounts carrying it. Choose another reason.`,
+        ),
+      );
+      process.exit(1);
+    }
+
+    await defaultTokenStore.markDisabled(accountKey, reason);
+    logger.always(
+      chalk.yellow(`\nDisabled account: ${accountKey} (${reason})`),
+    );
+    logger.always(
+      chalk.gray(
+        `Credentials are kept. Re-enable with: neurolink auth enable ${accountKey}\n`,
+      ),
+    );
+  } catch (error) {
+    logger.error(chalk.red("Failed to disable account:"));
+    logger.error(
+      chalk.red(error instanceof Error ? error.message : "Unknown error"),
+    );
+    process.exit(1);
+  }
+}
+
+/** Compact "in 3h 12m" / "5m" rendering for a future timestamp. */
+function formatDuration(ms: number): string {
+  const totalMinutes = Math.max(0, Math.round(ms / 60000));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+}
+
+/**
+ * Inspect or clear the per-account rate-limit cooldowns the proxy persists.
+ *
+ * Without this there is no way to see why an account vanished from the pool, or
+ * to release one parked by a bad reset timestamp.
+ */
+export async function handleCooldown(argv: AuthCommandArgs): Promise<void> {
+  const { loadAccountCooldowns, clearAccountCooldown } =
+    await import("../../lib/proxy/accountCooldown.js");
+  const action = String(argv.action ?? "list");
+  try {
+    if (action !== "list" && action !== "clear") {
+      logger.error(chalk.red(`Unknown action: ${action}. Use list|clear.`));
+      process.exit(1);
+    }
+    const cooldowns = await loadAccountCooldowns();
+    const now = Date.now();
+
+    if (action === "list") {
+      const active = Object.entries(cooldowns).filter(
+        ([, entry]) => entry.coolingUntil > now,
+      );
+      if (argv.format === "json") {
+        logger.always(
+          JSON.stringify(
+            active.map(([account, entry]) => ({ account, ...entry })),
+            null,
+            2,
+          ),
+        );
+        return;
+      }
+      if (active.length === 0) {
+        logger.always(chalk.green("\nNo accounts are cooling.\n"));
+        return;
+      }
+      logger.always(chalk.bold("\nCooling accounts:\n"));
+      for (const [account, entry] of active) {
+        logger.always(
+          `  ${chalk.cyan(account.padEnd(32))} ${chalk.yellow(
+            entry.reason.padEnd(10),
+          )} ${chalk.gray(
+            `recovers in ${formatDuration(entry.coolingUntil - now)}`,
+          )}`,
+        );
+      }
+      logger.always("");
+      return;
+    }
+
+    const targets = argv.all
+      ? Object.keys(cooldowns)
+      : [argv.account || (argv._?.[3] ? String(argv._[3]) : "")].filter(
+          Boolean,
+        );
+    if (targets.length === 0) {
+      logger.error(
+        chalk.red("Specify an account key, or pass --all to clear every one."),
+      );
+      process.exit(1);
+    }
+    // Cooldowns are keyed by the full compound key, so a bare label silently
+    // matches nothing. Reporting success for it would send the operator away
+    // believing an account was released when it is still parked.
+    const unknown = targets.filter((target) => !(target in cooldowns));
+    if (unknown.length > 0) {
+      logger.error(chalk.red(`No cooldown found for: ${unknown.join(", ")}`));
+      logger.always(
+        chalk.blue(
+          "\nRun 'neurolink auth cooldown list' to see the exact account keys.\n",
+        ),
+      );
+      process.exit(1);
+    }
+    for (const target of targets) {
+      await clearAccountCooldown(target);
+    }
+    logger.always(chalk.green(`\nCleared ${targets.length} cooldown(s).`));
+    // The running worker keeps its own copy of the cooldown map, loaded once at
+    // startup, so a file-level clear alone would not release the account.
+    logger.always(
+      chalk.gray(
+        "Restart the proxy for a running instance to pick this up: neurolink proxy start\n",
+      ),
+    );
+  } catch (error) {
+    logger.error(chalk.red("Failed to read or clear cooldowns:"));
     logger.error(
       chalk.red(error instanceof Error ? error.message : "Unknown error"),
     );
@@ -1202,6 +2056,99 @@ export async function handleSetPrimary(argv: AuthCommandArgs): Promise<void> {
     reportRunningProxyConfigUpdate(filePath);
   } catch (err) {
     logger.error(chalk.red("Failed to set primary account:"));
+    logger.error(
+      chalk.red(err instanceof Error ? err.message : "Unknown error"),
+    );
+    process.exit(1);
+  }
+}
+
+/**
+ * Handle the overage subcommand
+ * `neurolink auth overage <status|auto|always|never> [--config <path>]`
+ *
+ * Controls whether the pool may keep serving on paid extra usage once an
+ * account's subscription window is spent. Only `never` overrides the provider:
+ * nothing here can switch on extra usage that Anthropic reports as disabled.
+ */
+export async function handleOverage(argv: AuthCommandArgs): Promise<void> {
+  const action = String(
+    argv.action ?? (argv._ && argv._[2] ? String(argv._[2]) : "status"),
+  );
+  const filePath = argv.config ?? DEFAULT_PROXY_CONFIG_PATH;
+
+  try {
+    const doc = await readProxyConfigFile(filePath);
+    const routing = getRoutingObject(doc.data);
+    const current =
+      (typeof routing["use-overage"] === "string"
+        ? routing["use-overage"]
+        : typeof routing.useOverage === "string"
+          ? routing.useOverage
+          : undefined) ?? "auto";
+
+    if (action === "status") {
+      logger.always(chalk.bold(`\nExtra-usage policy: ${chalk.cyan(current)}`));
+      logger.always(
+        chalk.gray(
+          "  auto   — follow whatever Anthropic reports per account (default)\n" +
+            "  always — keep serving whenever the provider permits extra usage\n" +
+            "  never  — stop at the subscription limit, never spend credits",
+        ),
+      );
+
+      // The provider's own signal is what actually decides, so show it too —
+      // a policy of "always" is inert when the organization has it switched off.
+      const quotas = await loadAccountQuotas();
+      const rows = Object.entries(quotas).filter(
+        ([account, quota]) =>
+          // Anthropic only: Codex has no extra-usage concept and stores a
+          // neutral "rejected", which would read here as a real restriction.
+          !account.startsWith("codex:") &&
+          (quota.overageStatus || quota.overageDisabledReason),
+      );
+      if (rows.length > 0) {
+        logger.always(chalk.bold("\nProvider extra-usage state:"));
+        for (const [account, quota] of rows) {
+          const enabled =
+            quota.overageEnabled === true ||
+            quota.overageStatus?.trim().toLowerCase() === "allowed";
+          const detail = quota.overageDisabledReason
+            ? chalk.gray(` (${quota.overageDisabledReason})`)
+            : "";
+          logger.always(
+            `  ${chalk.cyan(account.padEnd(32))} ${
+              enabled ? chalk.green("available") : chalk.yellow("unavailable")
+            }${detail}`,
+          );
+        }
+      }
+      logger.always("");
+      return;
+    }
+
+    if (action !== "auto" && action !== "always" && action !== "never") {
+      logger.error(
+        chalk.red(`Unknown action: ${action}. Use status|auto|always|never.`),
+      );
+      process.exit(1);
+    }
+
+    if (doc.hadComments) {
+      logger.always(
+        chalk.yellow(
+          `⚠ Note: existing YAML comments in ${filePath} will not be preserved.`,
+        ),
+      );
+    }
+    delete routing.useOverage;
+    routing["use-overage"] = action;
+    await writeProxyConfigFile(filePath, doc);
+    logger.always(chalk.green(`✓ Extra-usage policy → ${action}`));
+    logger.always(chalk.green(`✓ Saved to ${filePath}`));
+    reportRunningProxyConfigUpdate(filePath);
+  } catch (err) {
+    logger.error(chalk.red("Failed to read or update extra-usage policy:"));
     logger.error(
       chalk.red(err instanceof Error ? err.message : "Unknown error"),
     );
@@ -2152,6 +3099,24 @@ async function getAuthStatus(
     isAuthenticated: false,
     method: "none",
   };
+
+  // Codex never writes a credentials file — its accounts exist only as pooled
+  // `codex:<label>` token-store entries, so checking the file alone reports a
+  // fully authenticated pool as "Not Authenticated".
+  if (provider === "codex") {
+    const keys = await defaultTokenStore.listByPrefix("codex:");
+    if (keys.length > 0) {
+      result.isAuthenticated = true;
+      result.method = "oauth";
+      const tokens = await defaultTokenStore.peekTokens(keys[0]);
+      result.hasRefreshToken = !!tokens?.refreshToken;
+      if (tokens?.expiresAt) {
+        result.tokenExpiry = new Date(tokens.expiresAt).toLocaleString();
+        result.needsRefresh = Date.now() >= tokens.expiresAt;
+      }
+    }
+    return result;
+  }
 
   // Check stored credentials FIRST (OAuth takes priority over API key)
   const stored = await getStoredCredentials(provider);

@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **loadDocument**(`source`, `options?`): `Promise`\<[`MDocument`](../classes/MDocument.md)\>
 
-Defined in: [rag/document/loaders.ts:563](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/rag/document/loaders.ts#L563)
+Defined in: [rag/document/loaders.ts:647](https://github.com/juspay/neurolink/blob/release/src/lib/rag/document/loaders.ts#L647)
 
 Load document from file path, URL, or content
 

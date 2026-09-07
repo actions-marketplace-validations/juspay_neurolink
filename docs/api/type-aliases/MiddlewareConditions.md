@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **MiddlewareConditions** = `object`
 
-Defined in: [types/middleware.ts:52](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L52)
+Defined in: [types/middleware.ts:77](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L77)
 
 Conditions for applying middleware
 
@@ -18,7 +18,7 @@ Conditions for applying middleware
 
 > `optional` **providers?**: `string`[]
 
-Defined in: [types/middleware.ts:54](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L54)
+Defined in: [types/middleware.ts:79](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L79)
 
 Apply only to specific providers
 
@@ -28,7 +28,7 @@ Apply only to specific providers
 
 > `optional` **models?**: `string`[]
 
-Defined in: [types/middleware.ts:56](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L56)
+Defined in: [types/middleware.ts:81](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L81)
 
 Apply only to specific models
 
@@ -38,7 +38,7 @@ Apply only to specific models
 
 > `optional` **options?**: `Record`\<`string`, `unknown`\>
 
-Defined in: [types/middleware.ts:58](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L58)
+Defined in: [types/middleware.ts:83](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L83)
 
 Apply only when certain options are present
 
@@ -48,7 +48,7 @@ Apply only when certain options are present
 
 > `optional` **custom?**: (`context`) => `boolean`
 
-Defined in: [types/middleware.ts:60](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L60)
+Defined in: [types/middleware.ts:85](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L85)
 
 Custom condition function
 

@@ -14,10 +14,30 @@ import type {
   AnthropicAuthConfig,
   OAuthToken,
   AnthropicAuthConfigResult,
+  OpenAICompatConfigInput,
+  OpenAICompatCredentials,
 } from "../types/index.js";
 
 import { logger } from "./logger.js";
+import {
+  getCatalogJsonEntries,
+  buildCatalogConfigOptions,
+} from "../providers/catalog/loader.js";
 // Re-export subscription types for convenience
+
+/**
+ * Looks up a JSON catalog entry by id and derives its ProviderConfigOptions.
+ * Backs the 9 catalog providers' create<Name>Config() delegations below —
+ * the JSON catalog (src/lib/providers/catalog/<id>.json) is their single
+ * source of truth.
+ */
+function catalogConfigOptions(id: string): ProviderConfigOptions {
+  const entry = getCatalogJsonEntries().find((e) => e.id === id);
+  if (!entry) {
+    throw new Error(`Unknown catalog provider id: ${id}`);
+  }
+  return buildCatalogConfigOptions(entry);
+}
 
 /**
  * API key format validation patterns (extracted from advanced validation system)
@@ -222,6 +242,35 @@ export function hasProviderCredentials(envVars: string[]): boolean {
   return envVars.some((envVar) => !!process.env[envVar]);
 }
 
+/**
+ * Evaluates a `ProviderDescriptor.envVars.extraRequiredFallbacks`-shaped
+ * list against an env-var source. Each entry is either a single env var
+ * name (satisfied on its own) or a nested array of names that must ALL be
+ * present together (e.g. Vertex's GOOGLE_AUTH_CLIENT_EMAIL +
+ * GOOGLE_AUTH_PRIVATE_KEY pair, which is only valid auth as a pair).
+ * Returns true when at least one entry is satisfied. The single evaluation
+ * site for this shape — every consumer (providerUtils.ts, providerHealth.ts,
+ * setup.ts, environmentManager.ts) must call this instead of re-deriving the
+ * same `.some()`/`.every()` logic, so they can't drift out of sync with each
+ * other or with the real auth gate (hasGoogleCredentials()).
+ * @param env Explicit env-var source (`process.env`, or a parsed .env file) —
+ *   never hardcoded, so callers checking a file's contents (not the live
+ *   process env) can reuse this too.
+ */
+export function satisfiesFallbacks(
+  fallbacks: readonly (string | readonly string[])[] | undefined,
+  env: Record<string, string | undefined>,
+): boolean {
+  if (!fallbacks) {
+    return false;
+  }
+  return fallbacks.some((entry) =>
+    typeof entry === "string"
+      ? !!env[entry]
+      : entry.every((name) => !!env[name]),
+  );
+}
+
 // =============================================================================
 // PROVIDER-SPECIFIC CONFIGURATION CREATORS
 // =============================================================================
@@ -330,17 +379,7 @@ export function createHuggingFaceConfig(): ProviderConfigOptions {
  * Creates Mistral provider configuration
  */
 export function createMistralConfig(): ProviderConfigOptions {
-  return {
-    providerName: "Mistral",
-    envVarName: "MISTRAL_API_KEY",
-    setupUrl: "https://console.mistral.ai/",
-    description: "API key",
-    instructions: [
-      "1. Visit: https://console.mistral.ai/",
-      "2. Create or sign in to your account",
-      "3. Generate a new API key",
-    ],
-  };
+  return catalogConfigOptions("mistral");
 }
 
 /**
@@ -470,78 +509,28 @@ export function createNvidiaNimConfig(): ProviderConfigOptions {
 }
 
 /**
- * Creates LM Studio provider configuration (local server)
- */
-export function createLmStudioConfig(): ProviderConfigOptions {
-  return {
-    providerName: "LM Studio",
-    envVarName: "LM_STUDIO_BASE_URL",
-    setupUrl: "https://lmstudio.ai/",
-    description: "LM Studio server URL",
-    instructions: [
-      "1. Install LM Studio: https://lmstudio.ai/",
-      "2. Open LM Studio and download a model (e.g. Llama 3.2 3B Instruct)",
-      '3. Click "Local Server" → Start Server',
-      "4. Default URL is http://localhost:1234/v1 (override via LM_STUDIO_BASE_URL)",
-    ],
-    // Base URL is optional — defaults to http://localhost:1234/v1 if unset.
-    optional: true,
-  };
-}
-
-/**
- * Creates llama.cpp provider configuration (local server)
- */
-export function createLlamaCppConfig(): ProviderConfigOptions {
-  return {
-    providerName: "llama.cpp",
-    envVarName: "LLAMACPP_BASE_URL",
-    setupUrl: "https://github.com/ggerganov/llama.cpp",
-    description: "llama.cpp server URL",
-    instructions: [
-      "1. Build llama.cpp: https://github.com/ggerganov/llama.cpp#build",
-      "2. Run: ./llama-server -m model.gguf --port 8080",
-      "3. Default URL is http://localhost:8080/v1 (override via LLAMACPP_BASE_URL)",
-    ],
-    // Base URL is optional — defaults to http://localhost:8080/v1 if unset.
-    optional: true,
-  };
-}
-
-/**
  * Creates xAI Grok provider configuration.
  */
 export function createXaiConfig(): ProviderConfigOptions {
-  return {
-    providerName: "xAI",
-    envVarName: "XAI_API_KEY",
-    setupUrl: "https://console.x.ai/",
-    description: "API key",
-    instructions: [
-      "1. Visit: https://console.x.ai/",
-      "2. Sign in with your xAI account",
-      "3. Create an API key",
-      "4. Set XAI_API_KEY in your .env file",
-    ],
-  };
+  return catalogConfigOptions("xai");
+}
+
+/**
+ * Creates SambaNova provider configuration.
+ */
+export function createSambanovaConfig(): ProviderConfigOptions {
+  return catalogConfigOptions("sambanova");
+}
+
+export function createCerebrasConfig(): ProviderConfigOptions {
+  return catalogConfigOptions("cerebras");
 }
 
 /**
  * Creates Groq provider configuration.
  */
 export function createGroqConfig(): ProviderConfigOptions {
-  return {
-    providerName: "Groq",
-    envVarName: "GROQ_API_KEY",
-    setupUrl: "https://console.groq.com/keys",
-    description: "API key",
-    instructions: [
-      "1. Visit: https://console.groq.com/keys",
-      "2. Sign in to your Groq account",
-      "3. Create a new API key",
-      "4. Set GROQ_API_KEY in your .env file",
-    ],
-  };
+  return catalogConfigOptions("groq");
 }
 
 /**
@@ -584,54 +573,21 @@ export function createReplicateConfig(): ProviderConfigOptions {
  * Creates Together AI provider configuration.
  */
 export function createTogetherAIConfig(): ProviderConfigOptions {
-  return {
-    providerName: "Together AI",
-    envVarName: "TOGETHER_API_KEY",
-    setupUrl: "https://api.together.xyz/settings/api-keys",
-    description: "API key",
-    instructions: [
-      "1. Visit: https://api.together.xyz/settings/api-keys",
-      "2. Sign in to your Together AI account",
-      "3. Create a new API key",
-      "4. Set TOGETHER_API_KEY in your .env file",
-    ],
-  };
+  return catalogConfigOptions("together-ai");
 }
 
 /**
  * Creates Fireworks AI provider configuration.
  */
 export function createFireworksConfig(): ProviderConfigOptions {
-  return {
-    providerName: "Fireworks AI",
-    envVarName: "FIREWORKS_API_KEY",
-    setupUrl: "https://fireworks.ai/account/api-keys",
-    description: "API key",
-    instructions: [
-      "1. Visit: https://fireworks.ai/account/api-keys",
-      "2. Sign in to your Fireworks AI account",
-      "3. Create a new API key",
-      "4. Set FIREWORKS_API_KEY in your .env file",
-    ],
-  };
+  return catalogConfigOptions("fireworks");
 }
 
 /**
  * Creates Perplexity provider configuration.
  */
 export function createPerplexityConfig(): ProviderConfigOptions {
-  return {
-    providerName: "Perplexity",
-    envVarName: "PERPLEXITY_API_KEY",
-    setupUrl: "https://www.perplexity.ai/settings/api",
-    description: "API key",
-    instructions: [
-      "1. Visit: https://www.perplexity.ai/settings/api",
-      "2. Sign in to your Perplexity account",
-      "3. Create a new API key (Sonar tier)",
-      "4. Set PERPLEXITY_API_KEY in your .env file",
-    ],
-  };
+  return catalogConfigOptions("perplexity");
 }
 
 /**
@@ -731,18 +687,7 @@ export function createRecraftConfig(): ProviderConfigOptions {
  * AND `CLOUDFLARE_ACCOUNT_ID` since the endpoint is per-account.
  */
 export function createCloudflareConfig(): ProviderConfigOptions {
-  return {
-    providerName: "Cloudflare Workers AI",
-    envVarName: "CLOUDFLARE_API_KEY",
-    setupUrl: "https://dash.cloudflare.com/profile/api-tokens",
-    description: "API token (Workers AI Read+Write scope)",
-    instructions: [
-      "1. Visit: https://dash.cloudflare.com/profile/api-tokens",
-      "2. Create a token with 'Workers AI: Read + Write' scope",
-      "3. Set CLOUDFLARE_API_KEY in your .env file",
-      "4. Also set CLOUDFLARE_ACCOUNT_ID (find it in the dashboard URL or under 'Account ID')",
-    ],
-  };
+  return catalogConfigOptions("cloudflare");
 }
 
 /**
@@ -1499,4 +1444,76 @@ export function describeAnthropicConfig(): string {
   lines.push(`Priority Access: ${config.limits.priorityAccess ? "Yes" : "No"}`);
 
   return lines.join("\n");
+}
+
+/**
+ * Resolves the {apiKey, baseURL} pair for a config-driven OpenAI-compatible
+ * catalog entry (see OpenAICompatCatalogEntry in types/providers.ts).
+ *
+ * Extracted from the identical 6-line precedence block that was copy-pasted
+ * across groq.ts, xai.ts, togetherAi.ts, fireworks.ts, perplexity.ts, and
+ * mistral.ts, plus Cloudflare's accountId-computed-baseURL variant.
+ *
+ * Precedence (matches every ported subclass's original behavior exactly):
+ *   apiKey:  credentials.apiKey (trimmed, non-blank) > env var > throw
+ *   baseURL: credentials.baseURL (trimmed, non-blank)
+ *            > env var (if entry.baseURLEnvVar is set, trimmed, non-blank)
+ *            > entry.defaultBaseURL
+ *   baseURL (computedBaseURL entries, e.g. Cloudflare):
+ *            credentials.baseURL > computedBaseURL.build(accountId), where
+ *            accountId = credentials.accountId (trimmed) > env var (trimmed)
+ *            > throw computedBaseURL.missingValueMessage
+ */
+export function resolveOpenAICompatConfig(
+  entry: OpenAICompatConfigInput,
+  credentials?: OpenAICompatCredentials,
+): { apiKey: string; baseURL: string } {
+  const overrideApiKey = credentials?.apiKey?.trim();
+  const apiKey =
+    overrideApiKey && overrideApiKey.length > 0
+      ? overrideApiKey
+      : validateApiKey(entry.configOptions);
+
+  if (entry.computedBaseURL) {
+    const { envVar, missingValueMessage, build } = entry.computedBaseURL;
+    // An explicit base URL is checked first and trimmed the same way the
+    // static branch trims it. It makes the account id irrelevant — there is
+    // nothing left to build — so demanding one anyway would reject a fully
+    // specified override.
+    const overrideComputedBaseURL = credentials?.baseURL?.trim();
+    if (overrideComputedBaseURL && overrideComputedBaseURL.length > 0) {
+      return { apiKey, baseURL: overrideComputedBaseURL };
+    }
+    const extraValue = (
+      credentials?.accountId ??
+      process.env[envVar] ??
+      ""
+    ).trim();
+    if (!extraValue) {
+      throw new Error(missingValueMessage);
+    }
+    return { apiKey, baseURL: build(extraValue) };
+  }
+
+  const overrideBaseURL = credentials?.baseURL?.trim();
+  const envBaseURL = entry.baseURLEnvVar
+    ? process.env[entry.baseURLEnvVar]?.trim()
+    : undefined;
+  const baseURL =
+    (overrideBaseURL && overrideBaseURL.length > 0
+      ? overrideBaseURL
+      : undefined) ??
+    (envBaseURL && envBaseURL.length > 0 ? envBaseURL : undefined) ??
+    entry.defaultBaseURL;
+  if (!baseURL) {
+    // Reachable only for an entry that sets neither defaultBaseURL nor
+    // computedBaseURL. Returning "" instead would hand the SDK an empty base
+    // URL and surface as a confusing request failure far from the cause.
+    throw new Error(
+      `${entry.providerName}: no base URL. Set one in credentials` +
+        (entry.baseURLEnvVar ? `, set ${entry.baseURLEnvVar}` : "") +
+        `, or give the catalog entry a defaultBaseURL.`,
+    );
+  }
+  return { apiKey, baseURL };
 }

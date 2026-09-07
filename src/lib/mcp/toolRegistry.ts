@@ -232,6 +232,9 @@ export class MCPToolRegistry extends MCPRegistry {
       const toolMaxRetries = serverInfo.metadata?.toolMaxRetries as
         | number
         | undefined;
+      const toolTotalTimeoutMs = serverInfo.metadata?.toolTotalTimeoutMs as
+        | number
+        | undefined;
       const toolInfo = {
         name: tool.name,
         description: tool.description,
@@ -245,6 +248,9 @@ export class MCPToolRegistry extends MCPRegistry {
         permissions: [], // MCPServerInfo.tools doesn't have permissions
         ...(toolTimeoutMs !== undefined && { timeoutMs: toolTimeoutMs }),
         ...(toolMaxRetries !== undefined && { maxRetries: toolMaxRetries }),
+        ...(toolTotalTimeoutMs !== undefined && {
+          totalTimeoutMs: toolTotalTimeoutMs,
+        }),
       };
 
       // Register only with fully-qualified toolId to avoid collisions
@@ -265,6 +271,9 @@ export class MCPToolRegistry extends MCPRegistry {
         }),
         ...(toolTimeoutMs !== undefined && { timeoutMs: toolTimeoutMs }),
         ...(toolMaxRetries !== undefined && { maxRetries: toolMaxRetries }),
+        ...(toolTotalTimeoutMs !== undefined && {
+          totalTimeoutMs: toolTotalTimeoutMs,
+        }),
       });
 
       // Tool registered successfully
@@ -1031,7 +1040,7 @@ export class MCPToolRegistry extends MCPRegistry {
     return removed;
   }
 
-  // TODO(#1179): Add FlexibleToolValidator class in next task
+  // TODO(#1576): Add FlexibleToolValidator class in next task
   // This will contain only universal safety checks (empty names, control characters, length limits)
 }
 

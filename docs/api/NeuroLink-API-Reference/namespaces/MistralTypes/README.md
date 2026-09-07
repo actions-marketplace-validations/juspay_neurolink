@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../../../README.md)
+[**NeuroLink API Reference**](../../../README.md)
 
 ---
 
@@ -10,4 +10,4 @@ Mistral specific types
 
 ## Type Aliases
 
-- [Client](type-aliases/Client.md)
+- [MistralClient](type-aliases/MistralClient.md)

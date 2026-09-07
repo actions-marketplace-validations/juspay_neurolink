@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **LiveConnectCallbacks** = `object`
 
-Defined in: [types/providers.ts:825](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L825)
+Defined in: [types/providers.ts:1116](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1116)
 
 Live connection callbacks
 
@@ -18,7 +18,7 @@ Live connection callbacks
 
 > `optional` **onopen?**: () => `void`
 
-Defined in: [types/providers.ts:826](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L826)
+Defined in: [types/providers.ts:1117](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1117)
 
 #### Returns
 
@@ -30,7 +30,7 @@ Defined in: [types/providers.ts:826](https://github.com/juspay/neurolink/blob/ff
 
 > `optional` **onmessage?**: (`message`) => `void`
 
-Defined in: [types/providers.ts:827](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L827)
+Defined in: [types/providers.ts:1118](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1118)
 
 #### Parameters
 
@@ -48,7 +48,7 @@ Defined in: [types/providers.ts:827](https://github.com/juspay/neurolink/blob/ff
 
 > `optional` **onerror?**: (`e`) => `void`
 
-Defined in: [types/providers.ts:828](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L828)
+Defined in: [types/providers.ts:1119](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1119)
 
 #### Parameters
 
@@ -68,7 +68,7 @@ Defined in: [types/providers.ts:828](https://github.com/juspay/neurolink/blob/ff
 
 > `optional` **onclose?**: (`e`) => `void`
 
-Defined in: [types/providers.ts:829](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L829)
+Defined in: [types/providers.ts:1120](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1120)
 
 #### Parameters
 

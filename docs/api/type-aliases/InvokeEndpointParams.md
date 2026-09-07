@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **InvokeEndpointParams** = `object`
 
-Defined in: [types/providers.ts:1170](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1170)
+Defined in: [types/providers.ts:1512](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1512)
 
 Parameters for SageMaker endpoint invocation
 
@@ -18,7 +18,7 @@ Parameters for SageMaker endpoint invocation
 
 > **EndpointName**: `string`
 
-Defined in: [types/providers.ts:1172](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1172)
+Defined in: [types/providers.ts:1514](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1514)
 
 Endpoint name to invoke
 
@@ -28,7 +28,7 @@ Endpoint name to invoke
 
 > **Body**: `string` \| `Uint8Array`
 
-Defined in: [types/providers.ts:1174](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1174)
+Defined in: [types/providers.ts:1516](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1516)
 
 Request body as string or Uint8Array
 
@@ -38,7 +38,7 @@ Request body as string or Uint8Array
 
 > `optional` **ContentType?**: `string`
 
-Defined in: [types/providers.ts:1176](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1176)
+Defined in: [types/providers.ts:1518](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1518)
 
 Content type of the request
 
@@ -48,7 +48,7 @@ Content type of the request
 
 > `optional` **Accept?**: `string`
 
-Defined in: [types/providers.ts:1178](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1178)
+Defined in: [types/providers.ts:1520](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1520)
 
 Accept header for response format
 
@@ -58,7 +58,7 @@ Accept header for response format
 
 > `optional` **CustomAttributes?**: `string`
 
-Defined in: [types/providers.ts:1180](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1180)
+Defined in: [types/providers.ts:1522](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1522)
 
 Custom attributes for the request
 
@@ -68,7 +68,7 @@ Custom attributes for the request
 
 > `optional` **TargetModel?**: `string`
 
-Defined in: [types/providers.ts:1182](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1182)
+Defined in: [types/providers.ts:1524](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1524)
 
 Target model for multi-model endpoints
 
@@ -78,7 +78,7 @@ Target model for multi-model endpoints
 
 > `optional` **TargetVariant?**: `string`
 
-Defined in: [types/providers.ts:1184](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1184)
+Defined in: [types/providers.ts:1526](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1526)
 
 Target variant for A/B testing
 
@@ -88,6 +88,22 @@ Target variant for A/B testing
 
 > `optional` **InferenceId?**: `string`
 
-Defined in: [types/providers.ts:1186](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1186)
+Defined in: [types/providers.ts:1528](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1528)
 
 Inference ID for request tracking
+
+---
+
+### abortSignal?
+
+> `optional` **abortSignal?**: `AbortSignal`
+
+Defined in: [types/providers.ts:1538](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1538)
+
+Cancels the in-flight HTTP request, not just the loop around it.
+
+Named in camelCase deliberately: every other field here mirrors an AWS
+`InvokeEndpointCommandInput` member and keeps its PascalCase, whereas this
+one is a transport option handed to `client.send()` as
+`@smithy/types` `HttpHandlerOptions` — it is never part of the command
+payload, and spelling it differently keeps that boundary visible.

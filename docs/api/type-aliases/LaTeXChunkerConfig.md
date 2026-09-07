@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **LaTeXChunkerConfig** = [`BaseChunkerConfig`](BaseChunkerConfig.md) & `object`
 
-Defined in: [types/rag.ts:920](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/rag.ts#L920)
+Defined in: [types/rag.ts:964](https://github.com/juspay/neurolink/blob/release/src/lib/types/rag.ts#L964)
 
 LaTeX chunker configuration
 LaTeX structure-aware splitting

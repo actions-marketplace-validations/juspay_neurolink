@@ -36,6 +36,7 @@ import {
   log,
   logSection as section,
   isExpectedProviderError as harnessIsExpectedError,
+  withCaseTimeout,
 } from "./helpers/harness.js";
 
 import { assertDistFresh } from "./helpers/distFreshness.js";
@@ -58,7 +59,7 @@ async function test(
   fn: () => Promise<boolean | null>,
 ): Promise<void> {
   try {
-    const result = await fn();
+    const result = await withCaseTimeout(name, fn);
     if (result === null) {
       recordTest(name, false, true, "skipped");
     } else {
@@ -128,7 +129,7 @@ async function testGenerate(): Promise<void> {
         model: () => getTestModel(),
         ...buildBaseOptions(false),
       });
-      const text = result.text || result.content || "";
+      const text = result.content || "";
       return text.length > 0;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -151,7 +152,7 @@ async function testGenerate(): Promise<void> {
         dynamicContext: { tenant: { id: "t1", plan: "enterprise" } },
         ...buildBaseOptions(false),
       } as Record<string, unknown>);
-      const text = result.text || result.content || "";
+      const text = result.content || "";
       return text.length > 0;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -172,7 +173,7 @@ async function testGenerate(): Promise<void> {
         dynamicContext: { user: { id: "test-user" } },
         ...buildBaseOptions(),
       } as Record<string, unknown>);
-      const text = result.text || result.content || "";
+      const text = result.content || "";
       return text.length > 0;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -233,7 +234,7 @@ async function testStream(): Promise<void> {
             : "gemini-2.5-flash",
         dynamicContext: { tier: "pro" },
         ...buildBaseOptions(false),
-      } as Record<string, unknown>);
+      });
       const chunks: string[] = [];
       for await (const chunk of streamResult.stream) {
         if ("content" in chunk) {

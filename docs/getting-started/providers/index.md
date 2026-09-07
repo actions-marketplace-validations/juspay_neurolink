@@ -161,6 +161,28 @@ Access frontier models via hosted cloud inference APIs:
 
 [Setup Guide →](groq.md)
 
+### [Cerebras](cerebras.md)
+
+**Wafer-scale inference at ~3000 tokens/s**
+
+- 🚀 Fastest generation speed of any hosted provider (WSE hardware)
+- 🤖 GPT-OSS 120B (default), Gemma 4 31B — roster live-verified 2026-08-27
+- 💳 Free $5 credit requires a saved payment method
+- 🔑 API key from [cloud.cerebras.ai](https://cloud.cerebras.ai)
+
+[Setup Guide →](cerebras.md)
+
+### [SambaNova](sambanova.md)
+
+**RDU-accelerated open-weight flagships**
+
+- 🧠 Llama 3.3 70B (default), GPT-OSS 120B, DeepSeek V3.x, MiniMax, Gemma 4
+- 👁️ Vision on gemma-4-31B-it (image+video) and MiniMax-M3
+- 💳 No free allowance — credits required before first call
+- 🔑 API key from [cloud.sambanova.ai/apis](https://cloud.sambanova.ai/apis)
+
+[Setup Guide →](sambanova.md)
+
 ### Together AI
 
 **Hosted open-model gateway**

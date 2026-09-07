@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ProxyMode** = `"full"` \| `"passthrough"` \| `"transparent"`
 
-Defined in: [types/proxy.ts:435](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L435)
+Defined in: [types/proxy.ts:453](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L453)
 
 Proxy operating mode:
 

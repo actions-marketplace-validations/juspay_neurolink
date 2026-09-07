@@ -54,7 +54,7 @@ export type {
   UserContent,
   ToolContent,
   DataContent,
-} from "ai";
+} from "./aiCompat.js";
 
 /**
  * Legacy public alias for the Hippocampus storage configuration.
@@ -87,6 +87,14 @@ export type ConversationMemoryConfig = {
 
   /** Model to use for summarization */
   summarizationModel?: string;
+
+  /**
+   * Wall-clock cap for one summarization generate call, in milliseconds
+   * (default: 60000). A summary that overruns is dropped, not fatal — the
+   * turn continues without it — so size this for the slowest summary a real
+   * conversation produces rather than losing compaction summaries silently.
+   */
+  summarizationTimeoutMs?: number;
 
   /** Memory SDK config (condensed key-value memory per user). Set enabled: true to activate. */
   memory?: HippocampusMemory;

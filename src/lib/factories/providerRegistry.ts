@@ -15,20 +15,13 @@ import {
   OpenAIModels,
   AnthropicModels,
   VertexModels,
-  MistralModels,
   OllamaModels,
   LiteLLMModels,
   HuggingFaceModels,
   DeepSeekModels,
   NvidiaNimModels,
   OpenRouterModels,
-  XaiModels,
-  GroqModels,
   CohereModels,
-  TogetherAIModels,
-  FireworksModels,
-  PerplexityModels,
-  CloudflareModels,
   VoyageModels,
   JinaModels,
   StabilityModels,
@@ -36,6 +29,10 @@ import {
   RecraftModels,
   ReplicateModels,
 } from "../constants/enums.js";
+import { PROVIDER_DESCRIPTORS_BY_NAME } from "./providerDescriptors.js";
+import { OPENAI_COMPAT_CATALOG } from "../providers/openaiCompatCatalog.js";
+import type { OpenAICompatCredentials } from "../types/index.js";
+import { providerChoicesFor } from "./mediaHandlerCatalog.js";
 
 /**
  * Provider Registry - registers all providers with the factory
@@ -120,6 +117,7 @@ export class ProviderRegistry {
         },
         GoogleAIModels.GEMINI_2_5_FLASH,
         ["googleAiStudio", "google", "gemini", "google-ai", "google-ai-studio"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.GOOGLE_AI),
       );
 
       // Register OpenAI provider
@@ -139,6 +137,7 @@ export class ProviderRegistry {
         },
         OpenAIModels.GPT_4O_MINI,
         ["gpt", "chatgpt"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.OPENAI),
       );
 
       // Register Anthropic provider
@@ -164,6 +163,7 @@ export class ProviderRegistry {
         },
         AnthropicModels.CLAUDE_SONNET_4_6,
         ["claude", "anthropic"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.ANTHROPIC),
       );
 
       // Register Amazon Bedrock provider
@@ -188,6 +188,7 @@ export class ProviderRegistry {
         },
         undefined, // Let provider read BEDROCK_MODEL from .env
         ["bedrock", "aws"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.BEDROCK),
       );
 
       // Register Azure OpenAI provider
@@ -211,6 +212,7 @@ export class ProviderRegistry {
           process.env.AZURE_OPENAI_DEPLOYMENT_ID ||
           "gpt-4o-mini",
         ["azure", "azureOpenai"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.AZURE),
       );
 
       // Register Google Vertex AI provider
@@ -236,6 +238,7 @@ export class ProviderRegistry {
         },
         VertexModels.CLAUDE_4_6_SONNET,
         ["vertex", "googleVertex"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.VERTEX),
       );
 
       // Register Hugging Face provider (Unified Router implementation)
@@ -244,37 +247,52 @@ export class ProviderRegistry {
         async (
           modelName?: string,
           _providerName?: string,
-          _sdk?: NeuroLink,
-          _region?: string,
+          sdk?: NeuroLink,
+          region?: string,
           credentials?: UnknownRecord,
         ) => {
           const hfCreds = credentials as NeurolinkCredentials["huggingFace"];
           const { HuggingFaceProvider } =
             await import("../providers/huggingFace/index.js");
-          return new HuggingFaceProvider(modelName, undefined, hfCreds);
+          return new HuggingFaceProvider(modelName, sdk, region, hfCreds);
         },
         process.env.HUGGINGFACE_MODEL ||
           HuggingFaceModels.QWEN_2_5_72B_INSTRUCT,
         ["huggingface", "hf"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.HUGGINGFACE),
       );
 
-      // Register Mistral AI provider
-      ProviderFactory.registerProvider(
-        AIProviderName.MISTRAL,
-        async (
-          modelName?: string,
-          _providerName?: string,
-          sdk?: NeuroLink,
-          _region?: string,
-          credentials?: UnknownRecord,
-        ) => {
-          const mistralCreds = credentials as NeurolinkCredentials["mistral"];
-          const { MistralProvider } = await import("../providers/mistral.js");
-          return new MistralProvider(modelName, sdk, undefined, mistralCreds);
-        },
-        MistralModels.MISTRAL_LARGE_LATEST,
-        ["mistral"],
-      );
+      // Register the config-driven OpenAI-compatible catalog providers
+      // (cerebras, groq, xai, together-ai, fireworks, perplexity, mistral,
+      // cloudflare).
+      // To add a new zero-quirk OpenAI-compatible provider, add one entry to
+      // OPENAI_COMPAT_CATALOG (openaiCompatCatalog.ts) — not a new block here.
+      for (const entry of OPENAI_COMPAT_CATALOG) {
+        ProviderFactory.registerProvider(
+          entry.providerName,
+          async (
+            modelName?: string,
+            _providerName?: string,
+            sdk?: NeuroLink,
+            _region?: string,
+            credentials?: UnknownRecord,
+          ) => {
+            const { ConfiguredOpenAICompatProvider } =
+              await import("../providers/configuredOpenAICompat.js");
+            return new ConfiguredOpenAICompatProvider(
+              entry,
+              modelName,
+              sdk,
+              credentials as OpenAICompatCredentials | undefined,
+            );
+          },
+          entry.registryDefaultModelChecksEnvVar
+            ? process.env[entry.modelEnvVar] || entry.registryDefaultModel
+            : entry.registryDefaultModel,
+          entry.aliases,
+          PROVIDER_DESCRIPTORS_BY_NAME.get(entry.providerName),
+        );
+      }
 
       // Register Ollama provider
       ProviderFactory.registerProvider(
@@ -293,6 +311,7 @@ export class ProviderRegistry {
         },
         process.env.OLLAMA_MODEL || OllamaModels.LLAMA3_2_LATEST,
         ["ollama", "local"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.OLLAMA),
       );
 
       // Register LiteLLM provider
@@ -312,6 +331,7 @@ export class ProviderRegistry {
         },
         process.env.LITELLM_MODEL || LiteLLMModels.OPENAI_GPT_4O_MINI,
         ["litellm"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.LITELLM),
       );
 
       // Register OpenAI Compatible provider
@@ -337,6 +357,7 @@ export class ProviderRegistry {
         },
         process.env.OPENAI_COMPATIBLE_MODEL || undefined, // Enable auto-discovery when no model specified
         ["openai-compatible", "vllm", "compatible"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.OPENAI_COMPATIBLE),
       );
 
       // Register OpenRouter provider (300+ models from 60+ providers)
@@ -367,6 +388,7 @@ export class ProviderRegistry {
         // provider's getDefault.
         process.env.OPENROUTER_MODEL || OpenRouterModels.CLAUDE_SONNET_4_5,
         ["openrouter", "or"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.OPENROUTER),
       );
 
       // Register Amazon SageMaker provider
@@ -393,6 +415,7 @@ export class ProviderRegistry {
         },
         process.env.SAGEMAKER_MODEL || "sagemaker-model",
         ["sagemaker", "aws-sagemaker"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.SAGEMAKER),
       );
 
       // Register DeepSeek provider
@@ -411,6 +434,7 @@ export class ProviderRegistry {
         },
         process.env.DEEPSEEK_MODEL || DeepSeekModels.DEEPSEEK_CHAT,
         ["deepseek", "ds"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.DEEPSEEK),
       );
 
       // Register NVIDIA NIM provider
@@ -430,6 +454,7 @@ export class ProviderRegistry {
         },
         process.env.NVIDIA_NIM_MODEL || NvidiaNimModels.LLAMA_3_3_70B_INSTRUCT,
         ["nvidia", "nim", "nvidia-nim"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.NVIDIA_NIM),
       );
 
       // Register LM Studio provider (local)
@@ -448,6 +473,7 @@ export class ProviderRegistry {
         },
         process.env.LM_STUDIO_MODEL || undefined,
         ["lmstudio", "lm-studio", "lms"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.LM_STUDIO),
       );
 
       // Register llama.cpp provider (local)
@@ -466,43 +492,8 @@ export class ProviderRegistry {
         },
         process.env.LLAMACPP_MODEL || undefined,
         ["llamacpp", "llama.cpp", "llama-cpp"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.LLAMACPP),
       );
-      // Register xAI Grok provider
-      ProviderFactory.registerProvider(
-        AIProviderName.XAI,
-        async (
-          modelName?: string,
-          _providerName?: string,
-          sdk?: NeuroLink,
-          _region?: string,
-          credentials?: UnknownRecord,
-        ) => {
-          const xaiCreds = credentials as NeurolinkCredentials["xai"];
-          const { XaiProvider } = await import("../providers/xai.js");
-          return new XaiProvider(modelName, sdk, undefined, xaiCreds);
-        },
-        process.env.XAI_MODEL || XaiModels.GROK_3,
-        ["xai", "grok"],
-      );
-
-      // Register Groq provider
-      ProviderFactory.registerProvider(
-        AIProviderName.GROQ,
-        async (
-          modelName?: string,
-          _providerName?: string,
-          sdk?: NeuroLink,
-          _region?: string,
-          credentials?: UnknownRecord,
-        ) => {
-          const groqCreds = credentials as NeurolinkCredentials["groq"];
-          const { GroqProvider } = await import("../providers/groq.js");
-          return new GroqProvider(modelName, sdk, undefined, groqCreds);
-        },
-        process.env.GROQ_MODEL || GroqModels.LLAMA_3_3_70B_VERSATILE,
-        ["groq"],
-      );
-
       // Register Cohere provider
       ProviderFactory.registerProvider(
         AIProviderName.COHERE,
@@ -519,106 +510,7 @@ export class ProviderRegistry {
         },
         process.env.COHERE_MODEL || CohereModels.COMMAND_R_PLUS,
         ["cohere"],
-      );
-
-      // Register Together AI provider
-      ProviderFactory.registerProvider(
-        AIProviderName.TOGETHER_AI,
-        async (
-          modelName?: string,
-          _providerName?: string,
-          sdk?: NeuroLink,
-          _region?: string,
-          credentials?: UnknownRecord,
-        ) => {
-          const togetherCreds = credentials as NeurolinkCredentials["together"];
-          const { TogetherAIProvider } =
-            await import("../providers/togetherAi.js");
-          return new TogetherAIProvider(
-            modelName,
-            sdk,
-            undefined,
-            togetherCreds,
-          );
-        },
-        process.env.TOGETHER_MODEL ||
-          TogetherAIModels.LLAMA_3_3_70B_INSTRUCT_TURBO,
-        ["together-ai", "together"],
-      );
-
-      // Register Fireworks AI provider
-      ProviderFactory.registerProvider(
-        AIProviderName.FIREWORKS,
-        async (
-          modelName?: string,
-          _providerName?: string,
-          sdk?: NeuroLink,
-          _region?: string,
-          credentials?: UnknownRecord,
-        ) => {
-          const fireworksCreds =
-            credentials as NeurolinkCredentials["fireworks"];
-          const { FireworksProvider } =
-            await import("../providers/fireworks.js");
-          return new FireworksProvider(
-            modelName,
-            sdk,
-            undefined,
-            fireworksCreds,
-          );
-        },
-        process.env.FIREWORKS_MODEL || FireworksModels.DEEPSEEK_V4_PRO,
-        ["fireworks"],
-      );
-
-      // Register Perplexity provider
-      ProviderFactory.registerProvider(
-        AIProviderName.PERPLEXITY,
-        async (
-          modelName?: string,
-          _providerName?: string,
-          sdk?: NeuroLink,
-          _region?: string,
-          credentials?: UnknownRecord,
-        ) => {
-          const perplexityCreds =
-            credentials as NeurolinkCredentials["perplexity"];
-          const { PerplexityProvider } =
-            await import("../providers/perplexity.js");
-          return new PerplexityProvider(
-            modelName,
-            sdk,
-            undefined,
-            perplexityCreds,
-          );
-        },
-        process.env.PERPLEXITY_MODEL || PerplexityModels.SONAR,
-        ["perplexity", "pplx"],
-      );
-
-      // Register Cloudflare Workers AI provider
-      ProviderFactory.registerProvider(
-        AIProviderName.CLOUDFLARE,
-        async (
-          modelName?: string,
-          _providerName?: string,
-          sdk?: NeuroLink,
-          _region?: string,
-          credentials?: UnknownRecord,
-        ) => {
-          const cloudflareCreds =
-            credentials as NeurolinkCredentials["cloudflare"];
-          const { CloudflareProvider } =
-            await import("../providers/cloudflare.js");
-          return new CloudflareProvider(
-            modelName,
-            sdk,
-            undefined,
-            cloudflareCreds,
-          );
-        },
-        process.env.CLOUDFLARE_MODEL || CloudflareModels.LLAMA_3_3_70B_FAST,
-        ["cloudflare", "workers-ai", "cf-ai"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.COHERE),
       );
 
       // Register Voyage AI embeddings provider
@@ -637,6 +529,7 @@ export class ProviderRegistry {
         },
         process.env.VOYAGE_MODEL || VoyageModels.VOYAGE_3_5,
         ["voyage", "voyage-ai"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.VOYAGE),
       );
 
       // Register Jina AI embeddings + reranking provider
@@ -655,6 +548,7 @@ export class ProviderRegistry {
         },
         process.env.JINA_MODEL || JinaModels.JINA_EMBEDDINGS_V3,
         ["jina", "jina-ai"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.JINA),
       );
 
       // Register Stability AI image-gen provider
@@ -680,6 +574,7 @@ export class ProviderRegistry {
         },
         process.env.STABILITY_MODEL || StabilityModels.STABLE_IMAGE_ULTRA,
         ["stability", "stability-ai", "sd"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.STABILITY),
       );
 
       // Register Ideogram image-gen provider
@@ -698,6 +593,7 @@ export class ProviderRegistry {
         },
         process.env.IDEOGRAM_MODEL || IdeogramModels.IDEOGRAM_V3,
         ["ideogram"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.IDEOGRAM),
       );
 
       // Register Replicate LLM provider (multi-modal — also serves video /
@@ -724,6 +620,7 @@ export class ProviderRegistry {
         },
         process.env.REPLICATE_MODEL || ReplicateModels.LLAMA_3_70B_INSTRUCT,
         ["replicate"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.REPLICATE),
       );
 
       // Register Recraft image-gen provider
@@ -742,23 +639,30 @@ export class ProviderRegistry {
         },
         process.env.RECRAFT_MODEL || RecraftModels.RECRAFT_V3,
         ["recraft"],
+        PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.RECRAFT),
       );
 
       logger.debug("All AI providers registered successfully");
 
+      // ===== MEDIA HANDLER REGISTRATION =====
+      // Single registration path (Task 11): each ecosystem barrel (voice,
+      // adapters/video, avatar, music) owns its own provider-name catalog
+      // wiring (MEDIA_HANDLER_CATALOG, Task 8) and exposes an idempotent
+      // registerDefault*Handlers() function (Task 10) that constructs and
+      // registers every shipped handler whose backing credentials are
+      // present in process.env. This block's only job is to invoke each of
+      // the six functions via dynamic import — no hand-rolled
+      // `new XHandler()` + `registerHandler()` calls live here anymore.
+      // Each ecosystem keeps its own try/catch so one broken import can't
+      // take down the other five (matches the previous block's isolation).
+
       // ===== TTS HANDLER REGISTRATION =====
       try {
-        // Create handler instance and register explicitly
-        const { GoogleTTSHandler } =
-          await import("../adapters/tts/googleTTSHandler.js");
-        const { TTSProcessor } = await import("../utils/ttsProcessor.js");
-
-        const googleHandler = new GoogleTTSHandler();
-        TTSProcessor.registerHandler("google-ai", googleHandler);
-        TTSProcessor.registerHandler("vertex", googleHandler);
-
-        logger.debug("TTS handlers registered successfully", {
-          providers: ["google-ai", "vertex"],
+        const { registerDefaultTTSHandlers } =
+          await import("../voice/index.js");
+        registerDefaultTTSHandlers();
+        logger.debug("TTS handler registration attempted", {
+          providers: providerChoicesFor("tts"),
         });
       } catch (ttsError) {
         logger.warn(
@@ -771,114 +675,13 @@ export class ProviderRegistry {
         // Don't throw - TTS is optional functionality
       }
 
-      // New TTS providers
-      try {
-        const { TTSProcessor } = await import("../utils/ttsProcessor.js");
-        const { OpenAITTS } = await import("../voice/providers/OpenAITTS.js");
-        TTSProcessor.registerHandler("openai-tts", new OpenAITTS());
-      } catch (err) {
-        logger.debug(
-          `[ProviderRegistry] openai-tts registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-
-      try {
-        const { TTSProcessor } = await import("../utils/ttsProcessor.js");
-        const { ElevenLabsTTS } =
-          await import("../voice/providers/ElevenLabsTTS.js");
-        const elevenLabsHandler = new ElevenLabsTTS();
-        TTSProcessor.registerHandler("elevenlabs", elevenLabsHandler);
-        TTSProcessor.registerHandler("elevenlabs-tts", elevenLabsHandler);
-      } catch (err) {
-        logger.debug(
-          `[ProviderRegistry] elevenlabs registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-
-      try {
-        const { TTSProcessor } = await import("../utils/ttsProcessor.js");
-        const { AzureTTS } = await import("../voice/providers/AzureTTS.js");
-        TTSProcessor.registerHandler("azure-tts", new AzureTTS());
-      } catch (err) {
-        logger.debug(
-          `[ProviderRegistry] azure-tts registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-
-      // Fish Audio and Cartesia also auto-register via the voice/index.ts
-      // barrel side-effect. The supports() guard here keeps registration
-      // idempotent across entry points — same handler, no overwrite warning.
-      try {
-        const { TTSProcessor } = await import("../utils/ttsProcessor.js");
-        if (!TTSProcessor.supports("fish-audio")) {
-          const { FishAudioTTS } =
-            await import("../voice/providers/FishAudioTTS.js");
-          TTSProcessor.registerHandler("fish-audio", new FishAudioTTS());
-        }
-      } catch (err) {
-        logger.debug(
-          `[ProviderRegistry] fish-audio registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-
-      try {
-        const { TTSProcessor } = await import("../utils/ttsProcessor.js");
-        if (!TTSProcessor.supports("cartesia")) {
-          const { CartesiaTTS } =
-            await import("../voice/providers/CartesiaTTS.js");
-          TTSProcessor.registerHandler("cartesia", new CartesiaTTS());
-        }
-      } catch (err) {
-        logger.debug(
-          `[ProviderRegistry] cartesia registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-
       // ===== STT HANDLER REGISTRATION =====
       try {
-        const { STTProcessor } = await import("../utils/sttProcessor.js");
-
-        try {
-          const { OpenAISTT } = await import("../voice/providers/OpenAISTT.js");
-          const openAISTT = new OpenAISTT();
-          STTProcessor.registerHandler("whisper", openAISTT);
-          STTProcessor.registerHandler("openai-stt", openAISTT);
-        } catch (err) {
-          logger.debug(
-            `[ProviderRegistry] whisper/openai-stt registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-
-        try {
-          const { DeepgramSTT } =
-            await import("../voice/providers/DeepgramSTT.js");
-          STTProcessor.registerHandler("deepgram", new DeepgramSTT());
-        } catch (err) {
-          logger.debug(
-            `[ProviderRegistry] deepgram registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-
-        try {
-          const { GoogleSTT } = await import("../voice/providers/GoogleSTT.js");
-          STTProcessor.registerHandler("google-stt", new GoogleSTT());
-        } catch (err) {
-          logger.debug(
-            `[ProviderRegistry] google-stt registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-
-        try {
-          const { AzureSTT } = await import("../voice/providers/AzureSTT.js");
-          STTProcessor.registerHandler("azure-stt", new AzureSTT());
-        } catch (err) {
-          logger.debug(
-            `[ProviderRegistry] azure-stt registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-
-        logger.debug("STT handlers registered successfully", {
-          providers: ["whisper", "deepgram", "google-stt", "azure-stt"],
+        const { registerDefaultSTTHandlers } =
+          await import("../voice/index.js");
+        registerDefaultSTTHandlers();
+        logger.debug("STT handler registration attempted", {
+          providers: providerChoicesFor("stt"),
         });
       } catch (sttError) {
         logger.warn(
@@ -892,46 +695,24 @@ export class ProviderRegistry {
 
       // ===== REALTIME HANDLER REGISTRATION =====
       try {
-        const { RealtimeProcessor } =
-          await import("../voice/RealtimeVoiceAPI.js");
+        const { registerDefaultRealtimeHandlers, RealtimeProcessor } =
+          await import("../voice/index.js");
+        registerDefaultRealtimeHandlers();
 
-        // M9 + NEW4: track per-handler registration outcomes so the final
-        // log accurately reflects which voice providers succeeded vs which
-        // were skipped — instead of unconditionally claiming "registered
-        // successfully" or hiding failures at debug level.
+        // M9 + NEW4: registerDefaultRealtimeHandlers() swallows per-handler
+        // construction failures internally (it's a shared, idempotent
+        // barrel function used by every entry point — see voice/index.ts),
+        // so the exact per-handler exception text the old inline block
+        // captured is no longer available here. Recover per-name pass/fail
+        // via supports() instead so getRegistrationReport() stays truthful
+        // for callers that poll it.
+        const realtimeNames = providerChoicesFor("realtime");
         const realtimeOutcomes: Record<string, "ok" | string> = {};
-
-        try {
-          const { OpenAIRealtime } =
-            await import("../voice/providers/OpenAIRealtime.js");
-          RealtimeProcessor.registerHandler(
-            "openai-realtime",
-            new OpenAIRealtime(),
-          );
-          realtimeOutcomes["openai-realtime"] = "ok";
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          realtimeOutcomes["openai-realtime"] = msg;
-          // M9: promote per-handler failures to error level so users can
-          // see which shipped voice provider failed to register at startup.
-          logger.error(
-            `[ProviderRegistry] openai-realtime registration failed: ${msg}`,
-          );
+        for (const name of realtimeNames) {
+          realtimeOutcomes[name] = RealtimeProcessor.supports(name)
+            ? "ok"
+            : "registration failed or handler unavailable";
         }
-
-        try {
-          const { GeminiLive } =
-            await import("../voice/providers/GeminiLive.js");
-          RealtimeProcessor.registerHandler("gemini-live", new GeminiLive());
-          realtimeOutcomes["gemini-live"] = "ok";
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          realtimeOutcomes["gemini-live"] = msg;
-          logger.error(
-            `[ProviderRegistry] gemini-live registration failed: ${msg}`,
-          );
-        }
-
         // NEW4: report the actual per-handler outcomes instead of an
         // unconditional success log. Stored on the registry so callers can
         // introspect via getRegistrationReport().
@@ -941,7 +722,7 @@ export class ProviderRegistry {
         );
         if (skipped.length === 0) {
           logger.info(
-            "[ProviderRegistry] Realtime handlers registered: openai-realtime, gemini-live",
+            `[ProviderRegistry] Realtime handlers registered: ${realtimeNames.join(", ")}`,
           );
         } else {
           logger.warn(
@@ -963,52 +744,12 @@ export class ProviderRegistry {
 
       // ===== VIDEO HANDLER REGISTRATION =====
       try {
-        const { VideoProcessor } = await import("../utils/videoProcessor.js");
-
-        try {
-          const { VertexVideoHandler } =
-            await import("../adapters/video/vertexVideoHandler.js");
-          VideoProcessor.registerHandler("vertex", new VertexVideoHandler());
-        } catch (err) {
-          logger.debug(
-            `[ProviderRegistry] vertex video registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-
-        try {
-          const { KlingVideoHandler } =
-            await import("../adapters/video/klingVideoHandler.js");
-          VideoProcessor.registerHandler("kling", new KlingVideoHandler());
-        } catch (err) {
-          logger.debug(
-            `[ProviderRegistry] kling video registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-
-        try {
-          const { RunwayVideoHandler } =
-            await import("../adapters/video/runwayVideoHandler.js");
-          VideoProcessor.registerHandler("runway", new RunwayVideoHandler());
-        } catch (err) {
-          logger.debug(
-            `[ProviderRegistry] runway video registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-
-        try {
-          const { ReplicateVideoHandler } =
-            await import("../adapters/video/replicateVideoHandler.js");
-          VideoProcessor.registerHandler(
-            "replicate",
-            new ReplicateVideoHandler(),
-          );
-        } catch (err) {
-          logger.debug(
-            `[ProviderRegistry] replicate video registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-
-        logger.debug("Video handlers registered");
+        const { registerDefaultVideoHandlers } =
+          await import("../adapters/video/index.js");
+        registerDefaultVideoHandlers();
+        logger.debug("Video handler registration attempted", {
+          providers: providerChoicesFor("video"),
+        });
       } catch (err) {
         logger.warn(
           `[ProviderRegistry] video registration block failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -1017,41 +758,12 @@ export class ProviderRegistry {
 
       // ===== AVATAR HANDLER REGISTRATION =====
       try {
-        const { AvatarProcessor } = await import("../utils/avatarProcessor.js");
-
-        try {
-          const { DIDAvatar } =
-            await import("../avatar/providers/DIDAvatar.js");
-          AvatarProcessor.registerHandler("d-id", new DIDAvatar());
-        } catch (err) {
-          logger.debug(
-            `[ProviderRegistry] d-id avatar registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-
-        try {
-          const { ReplicateAvatar } =
-            await import("../avatar/providers/ReplicateAvatar.js");
-          const replicateAvatar = new ReplicateAvatar();
-          AvatarProcessor.registerHandler("replicate", replicateAvatar);
-          AvatarProcessor.registerHandler("musetalk", replicateAvatar);
-        } catch (err) {
-          logger.debug(
-            `[ProviderRegistry] replicate avatar registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-
-        try {
-          const { HeyGenAvatar } =
-            await import("../avatar/providers/HeyGenAvatar.js");
-          AvatarProcessor.registerHandler("heygen", new HeyGenAvatar());
-        } catch (err) {
-          logger.debug(
-            `[ProviderRegistry] heygen avatar registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-
-        logger.debug("Avatar handlers registered");
+        const { registerDefaultAvatarHandlers } =
+          await import("../avatar/index.js");
+        registerDefaultAvatarHandlers();
+        logger.debug("Avatar handler registration attempted", {
+          providers: providerChoicesFor("avatar"),
+        });
       } catch (avatarError) {
         logger.warn(
           "Failed to register Avatar handlers - Avatar functionality will be unavailable",
@@ -1066,53 +778,12 @@ export class ProviderRegistry {
 
       // ===== MUSIC HANDLER REGISTRATION =====
       try {
-        const { MusicProcessor } = await import("../utils/musicProcessor.js");
-
-        try {
-          const { BeatovenMusic } =
-            await import("../music/providers/BeatovenMusic.js");
-          MusicProcessor.registerHandler("beatoven", new BeatovenMusic());
-        } catch (err) {
-          logger.debug(
-            `[ProviderRegistry] beatoven music registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-
-        try {
-          const { ReplicateMusic } =
-            await import("../music/providers/ReplicateMusic.js");
-          const replicateMusic = new ReplicateMusic();
-          MusicProcessor.registerHandler("replicate", replicateMusic);
-          MusicProcessor.registerHandler("musicgen", replicateMusic);
-        } catch (err) {
-          logger.debug(
-            `[ProviderRegistry] replicate music registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-
-        try {
-          const { ElevenLabsMusic } =
-            await import("../music/providers/ElevenLabsMusic.js");
-          const elevenLabsMusic = new ElevenLabsMusic();
-          MusicProcessor.registerHandler("elevenlabs-music", elevenLabsMusic);
-          MusicProcessor.registerHandler("elevenlabs-sound", elevenLabsMusic);
-        } catch (err) {
-          logger.debug(
-            `[ProviderRegistry] elevenlabs-music registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-
-        try {
-          const { LyriaMusic } =
-            await import("../music/providers/LyriaMusic.js");
-          MusicProcessor.registerHandler("lyria", new LyriaMusic());
-        } catch (err) {
-          logger.debug(
-            `[ProviderRegistry] lyria music registration skipped: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-
-        logger.debug("Music handlers registered");
+        const { registerDefaultMusicHandlers } =
+          await import("../music/index.js");
+        registerDefaultMusicHandlers();
+        logger.debug("Music handler registration attempted", {
+          providers: providerChoicesFor("music"),
+        });
       } catch (musicError) {
         logger.warn(
           "Failed to register Music handlers - Music functionality will be unavailable",

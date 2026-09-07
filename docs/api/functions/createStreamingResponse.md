@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **createStreamingResponse**(`options`): `Promise`\<`Response`\>
 
-Defined in: [client/aiSdkAdapter.ts:517](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/client/aiSdkAdapter.ts#L517)
+Defined in: [client/aiSdkAdapter.ts:518](https://github.com/juspay/neurolink/blob/release/src/lib/client/aiSdkAdapter.ts#L518)
 
 Create an AI SDK compatible streaming response from NeuroLink stream
 

@@ -79,6 +79,8 @@ import {
   log,
   logSection,
   type ColorName,
+  withCaseTimeout,
+  isCaseTimeout,
 } from "./helpers/harness.js";
 
 const { recordTest, runSuite } = defineSuite("Tool Reliability");
@@ -352,11 +354,11 @@ async function test_tool_execution_events(): Promise<boolean | null> {
     const toolEndEvents: Array<Record<string, unknown>> = [];
 
     const emitter = sdk.getEventEmitter();
-    emitter.on("tool:start", (event: Record<string, unknown>) => {
-      toolStartEvents.push(event);
+    emitter.on("tool:start", (...args: unknown[]) => {
+      toolStartEvents.push(args[0] as Record<string, unknown>);
     });
-    emitter.on("tool:end", (event: Record<string, unknown>) => {
-      toolEndEvents.push(event);
+    emitter.on("tool:end", (...args: unknown[]) => {
+      toolEndEvents.push(args[0] as Record<string, unknown>);
     });
 
     // Call generate with a prompt that should trigger the tool
@@ -531,7 +533,8 @@ async function test_tool_timeout_enforcement(): Promise<boolean | null> {
     emitter.on("tool:start", () => {
       toolStartFired = true;
     });
-    emitter.on("tool:end", (event: Record<string, unknown>) => {
+    emitter.on("tool:end", (...args: unknown[]) => {
+      const event = args[0] as Record<string, unknown>;
       if (event.error) {
         // Handle both string errors and Error objects
         toolEndError =
@@ -1043,7 +1046,7 @@ async function runAllTests(): Promise<number> {
 
   for (const test of tests) {
     try {
-      const result = await test.fn();
+      const result = await withCaseTimeout(test.name, test.fn);
       recordTest(
         test.name,
         result === true,
@@ -1053,6 +1056,19 @@ async function runAllTests(): Promise<number> {
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       recordTest(test.name, false, false, msg);
+
+      // A case bound is not an ordinary failure: Promise.race cannot cancel, so
+      // the abandoned case is still running. Continuing would run the loop's
+      // cleanup and inter-case delay underneath live work, and record every
+      // remaining case as "not run". Stop at the first one.
+      if (isCaseTimeout(error)) {
+        log(
+          `\n\u{1F6D1} ABORTING: "${test.name}" was abandoned by its timeout and is still executing. ` +
+            `Remaining cases are NOT run — this process no longer has clean state.`,
+          "red",
+        );
+        break;
+      }
     }
     await delay(TEST_CONFIG.interTestDelay);
   }
@@ -1084,4 +1100,6 @@ if (!TEST_CONFIG.model) {
   TEST_CONFIG.model = resolveTestModel(TEST_CONFIG.provider);
 }
 
-await runSuite(runAllTests);
+await runSuite(async () => {
+  await runAllTests();
+});

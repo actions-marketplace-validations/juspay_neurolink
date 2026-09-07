@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **AISDKUsage** = `object`
 
-Defined in: [types/stream.ts:748](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L748)
+Defined in: [types/stream.ts:944](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L944)
 
 Raw usage data from Vercel AI SDK.
 
@@ -26,7 +26,7 @@ extractTokenUsage() in tokenUtils.ts already handles both shapes.
 
 > `optional` **promptTokens?**: `number`
 
-Defined in: [types/stream.ts:750](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L750)
+Defined in: [types/stream.ts:946](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L946)
 
 #### Deprecated
 
@@ -38,7 +38,7 @@ AI SDK v4 name — use inputTokens
 
 > `optional` **completionTokens?**: `number`
 
-Defined in: [types/stream.ts:752](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L752)
+Defined in: [types/stream.ts:948](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L948)
 
 #### Deprecated
 
@@ -50,7 +50,7 @@ AI SDK v4 name — use outputTokens
 
 > `optional` **totalTokens?**: `number`
 
-Defined in: [types/stream.ts:754](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L754)
+Defined in: [types/stream.ts:950](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L950)
 
 #### Deprecated
 
@@ -62,7 +62,7 @@ AI SDK v4 name — use totalTokens
 
 > `optional` **inputTokens?**: `number`
 
-Defined in: [types/stream.ts:756](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L756)
+Defined in: [types/stream.ts:952](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L952)
 
 AI SDK v6 name for prompt / input tokens
 
@@ -72,6 +72,6 @@ AI SDK v6 name for prompt / input tokens
 
 > `optional` **outputTokens?**: `number`
 
-Defined in: [types/stream.ts:758](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L758)
+Defined in: [types/stream.ts:954](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L954)
 
 AI SDK v6 name for completion / output tokens

@@ -95,7 +95,7 @@ All fields are optional — omit any field you want to fall through to a lower-p
 | ----------------- | ------------------ | -------------------------------------------------------------------------------------------------- |
 | OpenAI            | `openai`           | `apiKey`, `baseURL`                                                                                |
 | Anthropic         | `anthropic`        | `apiKey`, `oauthToken`                                                                             |
-| Google AI Studio  | `googleAiStudio`   | `apiKey`                                                                                           |
+| Google AI Studio  | `googleAiStudio`   | `apiKey`, `baseURL`                                                                                |
 | Google Vertex AI  | `vertex`           | `projectId`, `location`, `apiKey` (Express Mode), `serviceAccountKey`, `clientEmail`, `privateKey` |
 | Amazon Bedrock    | `bedrock`          | `accessKeyId`, `secretAccessKey`, `sessionToken`, `region`                                         |
 | Amazon SageMaker  | `sagemaker`        | `accessKeyId`, `secretAccessKey`, `sessionToken`, `region`, `endpoint`                             |
@@ -105,6 +105,8 @@ All fields are optional — omit any field you want to fall through to a lower-p
 | OpenRouter        | `openrouter`       | `apiKey`, `baseURL`                                                                                |
 | LiteLLM           | `litellm`          | `apiKey`, `baseURL`                                                                                |
 | OpenAI-Compatible | `openaiCompatible` | `apiKey`, `baseURL`                                                                                |
+| Cerebras          | `cerebras`         | `apiKey`, `baseURL`                                                                                |
+| SambaNova         | `sambanova`        | `apiKey`, `baseURL`                                                                                |
 | Ollama            | `ollama`           | `baseURL`                                                                                          |
 
 The full type definition is `NeurolinkCredentials` in `src/lib/types/providers.ts`.

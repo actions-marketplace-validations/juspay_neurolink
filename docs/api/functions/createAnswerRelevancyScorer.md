@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **createAnswerRelevancyScorer**(`config?`): `Promise`\<[`AnswerRelevancyScorer`](../classes/AnswerRelevancyScorer.md)\>
 
-Defined in: [evaluation/scorers/llm/answerRelevancyScorer.ts:128](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/evaluation/scorers/llm/answerRelevancyScorer.ts#L128)
+Defined in: [evaluation/scorers/llm/answerRelevancyScorer.ts:128](https://github.com/juspay/neurolink/blob/release/src/lib/evaluation/scorers/llm/answerRelevancyScorer.ts#L128)
 
 Evaluation System Exports
 

@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **VoiceServerArgs** = `object`
 
-Defined in: [types/cli.ts:1592](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1592)
+Defined in: [types/cli.ts:1762](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1762)
 
 Arguments for `neurolink voice-server`.
 
@@ -18,4 +18,4 @@ Arguments for `neurolink voice-server`.
 
 > **port**: `number`
 
-Defined in: [types/cli.ts:1593](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1593)
+Defined in: [types/cli.ts:1763](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1763)

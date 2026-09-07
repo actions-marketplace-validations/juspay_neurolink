@@ -13,6 +13,39 @@
 
 import { DynamicModelProvider } from "../core/dynamicModels.js";
 import { logger } from "../utils/logger.js";
+import { resolveManifestEntryStrict } from "../models/manifestRegistry.js";
+import { getCatalogJsonEntries } from "../providers/catalog/loader.js";
+
+/**
+ * Per-provider context window blocks for the 9 JSON-catalog providers
+ * (cerebras, cloudflare, fireworks, groq, mistral, perplexity, sambanova,
+ * together-ai, xai), derived from models.catalog[*].contextWindow +
+ * defaultContextWindow — the catalog JSON (src/lib/providers/catalog/<id>.json)
+ * is their single source of truth. A catalog model with no recorded
+ * contextWindow (e.g. fireworks' current roster — none of its models have a
+ * sourced value yet) is simply omitted here, same as it was never a key in
+ * the pre-migration table either; the `_default` / prefix-match /
+ * DEFAULT_CONTEXT_WINDOW fallback chain in getContextWindowSize() below
+ * covers it exactly as it always has.
+ */
+const CATALOG_CONTEXT_WINDOWS: Record<
+  string,
+  Record<string, number>
+> = Object.fromEntries(
+  getCatalogJsonEntries().map((entry) => [
+    entry.id,
+    {
+      _default: entry.models.defaultContextWindow,
+      ...Object.fromEntries(
+        Object.entries(entry.models.catalog).flatMap(([modelId, spec]) =>
+          spec.contextWindow !== undefined
+            ? [[modelId, spec.contextWindow] as const]
+            : [],
+        ),
+      ),
+    },
+  ]),
+);
 
 /** Default context window when provider/model is unknown */
 export const DEFAULT_CONTEXT_WINDOW = 128_000;
@@ -56,73 +89,11 @@ export const MODEL_CONTEXT_WINDOWS: Record<string, Record<string, number>> = {
   llamacpp: {
     _default: 8_192,
   },
-  xai: {
-    _default: 131_072,
-    "grok-3": 131_072,
-    "grok-3-mini": 131_072,
-    "grok-2-latest": 131_072,
-    "grok-2-vision-latest": 32_768,
-    "grok-beta": 131_072,
-  },
-  groq: {
-    _default: 128_000,
-    "llama-3.3-70b-versatile": 131_072,
-    "llama-3.1-8b-instant": 128_000,
-    "llama-3.2-90b-vision-preview": 128_000,
-    "llama-3.2-11b-vision-preview": 128_000,
-    "llama-guard-3-8b": 8_192,
-    "gemma2-9b-it": 8_192,
-    "mixtral-8x7b-32768": 32_768,
-  },
   cohere: {
     _default: 128_000,
     "command-r-plus": 128_000,
     "command-r": 128_000,
     "command-r7b-12-2024": 128_000,
-  },
-  "together-ai": {
-    _default: 128_000,
-    "meta-llama/Llama-3.3-70B-Instruct-Turbo": 128_000,
-    "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo": 128_000,
-    "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo": 128_000,
-    "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo": 128_000,
-    "mistralai/Mixtral-8x22B-Instruct-v0.1": 65_536,
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": 32_768,
-    "Qwen/Qwen2.5-72B-Instruct-Turbo": 32_768,
-    "Qwen/Qwen2.5-Coder-32B-Instruct": 32_768,
-    "deepseek-ai/DeepSeek-R1": 64_000,
-    "deepseek-ai/DeepSeek-V3": 64_000,
-    "google/gemma-2-27b-it": 8_192,
-    "microsoft/WizardLM-2-8x22B": 65_536,
-  },
-  fireworks: {
-    _default: 128_000,
-    "accounts/fireworks/models/llama-v3p1-70b-instruct": 131_072,
-    "accounts/fireworks/models/llama-v3p1-405b-instruct": 128_000,
-    "accounts/fireworks/models/llama-v3p1-8b-instruct": 128_000,
-    "accounts/fireworks/models/llama-v3p3-70b-instruct": 128_000,
-    "accounts/fireworks/models/mixtral-8x22b-instruct": 65_536,
-    "accounts/fireworks/models/qwen2p5-72b-instruct": 32_768,
-    "accounts/fireworks/models/qwen2p5-coder-32b-instruct": 32_768,
-    "accounts/fireworks/models/deepseek-v3": 64_000,
-  },
-  perplexity: {
-    _default: 127_000,
-    sonar: 127_000,
-    "sonar-pro": 200_000,
-    "sonar-reasoning": 127_000,
-    "sonar-reasoning-pro": 127_000,
-    "sonar-deep-research": 200_000,
-  },
-  cloudflare: {
-    _default: 8_192,
-    "@cf/meta/llama-3.3-70b-instruct-fp8-fast": 24_000,
-    "@cf/meta/llama-3.1-70b-instruct": 24_000,
-    "@cf/meta/llama-3.1-8b-instruct-fast": 24_000,
-    "@cf/meta/llama-3.2-11b-vision-instruct": 24_000,
-    "@cf/mistral/mistral-7b-instruct-v0.2": 32_768,
-    "@cf/qwen/qwen1.5-14b-chat-awq": 7_500,
-    "@cf/google/gemma-2b-it-lora": 4_096,
   },
   replicate: {
     // Per-model — Replicate hosts arbitrary models; sensible default.
@@ -287,10 +258,10 @@ export const MODEL_CONTEXT_WINDOWS: Record<string, Record<string, number>> = {
   bedrock: {
     _default: 200_000,
     // Claude 4.6
-    "anthropic.claude-opus-4-6-v1:0": 1_000_000,
+    "anthropic.claude-opus-4-6-v1": 1_000_000,
     "anthropic.claude-sonnet-4-6": 1_000_000,
     // Claude 4.5
-    "anthropic.claude-opus-4-5-20251124-v1:0": 200_000,
+    "anthropic.claude-opus-4-5-20251101-v1:0": 200_000,
     "anthropic.claude-sonnet-4-5-20250929-v1:0": 200_000,
     "anthropic.claude-haiku-4-5-20251001-v1:0": 200_000,
     // Claude legacy
@@ -337,19 +308,6 @@ export const MODEL_CONTEXT_WINDOWS: Record<string, Record<string, number>> = {
     "gpt-4-turbo": 128_000,
     "gpt-4": 8_192,
   },
-  mistral: {
-    _default: 128_000,
-    "mistral-large-latest": 256_000,
-    "mistral-large-2512": 256_000,
-    "mistral-medium-latest": 128_000,
-    "mistral-small-latest": 128_000,
-    "codestral-latest": 256_000,
-    "codestral-2508": 256_000,
-    "devstral-2512": 256_000,
-    "devstral-small-2512": 256_000,
-    "magistral-medium-latest": 128_000,
-    "mistral-small-2603": 256_000,
-  },
   ollama: {
     _default: 128_000,
   },
@@ -366,6 +324,7 @@ export const MODEL_CONTEXT_WINDOWS: Record<string, Record<string, number>> = {
     // Qwen3 VL — 32K context
     "qwen3-vl-8b-instruct": 32_768,
   },
+  ...CATALOG_CONTEXT_WINDOWS,
 };
 
 /**
@@ -518,10 +477,24 @@ export function clearRuntimeOutputCeilings(): void {
  *  0.5 Runtime-discovered windows (registerRuntimeContextWindow) — real
  *      per-model limits fetched from the serving infrastructure (LiteLLM
  *      `/model/info`)
- *  1. Exact model match under provider in static registry
- *  2. Prefix match under provider in static registry
- *  3. Provider's _default in static registry
- *  4. Global DEFAULT_CONTEXT_WINDOW
+ *  1. Manifest exact/alias match ONLY (resolveManifestEntryStrict — no prefix, see
+ *     src/lib/models/manifestRegistry.ts) — the emerging single source of
+ *     truth for per-model metadata. Deliberately consulted for a REAL match
+ *     only (never the manifest's synthesized/generic default): most provider
+ *     manifests are still "minimal" stubs holding nothing but a provider-wide
+ *     default (e.g. vertex.ts, together-ai.ts) and none of the per-model
+ *     overrides — including Vertex's Claude "claude-" prefix catch-all below,
+ *     which exists specifically to stop an unlisted Claude-on-Vertex model
+ *     from inheriting Gemini's 1,048,576 default — that still live only in
+ *     MODEL_CONTEXT_WINDOWS. Falling back to a manifest-wide default here
+ *     would silently drop that coverage. When a manifest DOES carry a real
+ *     entry for this model, it wins even if it disagrees with the legacy
+ *     table (e.g. Mistral's manifest supersedes the coarser, older
+ *     MODEL_CONTEXT_WINDOWS.mistral values).
+ *  2. Exact model match under provider in static registry
+ *  3. Prefix match under provider in static registry
+ *  4. Provider's _default in static registry
+ *  5. Global DEFAULT_CONTEXT_WINDOW
  */
 export function getContextWindowSize(provider: string, model?: string): number {
   // Step 0: Check dynamic model registry first.
@@ -554,6 +527,25 @@ export function getContextWindowSize(provider: string, model?: string): number {
   // Static fallback chain — normalize aliases first so "lmstudio" / "llama.cpp" /
   // "nvidianim" find their canonical entries instead of falling back to default.
   const canonical = normalizeProviderForLookup(provider);
+
+  // Step 1: Manifest real-entry lookup (exact id, alias, or longest-prefix —
+  // see resolveManifestEntryStrict's docblock). Tries the alias-normalized
+  // provider key first, then the raw provider string, mirroring the
+  // `MODEL_CONTEXT_WINDOWS[canonical] ?? MODEL_CONTEXT_WINDOWS[provider]`
+  // double-lookup below — MANIFEST_REGISTRY is keyed by the same hyphenated
+  // AIProviderName forms (e.g. "together-ai") that normalizeProviderForLookup
+  // strips and PROVIDER_ALIAS_MAP doesn't cover, so callers passing the raw
+  // enum value still resolve. Only a genuine match short-circuits; a miss
+  // falls straight through to the untouched legacy cascade below.
+  if (model) {
+    const manifestEntry =
+      resolveManifestEntryStrict(canonical, model) ??
+      resolveManifestEntryStrict(provider, model);
+    if (manifestEntry) {
+      return manifestEntry.contextWindow;
+    }
+  }
+
   const providerWindows =
     MODEL_CONTEXT_WINDOWS[canonical] ?? MODEL_CONTEXT_WINDOWS[provider];
   if (!providerWindows) {

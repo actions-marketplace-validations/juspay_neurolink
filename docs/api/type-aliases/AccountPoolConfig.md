@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **AccountPoolConfig** = `object`
 
-Defined in: [types/subscription.ts:1094](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L1094)
+Defined in: [types/subscription.ts:1177](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1177)
 
 Configuration for AccountPool
 
@@ -18,7 +18,7 @@ Configuration for AccountPool
 
 > **strategy**: `"round-robin"` \| `"fill-first"`
 
-Defined in: [types/subscription.ts:1095](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L1095)
+Defined in: [types/subscription.ts:1178](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1178)
 
 ---
 
@@ -26,7 +26,7 @@ Defined in: [types/subscription.ts:1095](https://github.com/juspay/neurolink/blo
 
 > `optional` **defaultCooldownMs?**: `number`
 
-Defined in: [types/subscription.ts:1096](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L1096)
+Defined in: [types/subscription.ts:1179](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1179)
 
 ---
 
@@ -34,7 +34,7 @@ Defined in: [types/subscription.ts:1096](https://github.com/juspay/neurolink/blo
 
 > `optional` **maxCooldownMs?**: `number`
 
-Defined in: [types/subscription.ts:1097](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L1097)
+Defined in: [types/subscription.ts:1180](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1180)
 
 ---
 
@@ -42,4 +42,4 @@ Defined in: [types/subscription.ts:1097](https://github.com/juspay/neurolink/blo
 
 > `optional` **maxRetryAccounts?**: `number`
 
-Defined in: [types/subscription.ts:1098](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L1098)
+Defined in: [types/subscription.ts:1181](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1181)

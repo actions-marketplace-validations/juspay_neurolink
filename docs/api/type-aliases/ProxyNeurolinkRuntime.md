@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ProxyNeurolinkRuntime** = `object`
 
-Defined in: [types/proxy.ts:1257](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1257)
+Defined in: [types/proxy.ts:3190](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L3190)
 
 Handle for a NeuroLink runtime created by the proxy start command.
 The `neurolink` field is typed structurally (only the method used by the
@@ -21,7 +21,7 @@ NeuroLink class.
 
 > **neurolink**: `object`
 
-Defined in: [types/proxy.ts:1258](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1258)
+Defined in: [types/proxy.ts:3191](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L3191)
 
 #### getToolRegistry()
 
@@ -33,22 +33,8 @@ Defined in: [types/proxy.ts:1258](https://github.com/juspay/neurolink/blob/ff50c
 
 ---
 
-### cleanupLogs
+### logsDir
 
-> **cleanupLogs**: (`daysToKeep?`, `maxFiles?`) => `void`
+> **logsDir**: `string`
 
-Defined in: [types/proxy.ts:1261](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1261)
-
-#### Parameters
-
-##### daysToKeep?
-
-`number`
-
-##### maxFiles?
-
-`number`
-
-#### Returns
-
-`void`
+Defined in: [types/proxy.ts:3194](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L3194)

@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **BasicToolsMap** = `object`
 
-Defined in: [types/tools.ts:448](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L448)
+Defined in: [types/tools.ts:499](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L499)
 
 Subset of directAgentTools exposing only the "basic" category.
 
@@ -16,14 +16,14 @@ Subset of directAgentTools exposing only the "basic" category.
 
 ### getCurrentTime
 
-> **getCurrentTime**: `Tool`
+> **getCurrentTime**: [`Tool`](Tool.md)
 
-Defined in: [types/tools.ts:449](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L449)
+Defined in: [types/tools.ts:500](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L500)
 
 ---
 
 ### calculateMath
 
-> **calculateMath**: `Tool`
+> **calculateMath**: [`Tool`](Tool.md)
 
-Defined in: [types/tools.ts:450](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L450)
+Defined in: [types/tools.ts:501](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L501)

@@ -33,7 +33,11 @@ import type {
   ZodUnknownSchema,
 } from "./aliases.js";
 import type { NeurolinkCredentials } from "./providers.js";
-import type { CSVProcessorOptions, FileWithMetadata } from "./file.js";
+import type {
+  CSVProcessorOptions,
+  FileWithMetadata,
+  MultimodalAudioEntry,
+} from "./file.js";
 import type { WorkflowConfig } from "./workflow.js";
 import type { Schema, Tool, ToolChoice } from "./tools.js";
 import type { StepResult, LanguageModel } from "./providers.js";
@@ -73,6 +77,17 @@ export type GenerateOptions = {
     csvFiles?: Array<Buffer | string>; // Explicit CSV files
     pdfFiles?: Array<Buffer | string>; // Explicit PDF files
     audioFiles?: Array<Buffer | string>; // Explicit audio files (metadata/transcript extraction)
+    /**
+     * Audio whose bytes should be delivered to the provider, populated during
+     * detection rather than by callers.
+     *
+     * Separate from `audioFiles` above, which is the caller-facing input that
+     * yields a metadata summary. This one carries the decoded bytes forward so
+     * a provider that can actually listen receives the audio instead of a
+     * description of it; providers that cannot fall back to the summary and
+     * this is ignored.
+     */
+    nativeAudioFiles?: MultimodalAudioEntry[];
     videoFiles?: Array<Buffer | string>; // Explicit video files
     files?: Array<Buffer | string | FileWithMetadata>; // Auto-detect file types
     content?: Content[]; // Advanced multimodal content
@@ -363,7 +378,14 @@ export type GenerateOptions = {
    * multi-step tool loop (Vertex Gemini / Vertex Claude), this bounds EACH
    * model call in the loop, not the whole turn — a tool-heavy turn may run
    * far longer than this value in total. Size it for the slowest single
-   * step (default 300s), and use `abortSignal` for a total-turn deadline.
+   * step (default 300s), and use `turnTimeoutMs` (or `abortSignal`) for a
+   * total-turn deadline.
+   *
+   * On the AI-SDK loop path (direct Anthropic, litellm, OpenAI-compatible)
+   * the same split holds only when `turnTimeoutMs` is ALSO set: then this
+   * value bounds each model call and `turnTimeoutMs` bounds the turn. With
+   * `turnTimeoutMs` unset, this value bounds the WHOLE turn there (the
+   * pre-existing defensive behavior, kept for backward compatibility).
    *
    * When set explicitly, a step timeout is surfaced immediately instead of
    * burning internal retries/fallbacks that would re-run the same
@@ -378,9 +400,11 @@ export type GenerateOptions = {
    * imposes no product policy).
    *
    * Enforced by the native Vertex loops (Gemini + Claude) AND the AI-SDK
-   * loop path (litellm and other OpenAI-compatible providers). On the AI-SDK
-   * path, an explicit `timeout` also engages the same wrap-up when
-   * `turnTimeoutMs` is unset. Once the wrap-up window begins (see
+   * loop path (direct Anthropic, litellm and other OpenAI-compatible
+   * providers). On the AI-SDK path this value also owns the whole-turn hard
+   * abort: when set, `timeout` keeps its per-model-call meaning instead of
+   * bounding the entire loop. An explicit `timeout` also engages the same
+   * wrap-up when `turnTimeoutMs` is unset. Once the wrap-up window begins (see
    * `wrapupTimeLeadMs`), the loop forcibly sets `toolChoice: "none"` for the
    * remaining steps — overriding any caller-supplied `toolChoice` or
    * `prepareStep` tool selection — and appends an honest time message that a
@@ -394,6 +418,13 @@ export type GenerateOptions = {
    * with `stopReason: "stalled"`. Catches wedged tools and hung model calls
    * that a whole-turn deadline would let run to the bitter end.
    * Unset = disabled.
+   *
+   * Enforced by the native Vertex loops (Gemini + Claude) ONLY. Unlike
+   * `turnTimeoutMs`, the AI-SDK loop path does not implement stall detection,
+   * so setting this on any other provider has no effect — the turn runs until
+   * it finishes, times out some other way, or the caller aborts. The narrower
+   * scope is stated here because the option itself is accepted everywhere:
+   * without this note a caller would reasonably read silence as coverage.
    */
   stallTimeoutMs?: number;
   /**
@@ -462,6 +493,20 @@ export type GenerateOptions = {
 
   /** Disable tool result caching for this request (overrides global mcp.cache.enabled) */
   disableToolCache?: boolean;
+
+  /**
+   * Disable NeuroLink's internal fallback for this request: the static
+   * provider-priority walk that runs when no provider was requested, and the
+   * catalog model-fallback walk a provider performs when its model is
+   * rejected as invalid. Callers that own fallback order (a caller-supplied
+   * `providerFallback` / `modelChain`, or a router that retries on its own,
+   * as the Claude proxy does for its streams) set this so an invalid model
+   * or an unavailable provider surfaces as exactly that.
+   * A configured `ModelPool`, `providerFallback` and `modelChain` are the
+   * caller's own fallback and are unaffected. Mirrors the same flag on
+   * `StreamOptions`.
+   */
+  disableInternalFallback?: boolean;
 
   /** Maximum number of tool execution steps (default: 200) */
   maxSteps?: number;
@@ -884,22 +929,12 @@ export type GenerateStopReason =
   | "provider-error";
 
 /**
- * Generate function result type - Primary output format
- * Future-ready for multi-modal outputs while maintaining text focus
+ * Media generation/processing outputs shared by GenerateResult and
+ * TextGenerationResult. Extracted so both result types intersect (&) this
+ * single definition instead of each declaring its own drifting copy of the
+ * same audio/video/avatar/music/ppt/image/transcription fields.
  */
-export type GenerateResult = {
-  content: string; // Primary output
-  /** Knowledge-grounding diagnostics for this turn (present only when grounding ran). */
-  knowledge?: KnowledgeGroundingMetadata;
-  /**
-   * Parsed structured object when a `schema` was requested. Populated from
-   * AI-SDK experimental_output, or from text-mode coercion (balanced-scan +
-   * jsonrepair). Prefer this over JSON.parse(content) — it never requires the
-   * caller to re-parse hand-escaped model text.
-   */
-  structuredData?: unknown;
-  outputs?: { text: string }; // Future extensible for multi-modal
-
+export type MediaGenerationOutputs = {
   /**
    * Text-to-Speech audio result
    *
@@ -929,6 +964,20 @@ export type GenerateResult = {
    * ```
    */
   audio?: TTSResult;
+  /**
+   * What happened during TTS synthesis, including why it failed.
+   *
+   * `generate()` degrades gracefully when synthesis fails: it returns the text
+   * and omits `audio`. Without this field a caller cannot tell a request that
+   * never asked for audio from one whose provider rejected the credentials —
+   * an invalid key produces a silent, indistinguishable absence.
+   *
+   * BaseProvider has always recorded this on EnhancedGenerateResult; it was
+   * declared there but never forwarded by the result builders, so callers
+   * reading it got `undefined`. Same defect the `reasoning` comment in
+   * neurolink.ts describes, on a different field.
+   */
+  ttsMetadata?: TTSMetadata;
 
   /**
    * Video generation result
@@ -979,7 +1028,28 @@ export type GenerateResult = {
    * ```
    */
   ppt?: PPTGenerationResult;
-  imageOutput?: { base64: string } | null; // Standard format for image generation
+  /** Standard format for image generation */
+  imageOutput?: { base64: string } | null;
+  /** STT transcription result (present when stt.enabled is true and audio input was provided) */
+  transcription?: STTResult;
+};
+
+/**
+ * Generate function result type - Primary output format
+ * Future-ready for multi-modal outputs while maintaining text focus
+ */
+export type GenerateResult = {
+  content: string; // Primary output
+  /** Knowledge-grounding diagnostics for this turn (present only when grounding ran). */
+  knowledge?: KnowledgeGroundingMetadata;
+  /**
+   * Parsed structured object when a `schema` was requested. Populated from
+   * AI-SDK experimental_output, or from text-mode coercion (balanced-scan +
+   * jsonrepair). Prefer this over JSON.parse(content) — it never requires the
+   * caller to re-parse hand-escaped model text.
+   */
+  structuredData?: unknown;
+  outputs?: { text: string }; // Future extensible for multi-modal
 
   // Provider information
   provider?: string;
@@ -1099,9 +1169,6 @@ export type GenerateResult = {
   /** Token count for reasoning content */
   reasoningTokens?: number;
 
-  /** STT transcription result (present when stt.enabled is true and audio input was provided) */
-  transcription?: STTResult;
-
   // NL-007: Retry metadata for observability
   retries?: {
     count: number;
@@ -1119,7 +1186,7 @@ export type GenerateResult = {
    * absolute `requestsRemaining` / `tokensRemaining`.
    */
   limits?: ClaudeLimitSnapshot;
-};
+} & MediaGenerationOutputs;
 
 /**
  * Unified options for both generation and streaming
@@ -1289,6 +1356,15 @@ export type TextGenerationOptions = {
 
   /** Disable tool result caching for this request (overrides global mcp.cache.enabled) */
   disableToolCache?: boolean;
+
+  /**
+   * Caller owns fallback order. Read in two places: `directProviderGeneration`
+   * bounds its static provider-priority walk to one candidate, and
+   * `BaseProvider.generate()` skips the catalog model-fallback walk so an
+   * invalid-model error surfaces as itself. Mapped from
+   * `GenerateOptions.disableInternalFallback`.
+   */
+  disableInternalFallback?: boolean;
 
   /**
    * Tool choice configuration for the generation.
@@ -1601,6 +1677,12 @@ export type TextGenerationResult = {
   model?: string;
   usage?: TokenUsage;
   responseTime?: number;
+  /** The executed tool calls of a native turn — the same shape `GenerateResult` exposes. */
+  toolCalls?: Array<{
+    toolCallId: string;
+    toolName: string;
+    args: StandardRecord;
+  }>;
   toolsUsed?: string[];
   toolExecutions?: Array<{
     toolName: string;
@@ -1618,19 +1700,6 @@ export type TextGenerationResult = {
   // Analytics and evaluation data
   analytics?: AnalyticsData;
   evaluation?: EvaluationData;
-  audio?: TTSResult;
-  /** STT transcription result (present when stt input was processed) */
-  transcription?: STTResult;
-  /** Video generation result */
-  video?: VideoGenerationResult;
-  /** Avatar (talking-head) generation result */
-  avatar?: AvatarResult;
-  /** Music generation result */
-  music?: MusicResult;
-  /** PowerPoint generation result */
-  ppt?: PPTGenerationResult;
-  /** Image generation output */
-  imageOutput?: { base64: string } | null;
   /** Gemini 3 thought signature for reasoning continuity across turns */
   thoughtSignature?: string;
   /** Thinking/reasoning text from provider (Anthropic thinking blocks, Gemini thought parts, DeepSeek/NIM reasoning_content) */
@@ -1642,7 +1711,7 @@ export type TextGenerationResult = {
     count: number;
     errors: Array<{ code: string; message: string }>;
   };
-};
+} & MediaGenerationOutputs;
 
 /**
  * Enhanced result type with optional analytics/evaluation
@@ -1666,7 +1735,6 @@ export type EnhancedGenerateResult = GenerateResult & {
   analytics?: AnalyticsData;
   evaluation?: EvaluationData;
   /** Outcome metadata when TTS was enabled for this generation. */
-  ttsMetadata?: TTSMetadata;
 };
 
 /**
@@ -1692,4 +1760,78 @@ export type ModelAliasConfig = {
  */
 export type GenerateOptionsNormalized = GenerateOptions & {
   input: NonNullable<GenerateOptions["input"]>;
+};
+
+/**
+ * Per-call configuration for GenerationHandler's AI-SDK loop invocation,
+ * shared by the initial call and every fallback retry so they cannot drift.
+ */
+export type GenerationCallConfig = {
+  shouldUseTools: boolean;
+  includeStructuredOutput: boolean;
+  /** Anchor for the turn deadline — the ORIGINAL executeGeneration start,
+   *  shared across fallback/provider retries so they can't refresh the
+   *  wall-clock budget. */
+  turnStartMs: number;
+  /** Structured-output fallback retry: also spell the JSON Schema out in the
+   *  system prompt, for vendors that ignore `response_format`. */
+  promptJsonInstruction?: boolean;
+  /** Set on the single toolChoice:"none" re-ask so it can never recurse. */
+  isToolReask?: boolean;
+};
+
+/**
+ * Inputs to the shared native generate loop (`core/nativeGenerateLoop.ts`).
+ * One loop serves every provider whose delegating model exposes a v3-shaped
+ * `doGenerate`; the provider supplies the wire details.
+ */
+export type NativeGenerateLoopArgs = {
+  doGenerate: (
+    options: Record<string, unknown>,
+  ) => Promise<Record<string, unknown>>;
+  /** Conversation in the message-builder shape each doGenerate converts itself. */
+  conversation: Array<Record<string, unknown>>;
+  /** Tool declarations in the v3 shape doGenerate already knows how to convert. */
+  tools?: Array<Record<string, unknown>>;
+  /** Registered tools, used to execute a call the model asks for. */
+  toolsRecord: Record<string, unknown>;
+  toolChoice?: unknown;
+  responseFormat?: Record<string, unknown>;
+  providerOptions?: Record<string, Record<string, unknown>>;
+  maxSteps: number;
+  maxOutputTokens?: number;
+  temperature?: number;
+  abortSignal?: AbortSignal;
+  /** Per-tool-execution cap, forwarded into `guardToolExecutor`. */
+  toolTimeoutMs?: number;
+  /** Wraps one step: retry ladder plus provider error classification. */
+  runStep: (
+    call: () => Promise<Record<string, unknown>>,
+  ) => Promise<Record<string, unknown>>;
+};
+
+export type NativeGenerateLoopResult = {
+  text: string;
+  finishReason: string;
+  rawFinishReason?: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  toolsUsed: string[];
+  steps: number;
+};
+
+export type SingleShotRequest = {
+  system?: string;
+  prompt: string;
+  maxOutputTokens?: number;
+  temperature?: number;
+  abortSignal?: AbortSignal;
+};
+
+export type SingleShotResult = {
+  text: string;
+  usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+  finishReason?: string;
 };

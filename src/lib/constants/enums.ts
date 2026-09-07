@@ -16,20 +16,30 @@ export enum AIProviderName {
   GOOGLE_AI = "google-ai",
   HUGGINGFACE = "huggingface",
   OLLAMA = "ollama",
-  MISTRAL = "mistral",
   LITELLM = "litellm",
   SAGEMAKER = "sagemaker",
   DEEPSEEK = "deepseek",
   NVIDIA_NIM = "nvidia-nim",
   LM_STUDIO = "lm-studio",
   LLAMACPP = "llamacpp",
-  XAI = "xai",
-  GROQ = "groq",
-  COHERE = "cohere",
-  TOGETHER_AI = "together-ai",
-  FIREWORKS = "fireworks",
-  PERPLEXITY = "perplexity",
+  // ── BEGIN GENERATED(provider-members): provider catalog (pnpm run codegen:catalog) ──
+  BASETEN = "baseten",
+  CEREBRAS = "cerebras",
   CLOUDFLARE = "cloudflare",
+  FIREWORKS = "fireworks",
+  GMICLOUD = "gmicloud",
+  GROQ = "groq",
+  INCEPTION_LABS = "inception-labs",
+  IO_INTELLIGENCE = "io-intelligence",
+  MANCER = "mancer",
+  MISTRAL = "mistral",
+  PERPLEXITY = "perplexity",
+  SAMBANOVA = "sambanova",
+  TOGETHER_AI = "together-ai",
+  UPSTAGE = "upstage",
+  XAI = "xai",
+  // ── END GENERATED(provider-members) ──
+  COHERE = "cohere",
   REPLICATE = "replicate",
   VOYAGE = "voyage",
   JINA = "jina",
@@ -89,11 +99,11 @@ export enum BedrockModels {
   // ============================================================================
 
   // Claude 4.6 Series (Latest - February 2026)
-  CLAUDE_4_6_OPUS = "anthropic.claude-opus-4-6-v1:0",
+  CLAUDE_4_6_OPUS = "anthropic.claude-opus-4-6-v1",
   CLAUDE_4_6_SONNET = "anthropic.claude-sonnet-4-6",
 
   // Claude 4.5 Series (September-November 2025)
-  CLAUDE_4_5_OPUS = "anthropic.claude-opus-4-5-20251124-v1:0",
+  CLAUDE_4_5_OPUS = "anthropic.claude-opus-4-5-20251101-v1:0",
   CLAUDE_4_5_SONNET = "anthropic.claude-sonnet-4-5-20250929-v1:0",
   CLAUDE_4_5_HAIKU = "anthropic.claude-haiku-4-5-20251001-v1:0",
 
@@ -378,6 +388,13 @@ export enum AzureOpenAIModels {
   GPT_5_CHAT = "gpt-5-chat",
   GPT_5_CODEX = "gpt-5-codex",
   GPT_5_PRO = "gpt-5-pro",
+  /**
+   * @deprecated No such model exists on Azure OpenAI. "Turbo" was a GPT-3.5 and
+   * GPT-4 era suffix and was never carried into the GPT-5 family; the real
+   * series is gpt-5 / gpt-5-mini / gpt-5-nano / gpt-5-chat / gpt-5-codex /
+   * gpt-5-pro. Deploying this id fails. Kept only so existing code still
+   * compiles — scheduled for removal in the next major. Use GPT_5 instead.
+   */
   GPT_5_TURBO = "gpt-5-turbo",
 
   // O-Series Reasoning Models
@@ -418,7 +435,7 @@ export enum VertexModels {
   CLAUDE_4_6_SONNET = "claude-sonnet-4-6",
 
   // Claude 4.5 Series (September-November 2025)
-  CLAUDE_4_5_OPUS = "claude-opus-4-5@20251124",
+  CLAUDE_4_5_OPUS = "claude-opus-4-5@20251101",
   CLAUDE_4_5_SONNET = "claude-sonnet-4-5@20250929",
   CLAUDE_4_5_HAIKU = "claude-haiku-4-5@20251001",
 
@@ -521,8 +538,24 @@ export enum GoogleAIModels {
 /**
  * Supported Models for Anthropic (Direct API)
  */
+// Model states below track Anthropic's own status table at
+// platform.claude.com/docs/en/about-claude/model-deprecations. Those dates
+// cover Anthropic-operated platforms only — Amazon Bedrock and Google Cloud
+// set their own retirement schedules, so BedrockModels/VertexModels entries
+// are NOT retired just because the direct-API twin is.
 export enum AnthropicModels {
-  // Claude 4.6 Series (Latest - February 2026)
+  // Claude 5 Series (mid 2026). MODEL_CONTEXT_WINDOWS.anthropic
+  // (src/lib/constants/contextWindows.ts) already carries the 1M window
+  // these ids resolve to.
+  CLAUDE_OPUS_5 = "claude-opus-5",
+  CLAUDE_SONNET_5 = "claude-sonnet-5",
+  CLAUDE_FABLE_5 = "claude-fable-5",
+
+  // Claude 4.7 / 4.8 Series
+  CLAUDE_OPUS_4_8 = "claude-opus-4-8",
+  CLAUDE_OPUS_4_7 = "claude-opus-4-7",
+
+  // Claude 4.6 Series (February 2026)
   CLAUDE_OPUS_4_6 = "claude-opus-4-6",
   CLAUDE_SONNET_4_6 = "claude-sonnet-4-6",
 
@@ -532,10 +565,13 @@ export enum AnthropicModels {
   CLAUDE_4_5_HAIKU = "claude-haiku-4-5-20251001",
 
   // Claude 4.1 Series (Legacy)
+  /** @deprecated Retired from the Claude API on August 5, 2026. Use CLAUDE_OPUS_4_8 instead. */
   CLAUDE_OPUS_4_1 = "claude-opus-4-1-20250805",
 
   // Claude 4.0 Series (Legacy)
+  /** @deprecated Retired from the Claude API on June 15, 2026. Use CLAUDE_OPUS_4_8 instead. */
   CLAUDE_OPUS_4_0 = "claude-opus-4-20250514",
+  /** @deprecated Retired from the Claude API on June 15, 2026. Use CLAUDE_SONNET_4_6 instead. */
   CLAUDE_SONNET_4_0 = "claude-sonnet-4-20250514",
 
   // Claude 3.7 Series (Legacy)
@@ -555,73 +591,6 @@ export enum AnthropicModels {
   CLAUDE_3_OPUS = "claude-3-opus-20240229",
   /** @deprecated Retired from Anthropic API. Use CLAUDE_SONNET_4_6 instead. */
   CLAUDE_3_HAIKU = "claude-3-haiku-20240307",
-}
-
-/**
- * Supported Models for Mistral AI
- */
-export enum MistralModels {
-  // Mistral Large (Latest)
-  MISTRAL_LARGE_LATEST = "mistral-large-latest",
-  MISTRAL_LARGE_2512 = "mistral-large-2512",
-
-  // Mistral Medium
-  MISTRAL_MEDIUM_LATEST = "mistral-medium-latest",
-  MISTRAL_MEDIUM_2508 = "mistral-medium-2508",
-
-  // Mistral Small
-  MISTRAL_SMALL_LATEST = "mistral-small-latest",
-  MISTRAL_SMALL_2506 = "mistral-small-2506",
-
-  // Magistral (Reasoning)
-  MAGISTRAL_MEDIUM_LATEST = "magistral-medium-latest",
-  MAGISTRAL_SMALL_LATEST = "magistral-small-latest",
-
-  // Ministral (Edge Models)
-  MINISTRAL_14B_2512 = "ministral-14b-2512",
-  MINISTRAL_8B_2512 = "ministral-8b-2512",
-  MINISTRAL_3B_2512 = "ministral-3b-2512",
-
-  // Codestral (Code Generation)
-  CODESTRAL_LATEST = "codestral-latest",
-  CODESTRAL_2508 = "codestral-2508",
-  CODESTRAL_EMBED = "codestral-embed",
-
-  // Devstral (Software Development)
-  DEVSTRAL_MEDIUM_LATEST = "devstral-medium-latest",
-  DEVSTRAL_SMALL_LATEST = "devstral-small-latest",
-
-  // Pixtral (Multimodal/Vision)
-  PIXTRAL_LARGE = "pixtral-large",
-  PIXTRAL_12B = "pixtral-12b",
-
-  // Voxtral (Audio)
-  VOXTRAL_SMALL_LATEST = "voxtral-small-latest",
-  VOXTRAL_MINI_LATEST = "voxtral-mini-latest",
-
-  // Devstral 2 Series (December 2025)
-  DEVSTRAL_2 = "devstral-2512",
-  DEVSTRAL_SMALL_2 = "devstral-small-2512",
-
-  // Magistral Versioned (September 2025)
-  MAGISTRAL_MEDIUM_2509 = "magistral-medium-2509",
-  MAGISTRAL_SMALL_2509 = "magistral-small-2509",
-
-  // Voxtral Transcribe 2 (February 2026)
-  VOXTRAL_MINI_TRANSCRIBE_2 = "voxtral-mini-2602",
-
-  // OCR (December 2025)
-  MISTRAL_OCR_3 = "mistral-ocr-2512",
-  MISTRAL_OCR_LATEST = "mistral-ocr-latest",
-
-  // Specialized Models
-  MISTRAL_NEMO = "mistral-nemo",
-  MISTRAL_EMBED = "mistral-embed",
-  MISTRAL_MODERATION_LATEST = "mistral-moderation-latest",
-
-  // Mistral Small 4 Series (June 2026)
-  MISTRAL_SMALL_4 = "mistral-small-2603",
-  MISTRAL_SMALL_CREATIVE = "mistral-small-creative",
 }
 
 /**
@@ -1102,44 +1071,6 @@ export enum LlamaCppModels {
 }
 
 /**
- * xAI Grok models — accessible at api.x.ai/v1 (OpenAI-compatible).
- * @see https://docs.x.ai/docs/models
- */
-export enum XaiModels {
-  /** Latest Grok 3 — flagship; best for complex reasoning */
-  GROK_3 = "grok-3",
-  /** Grok 3 Mini — faster + cheaper variant of Grok 3 */
-  GROK_3_MINI = "grok-3-mini",
-  /** Grok 2 latest — previous flagship; still supported */
-  GROK_2_LATEST = "grok-2-latest",
-  /** Grok 2 Vision — multimodal (text + images) */
-  GROK_2_VISION_LATEST = "grok-2-vision-latest",
-  /** Grok beta — pre-release / experimental access */
-  GROK_BETA = "grok-beta",
-}
-
-/**
- * Groq-hosted models — Llama / Mistral / Gemma at sub-100ms inference.
- * @see https://console.groq.com/docs/models
- */
-export enum GroqModels {
-  /** Llama 3.3 70B Versatile — production default */
-  LLAMA_3_3_70B_VERSATILE = "llama-3.3-70b-versatile",
-  /** Llama 3.1 8B Instant — low-latency tier */
-  LLAMA_3_1_8B_INSTANT = "llama-3.1-8b-instant",
-  /** Gemma 2 9B IT — Google's lightweight instruct model */
-  GEMMA_2_9B_IT = "gemma2-9b-it",
-  /** Mixtral 8x7B 32K — Mistral's MoE model */
-  MIXTRAL_8X7B_32768 = "mixtral-8x7b-32768",
-  /** Llama Guard 3 8B — safety classifier */
-  LLAMA_GUARD_3_8B = "llama-guard-3-8b",
-  /** Llama 3.2 90B Vision Preview — multimodal */
-  LLAMA_3_2_90B_VISION_PREVIEW = "llama-3.2-90b-vision-preview",
-  /** Llama 3.2 11B Vision Preview — smaller multimodal */
-  LLAMA_3_2_11B_VISION_PREVIEW = "llama-3.2-11b-vision-preview",
-}
-
-/**
  * Cohere Command + Embed models.
  * @see https://docs.cohere.com/docs/models
  *
@@ -1165,97 +1096,6 @@ export enum CohereModels {
   RERANK_MULTILINGUAL_V3 = "rerank-multilingual-v3.0",
   /** Rerank v3 English */
   RERANK_ENGLISH_V3 = "rerank-english-v3.0",
-}
-
-/**
- * Together AI hosted models — open-model gateway.
- * @see https://docs.together.ai/docs/serverless-models
- */
-export enum TogetherAIModels {
-  /** Llama 3.3 70B Instruct Turbo — production default */
-  LLAMA_3_3_70B_INSTRUCT_TURBO = "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-  /** Llama 3.1 405B Instruct Turbo — flagship size */
-  LLAMA_3_1_405B_INSTRUCT_TURBO = "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo",
-  /** Llama 3.1 70B Instruct Turbo */
-  LLAMA_3_1_70B_INSTRUCT_TURBO = "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
-  /** Llama 3.1 8B Instruct Turbo — fastest */
-  LLAMA_3_1_8B_INSTRUCT_TURBO = "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-  /** Mixtral 8x22B Instruct */
-  MIXTRAL_8X22B_INSTRUCT = "mistralai/Mixtral-8x22B-Instruct-v0.1",
-  /** Mixtral 8x7B Instruct */
-  MIXTRAL_8X7B_INSTRUCT = "mistralai/Mixtral-8x7B-Instruct-v0.1",
-  /** Qwen 2.5 72B Instruct Turbo */
-  QWEN_2_5_72B_INSTRUCT_TURBO = "Qwen/Qwen2.5-72B-Instruct-Turbo",
-  /** Qwen 2.5 Coder 32B Instruct */
-  QWEN_2_5_CODER_32B = "Qwen/Qwen2.5-Coder-32B-Instruct",
-  /** DeepSeek R1 — reasoning */
-  DEEPSEEK_R1 = "deepseek-ai/DeepSeek-R1",
-  /** DeepSeek V3 */
-  DEEPSEEK_V3 = "deepseek-ai/DeepSeek-V3",
-  /** Google Gemma 2 27B IT */
-  GEMMA_2_27B_IT = "google/gemma-2-27b-it",
-  /** WizardLM 2 8x22B */
-  WIZARDLM_2_8X22B = "microsoft/WizardLM-2-8x22B",
-}
-
-/**
- * Fireworks AI hosted models — fast open-model serving.
- * @see https://fireworks.ai/models
- *
- * Note: the older Llama / Mixtral / Qwen 2.5 generation was rotated
- * out of Fireworks' serverless tier. Current shipping defaults below.
- */
-export enum FireworksModels {
-  /** DeepSeek V4 Pro — current general-purpose default */
-  DEEPSEEK_V4_PRO = "accounts/fireworks/models/deepseek-v4-pro",
-  /** GLM 5.1 — Zhipu flagship */
-  GLM_5P1 = "accounts/fireworks/models/glm-5p1",
-  /** GLM 5 — broader coverage */
-  GLM_5 = "accounts/fireworks/models/glm-5",
-  /** Kimi K2.6 — Moonshot flagship */
-  KIMI_K2P6 = "accounts/fireworks/models/kimi-k2p6",
-  /** Kimi K2.5 — preceding Kimi */
-  KIMI_K2P5 = "accounts/fireworks/models/kimi-k2p5",
-  /** GPT-OSS 120B — Apache-2.0 OpenAI weights */
-  GPT_OSS_120B = "accounts/fireworks/models/gpt-oss-120b",
-}
-
-/**
- * Perplexity Sonar models — built-in web grounding.
- * @see https://docs.perplexity.ai/guides/model-cards
- */
-export enum PerplexityModels {
-  /** Sonar — production default with web search */
-  SONAR = "sonar",
-  /** Sonar Pro — better reasoning + larger context */
-  SONAR_PRO = "sonar-pro",
-  /** Sonar Reasoning — explicit reasoning traces */
-  SONAR_REASONING = "sonar-reasoning",
-  /** Sonar Reasoning Pro — flagship reasoning + web */
-  SONAR_REASONING_PRO = "sonar-reasoning-pro",
-  /** Sonar Deep Research — long-form research with citations */
-  SONAR_DEEP_RESEARCH = "sonar-deep-research",
-}
-
-/**
- * Cloudflare Workers AI models — edge-served open models.
- * @see https://developers.cloudflare.com/workers-ai/models/
- */
-export enum CloudflareModels {
-  /** Llama 3.3 70B Instruct (FP8 fast) */
-  LLAMA_3_3_70B_FAST = "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-  /** Llama 3.1 70B Instruct */
-  LLAMA_3_1_70B_INSTRUCT = "@cf/meta/llama-3.1-70b-instruct",
-  /** Llama 3.1 8B Instruct fast */
-  LLAMA_3_1_8B_FAST = "@cf/meta/llama-3.1-8b-instruct-fast",
-  /** Llama 3.2 11B Vision Instruct */
-  LLAMA_3_2_11B_VISION = "@cf/meta/llama-3.2-11b-vision-instruct",
-  /** Mistral 7B Instruct v0.2 */
-  MISTRAL_7B_INSTRUCT_V0_2 = "@cf/mistral/mistral-7b-instruct-v0.2",
-  /** Qwen 1.5 14B Chat AWQ */
-  QWEN_1P5_14B_CHAT_AWQ = "@cf/qwen/qwen1.5-14b-chat-awq",
-  /** Gemma 2B IT */
-  GEMMA_2B_IT_LORA = "@cf/google/gemma-2b-it-lora",
 }
 
 /**
@@ -1380,3 +1220,223 @@ export enum ReplicateModels {
  * authentication failures during ongoing operations
  */
 export const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000; // 5 minutes
+
+// ── BEGIN GENERATED(models-enums): provider catalog (pnpm run codegen:catalog) ──
+export enum BasetenModels {
+  OPENAI_GPT_OSS_120B = "openai/gpt-oss-120b",
+  ZAI_ORG_GLM_4_7 = "zai-org/GLM-4.7",
+  MOONSHOTAI_KIMI_K2_6 = "moonshotai/Kimi-K2.6",
+  DEEPSEEK_AI_DEEPSEEK_V4_PRO = "deepseek-ai/DeepSeek-V4-Pro",
+  NVIDIA_NVIDIA_NEMOTRON_3_ULTRA_550B_A55B = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B",
+  ZAI_ORG_GLM_5_2 = "zai-org/GLM-5.2",
+  MOONSHOTAI_KIMI_K2_7_CODE = "moonshotai/Kimi-K2.7-Code",
+  DEEPSEEK_AI_DEEPSEEK_V4_FLASH_0731 = "deepseek-ai/DeepSeek-V4-Flash-0731",
+  THINKINGMACHINES_INKLING = "thinkingmachines/inkling",
+  ZAI_ORG_GLM_5_2_FAST = "zai-org/GLM-5.2-Fast",
+  MOONSHOTAI_KIMI_K3 = "moonshotai/Kimi-K3",
+  THINKINGMACHINES_INKLING_SMALL = "thinkingmachines/inkling-small",
+  DEEPSEEK_AI_DEEPSEEK_V4_PRO_0813 = "deepseek-ai/DeepSeek-V4-Pro-0813",
+  ZAI_ORG_GLM_5_3_FLASH = "zai-org/GLM-5.3-Flash",
+  ZAI_ORG_GLM_5_3 = "zai-org/GLM-5.3",
+  ZAI_ORG_GLM_5_3_FAST = "zai-org/GLM-5.3-Fast",
+}
+
+export enum CerebrasModels {
+  GPT_OSS_120B = "gpt-oss-120b",
+  GEMMA_4_31B = "gemma-4-31b",
+}
+
+export enum CloudflareModels {
+  LLAMA_3_3_70B_FAST = "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+  LLAMA_3_1_70B_INSTRUCT = "@cf/meta/llama-3.1-70b-instruct",
+  LLAMA_3_1_8B_FAST = "@cf/meta/llama-3.1-8b-instruct-fast",
+  LLAMA_3_2_11B_VISION = "@cf/meta/llama-3.2-11b-vision-instruct",
+  MISTRAL_7B_INSTRUCT_V0_2 = "@cf/mistral/mistral-7b-instruct-v0.2",
+  QWEN_1P5_14B_CHAT_AWQ = "@cf/qwen/qwen1.5-14b-chat-awq",
+  GEMMA_2B_IT_LORA = "@cf/google/gemma-2b-it-lora",
+}
+
+export enum FireworksModels {
+  KIMI_K2P6 = "accounts/fireworks/models/kimi-k2p6",
+  GPT_OSS_120B = "accounts/fireworks/models/gpt-oss-120b",
+  KIMI_K3 = "accounts/fireworks/models/kimi-k3",
+  QWEN3P8_MAX = "accounts/fireworks/models/qwen3p8-max",
+  GLM_5P3 = "accounts/fireworks/models/glm-5p3",
+  MINIMAX_M3 = "accounts/fireworks/models/minimax-m3",
+  DEEPSEEK_V4_FLASH_0731 = "accounts/fireworks/models/deepseek-v4-flash-0731",
+  DEEPSEEK_V4_PRO = "accounts/fireworks/models/deepseek-v4-pro",
+  GLM_5P1 = "accounts/fireworks/models/glm-5p1",
+  GLM_5 = "accounts/fireworks/models/glm-5",
+  KIMI_K2P5 = "accounts/fireworks/models/kimi-k2p5",
+  LLAMA_V3P2_90B_VISION_INSTRUCT = "accounts/fireworks/models/llama-v3p2-90b-vision-instruct",
+  LLAMA_V3P2_11B_VISION_INSTRUCT = "accounts/fireworks/models/llama-v3p2-11b-vision-instruct",
+  PHI_3_VISION_128K_INSTRUCT = "accounts/fireworks/models/phi-3-vision-128k-instruct",
+}
+
+export enum GmicloudModels {
+  MINIMAXAI_MINIMAX_M3 = "MiniMaxAI/MiniMax-M3",
+}
+
+export enum GroqModels {
+  GPT_OSS_120B = "openai/gpt-oss-120b",
+  GPT_OSS_20B = "openai/gpt-oss-20b",
+  QWEN_3_8_27B = "qwen/qwen3.8-27b",
+  QWEN_3_6_27B = "qwen/qwen3.6-27b",
+  COMPOUND = "groq/compound",
+  COMPOUND_MINI = "groq/compound-mini",
+  ALLAM_2_7B = "allam-2-7b",
+  LLAMA_3_3_70B_VERSATILE = "llama-3.3-70b-versatile",
+  LLAMA_3_1_8B_INSTANT = "llama-3.1-8b-instant",
+  GEMMA_2_9B_IT = "gemma2-9b-it",
+  MIXTRAL_8X7B_32768 = "mixtral-8x7b-32768",
+  LLAMA_GUARD_3_8B = "llama-guard-3-8b",
+  LLAMA_3_2_90B_VISION_PREVIEW = "llama-3.2-90b-vision-preview",
+  LLAMA_3_2_11B_VISION_PREVIEW = "llama-3.2-11b-vision-preview",
+}
+
+export enum InceptionLabsModels {
+  MERCURY_2 = "mercury-2",
+}
+
+export enum IoIntelligenceModels {
+  ZAI_ORG_GLM_5_3_FLASH = "zai-org/GLM-5.3-Flash",
+  ZAI_ORG_GLM_5_3 = "zai-org/GLM-5.3",
+  QWEN_QWEN3_8_27B = "Qwen/Qwen3.8-27B",
+  DEEPSEEK_AI_DEEPSEEK_V4_FLASH_0731 = "deepseek-ai/DeepSeek-V4-Flash-0731",
+  MOONSHOTAI_KIMI_K3 = "moonshotai/Kimi-K3",
+  XIAOMIMIMO_MIMO_V2_5 = "XiaomiMiMo/MiMo-V2.5",
+  ZAI_ORG_GLM_5_2 = "zai-org/GLM-5.2",
+  MOONSHOTAI_KIMI_K2_7_CODE = "moonshotai/Kimi-K2.7-Code",
+  QWEN_QWEN3_6_35B_A3B = "Qwen/Qwen3.6-35B-A3B",
+  QWEN_QWEN3_6_27B = "Qwen/Qwen3.6-27B",
+  MINIMAXAI_MINIMAX_M2_7 = "MiniMaxAI/MiniMax-M2.7",
+  DEEPSEEK_AI_DEEPSEEK_V4_FLASH = "deepseek-ai/DeepSeek-V4-Flash",
+  DEEPSEEK_AI_DEEPSEEK_V4_PRO = "deepseek-ai/DeepSeek-V4-Pro",
+  MOONSHOTAI_KIMI_K2_6 = "moonshotai/Kimi-K2.6",
+  ZAI_ORG_GLM_5_1 = "zai-org/GLM-5.1",
+  MINIMAXAI_MINIMAX_M2_5 = "MiniMaxAI/MiniMax-M2.5",
+  MOONSHOTAI_KIMI_K2_5 = "moonshotai/Kimi-K2.5",
+  ZAI_ORG_GLM_5 = "zai-org/GLM-5",
+  DEEPSEEK_AI_DEEPSEEK_V3_2 = "deepseek-ai/DeepSeek-V3.2",
+  MOONSHOTAI_KIMI_K2_THINKING = "moonshotai/Kimi-K2-Thinking",
+  ZAI_ORG_GLM_4_5_AIR = "zai-org/GLM-4.5-Air",
+  GOOGLE_GEMMA_4_26B_A4B_IT = "google/gemma-4-26b-a4b-it",
+  ZAI_ORG_GLM_4_7_FLASH = "zai-org/GLM-4.7-Flash",
+  ZAI_ORG_GLM_4_7 = "zai-org/GLM-4.7",
+  MOONSHOTAI_KIMI_K2_INSTRUCT_0905 = "moonshotai/Kimi-K2-Instruct-0905",
+  OPENAI_GPT_OSS_120B = "openai/gpt-oss-120b",
+  DEEPSEEK_AI_DEEPSEEK_R1_0528 = "deepseek-ai/DeepSeek-R1-0528",
+  ZAI_ORG_GLM_4_6 = "zai-org/GLM-4.6",
+  QWEN_QWEN3_NEXT_80B_A3B_INSTRUCT = "Qwen/Qwen3-Next-80B-A3B-Instruct",
+  INTEL_QWEN3_CODER_480B_A35B_INSTRUCT_INT4_MIXED_AR = "Intel/Qwen3-Coder-480B-A35B-Instruct-int4-mixed-ar",
+  META_LLAMA_LLAMA_4_MAVERICK_17B_128E_INSTRUCT_FP8 = "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+  MISTRALAI_MISTRAL_NEMO_INSTRUCT_2407 = "mistralai/Mistral-Nemo-Instruct-2407",
+  OPENAI_GPT_OSS_20B = "openai/gpt-oss-20b",
+  META_LLAMA_LLAMA_3_3_70B_INSTRUCT = "meta-llama/Llama-3.3-70B-Instruct",
+}
+
+export enum MancerModels {
+  MYTHOMAX = "mythomax",
+  DEEPSEEK_V4_FLASH = "deepseek-v4-flash",
+  DEEPSEEK_V4_FLASH_0731 = "deepseek-v4-flash-0731",
+  MYTHOLITE = "mytholite",
+  REMM_SLERP = "remm-slerp",
+  MAGNUM_72B_V4 = "magnum-72b-v4",
+  GLM_4_7 = "glm-4.7",
+  GPT_OSS_120B = "gpt-oss-120b",
+  WEAVER_ALPHA = "weaver-alpha",
+  DANS_PE_1_3_24B = "dans-pe-1.3-24b",
+}
+
+export enum MistralModels {
+  MISTRAL_LARGE_LATEST = "mistral-large-latest",
+  MISTRAL_LARGE_2512 = "mistral-large-2512",
+  MISTRAL_MEDIUM_LATEST = "mistral-medium-latest",
+  MISTRAL_MEDIUM_2508 = "mistral-medium-2508",
+  MISTRAL_SMALL_LATEST = "mistral-small-latest",
+  MISTRAL_SMALL_2506 = "mistral-small-2506",
+  MAGISTRAL_MEDIUM_LATEST = "magistral-medium-latest",
+  MAGISTRAL_SMALL_LATEST = "magistral-small-latest",
+  MINISTRAL_14B_2512 = "ministral-14b-2512",
+  MINISTRAL_8B_2512 = "ministral-8b-2512",
+  MINISTRAL_3B_2512 = "ministral-3b-2512",
+  CODESTRAL_LATEST = "codestral-latest",
+  CODESTRAL_2508 = "codestral-2508",
+  CODESTRAL_EMBED = "codestral-embed",
+  DEVSTRAL_MEDIUM_LATEST = "devstral-medium-latest",
+  DEVSTRAL_SMALL_LATEST = "devstral-small-latest",
+  PIXTRAL_LARGE = "pixtral-large",
+  PIXTRAL_12B = "pixtral-12b",
+  VOXTRAL_SMALL_LATEST = "voxtral-small-latest",
+  VOXTRAL_MINI_LATEST = "voxtral-mini-latest",
+  DEVSTRAL_2 = "devstral-2512",
+  DEVSTRAL_SMALL_2 = "devstral-small-2512",
+  MAGISTRAL_MEDIUM_2509 = "magistral-medium-2509",
+  MAGISTRAL_SMALL_2509 = "magistral-small-2509",
+  VOXTRAL_MINI_TRANSCRIBE_2 = "voxtral-mini-2602",
+  MISTRAL_OCR_3 = "mistral-ocr-2512",
+  MISTRAL_OCR_LATEST = "mistral-ocr-latest",
+  MISTRAL_NEMO = "mistral-nemo",
+  MISTRAL_EMBED = "mistral-embed",
+  MISTRAL_MODERATION_LATEST = "mistral-moderation-latest",
+  MISTRAL_SMALL_4 = "mistral-small-2603",
+  MISTRAL_SMALL_CREATIVE = "mistral-small-creative",
+}
+
+export enum PerplexityModels {
+  SONAR = "sonar",
+  SONAR_PRO = "sonar-pro",
+  SONAR_REASONING = "sonar-reasoning",
+  SONAR_REASONING_PRO = "sonar-reasoning-pro",
+  SONAR_DEEP_RESEARCH = "sonar-deep-research",
+}
+
+export enum SambanovaModels {
+  META_LLAMA_3_3_70B_INSTRUCT = "Meta-Llama-3.3-70B-Instruct",
+  GPT_OSS_120B = "gpt-oss-120b",
+  DEEPSEEK_V3_1 = "DeepSeek-V3.1",
+  DEEPSEEK_V3_2 = "DeepSeek-V3.2",
+  MINIMAX_M2_7 = "MiniMax-M2.7",
+  MINIMAX_M3 = "MiniMax-M3",
+  GEMMA_4_31B_IT = "gemma-4-31B-it",
+}
+
+export enum TogetherAIModels {
+  LLAMA_3_3_70B_INSTRUCT_TURBO = "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+  LLAMA_3_1_405B_INSTRUCT_TURBO = "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo",
+  LLAMA_3_1_70B_INSTRUCT_TURBO = "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+  LLAMA_3_1_8B_INSTRUCT_TURBO = "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+  MIXTRAL_8X22B_INSTRUCT = "mistralai/Mixtral-8x22B-Instruct-v0.1",
+  MIXTRAL_8X7B_INSTRUCT = "mistralai/Mixtral-8x7B-Instruct-v0.1",
+  QWEN_2_5_72B_INSTRUCT_TURBO = "Qwen/Qwen2.5-72B-Instruct-Turbo",
+  QWEN_2_5_CODER_32B = "Qwen/Qwen2.5-Coder-32B-Instruct",
+  DEEPSEEK_R1 = "deepseek-ai/DeepSeek-R1",
+  DEEPSEEK_V3 = "deepseek-ai/DeepSeek-V3",
+  GEMMA_2_27B_IT = "google/gemma-2-27b-it",
+  WIZARDLM_2_8X22B = "microsoft/WizardLM-2-8x22B",
+}
+
+export enum UpstageModels {
+  SOLAR_PRO4 = "solar-pro4",
+  SOLAR_PRO4_260806 = "solar-pro4-260806",
+  SOLAR_PRO3 = "solar-pro3",
+  SOLAR_PRO3_260323 = "solar-pro3-260323",
+  SOLAR_PRO2 = "solar-pro2",
+  SOLAR_PRO2_251215 = "solar-pro2-251215",
+  SOLAR_MINI = "solar-mini",
+  SOLAR_MINI_250422 = "solar-mini-250422",
+  SYN_PRO = "syn-pro",
+  SYN_PRO_251021 = "syn-pro-251021",
+}
+
+export enum XaiModels {
+  GROK_4_6 = "grok-4.6",
+  GROK_4_5 = "grok-4.5",
+  GROK_4_3 = "grok-4.3",
+  GROK_3 = "grok-3",
+  GROK_3_MINI = "grok-3-mini",
+  GROK_2_LATEST = "grok-2-latest",
+  GROK_2_VISION_LATEST = "grok-2-vision-latest",
+  GROK_BETA = "grok-beta",
+}
+// ── END GENERATED(models-enums) ──

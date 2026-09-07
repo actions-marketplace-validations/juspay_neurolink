@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,9 +8,14 @@
 
 > **NativeToolDeclarationsResult** = `object`
 
-Defined in: [types/providers.ts:1731](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1731)
+Defined in: [types/providers.ts:2061](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L2061)
 
 Return value of buildNativeToolDeclarations.
+
+`originalNameMap` lets callers translate a Google-safe (sanitized,
+suffix-disambiguated) tool name back to the original identifier the
+SDK consumer registered. Sanitized names are transport-only — they
+MUST be hidden from tool-call metadata exposed to consumers.
 
 ## Properties
 
@@ -18,12 +23,20 @@ Return value of buildNativeToolDeclarations.
 
 > **toolsConfig**: [`NativeToolsConfig`](NativeToolsConfig.md)
 
-Defined in: [types/providers.ts:1732](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1732)
+Defined in: [types/providers.ts:2062](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L2062)
 
 ---
 
 ### executeMap
 
-> **executeMap**: `Map`\<`string`, `Tool`\[`"execute"`\]\>
+> **executeMap**: `Map`\<`string`, [`Tool`](Tool.md)\[`"execute"`\]\>
 
-Defined in: [types/providers.ts:1733](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1733)
+Defined in: [types/providers.ts:2063](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L2063)
+
+---
+
+### originalNameMap
+
+> **originalNameMap**: `Map`\<`string`, `string`\>
+
+Defined in: [types/providers.ts:2064](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L2064)

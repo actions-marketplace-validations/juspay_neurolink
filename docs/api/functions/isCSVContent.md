@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **isCSVContent**(`content`): `content is CSVContent`
 
-Defined in: [types/multimodal.ts:528](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/multimodal.ts#L528)
+Defined in: [types/multimodal.ts:623](https://github.com/juspay/neurolink/blob/release/src/lib/types/multimodal.ts#L623)
 
 Type guard to check if content is CSVContent
 

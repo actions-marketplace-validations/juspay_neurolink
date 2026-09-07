@@ -67,6 +67,8 @@ import {
   log,
   logSection,
   type ColorName,
+  withCaseTimeout,
+  isCaseTimeout,
 } from "./helpers/harness.js";
 
 import { assertDistFresh } from "./helpers/distFreshness.js";
@@ -221,9 +223,15 @@ async function loadWorkflowAPIs() {
     runWorkflow: mod.runWorkflow,
     listWorkflows: mod.listWorkflows,
     registerWorkflow: mod.registerWorkflow,
-    clearRegistry: mod.clearWorkflowRegistry || mod.clearRegistry,
+    // mod.clearWorkflowRegistry always exists on the built entry, so the
+    // legacy `mod.clearRegistry` fallback it used to carry was unreachable —
+    // dropped rather than referencing a name the package no longer exports.
+    clearRegistry: mod.clearWorkflowRegistry,
     getWorkflow: mod.getWorkflow,
-    getRegistryStats: mod.getRegistryStats || (() => ({ totalWorkflows: 0 })),
+    // mod.getRegistryStats has no equivalent on the built entry; this stub
+    // is what every call already received once the (never-present)
+    // mod.getRegistryStats fallback resolved to it.
+    getRegistryStats: () => ({ totalWorkflows: 0 }),
     CONSENSUS_3_WORKFLOW: mod.CONSENSUS_3_WORKFLOW,
     CONSENSUS_3_FAST_WORKFLOW: mod.CONSENSUS_3_FAST_WORKFLOW,
     FAST_FALLBACK_WORKFLOW: mod.FAST_FALLBACK_WORKFLOW,
@@ -236,11 +244,11 @@ async function loadWorkflowAPIs() {
     createConsensus3WithPrompt: mod.createConsensus3WithPrompt,
     createMultiJudgeWorkflow: mod.createMultiJudgeWorkflow,
     createAdaptiveWorkflow: mod.createAdaptiveWorkflow,
-    executeEnsemble: mod.executeEnsemble,
-    scoreEnsemble: mod.scoreEnsemble,
-    conditionResponse: mod.conditionResponse,
+    // mod.executeEnsemble, mod.scoreEnsemble, mod.conditionResponse and
+    // mod.createWorkflowConfig are not exported by the built entry and were
+    // never read anywhere in this suite (grep confirms no caller past this
+    // function) — dropped rather than referencing names that don't exist.
     validateWorkflow: mod.validateWorkflow,
-    createWorkflowConfig: mod.createWorkflowConfig,
   };
 }
 
@@ -2005,7 +2013,7 @@ async function runAllTests(): Promise<void> {
   for (const test of tests) {
     try {
       const testStartTime = Date.now();
-      const result = await test.fn();
+      const result = await withCaseTimeout(test.name, test.fn);
       const duration = Date.now() - testStartTime;
       recordTest(
         test.name,
@@ -2016,6 +2024,19 @@ async function runAllTests(): Promise<void> {
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       recordTest(test.name, false, false, msg);
+
+      // A case bound is not an ordinary failure: Promise.race cannot cancel, so
+      // the abandoned case is still running. Continuing would run the loop's
+      // cleanup and inter-case delay underneath live work, and record every
+      // remaining case as "not run". Stop at the first one.
+      if (isCaseTimeout(error)) {
+        log(
+          `\n\u{1F6D1} ABORTING: "${test.name}" was abandoned by its timeout and is still executing. ` +
+            `Remaining cases are NOT run — this process no longer has clean state.`,
+          "red",
+        );
+        break;
+      }
     }
     await globalCleanup();
     await new Promise((r) => setTimeout(r, TEST_CONFIG.interTestDelay));

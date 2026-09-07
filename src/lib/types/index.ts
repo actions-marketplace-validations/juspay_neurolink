@@ -12,13 +12,25 @@ export * from "./artifact.js";
 export * from "./auth.js";
 export * from "./autoresearch.js";
 export * from "./circuitBreakerErrors.js";
+export * from "./claudeProxy.js";
 export * from "./cli.js";
 export * from "./client.js";
+export * from "./codex.js";
 export * from "./common.js";
 export * from "./config.js";
 export * from "./context.js";
 export * from "./conversation.js";
 export * from "./conversationMemoryInterface.js";
+export * from "./delegation.js";
+
+// Background commands (N4) — detached execution, banked output, monitors
+export * from "./backgroundCommand.js";
+
+// Read-only git toolset (N4.4) built on the background-command runner
+export * from "./gitTools.js";
+
+// Path containment guard shared by the sandboxed execution paths
+export * from "./pathSandbox.js";
 export * from "./domain.js";
 export * from "./errors.js";
 export * from "./evaluation.js";
@@ -33,18 +45,23 @@ export * from "./hitl.js";
 export * from "./isolatedAgent.js";
 export * from "./knowledge.js";
 export * from "./livekit.js";
+export * from "./loopEngine.js";
 export * from "./mcp.js";
 export * from "./mcpOutput.js";
 export * from "./memory.js";
 export * from "./middleware.js";
 export * from "./model.js";
 export * from "./multimodal.js";
+export * from "./nativeTools.js";
 export * from "./observability.js";
 export * from "./openaiCompatible.js";
 export * from "./ppt.js";
 export * from "./processor.js";
+export * from "./providerCatalog.js";
+export * from "./providerCatalog.generated.js";
 export * from "./providers.js";
 export * from "./proxy.js";
+export * from "./proxyClient.js";
 export * from "./rag.js";
 export * from "./scorer.js";
 export * from "./sdk.js";
@@ -52,9 +69,11 @@ export * from "./server.js";
 export * from "./service.js";
 export * from "./skills.js";
 export * from "./stream.js";
+export * from "./streaming.js";
 export * from "./subscription.js";
 export * from "./task.js";
 export * from "./taskClassification.js";
+export * from "./tasks.js";
 export * from "./toolDedup.js";
 export * from "./toolResolution.js";
 export * from "./toolRouting.js";
@@ -62,7 +81,6 @@ export * from "./tools.js";
 export * from "./vectorStoreChroma.js";
 export * from "./vectorStorePinecone.js";
 export * from "./voice.js";
-export * from "./universalProviderOptions.js";
 export * from "./utilities.js";
 export * from "./workflow.js";
 
@@ -87,6 +105,7 @@ export * from "./video.js";
 export * from "./avatar.js";
 export * from "./music.js";
 export * from "./replicate.js";
+export * from "./mediaCatalog.js";
 
 // Safe-fetch helper types (SSRF-hardened download)
 export * from "./safeFetch.js";
@@ -101,3 +120,7 @@ export * from "./requestRouter.js";
 export * from "./classifierRouter.js";
 // Multi-Agent orchestration types
 export * from "./agentNetwork.js";
+export * from "./localUsage.js";
+
+// resolveRequestKind() dispatch-decision types
+export * from "./dispatch.js";

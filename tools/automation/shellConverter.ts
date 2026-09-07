@@ -15,11 +15,22 @@
 import fs from "fs/promises";
 import path from "path";
 
+// Local shape for this tool's own bookkeeping — no equivalent lives in
+// src/lib/types/ (that barrel covers the SDK's public surface, not this
+// standalone conversion script's internal result tracking).
+type ShellConversionFailure = { script: string; error: string };
+
+type ShellConversionResults = {
+  converted: string[];
+  failed: ShellConversionFailure[];
+  total: number;
+};
+
 class ShellConverter {
   scriptsDir: string;
   outputDir: string;
   conversionMap: Record<string, any>;
-  results: Record<string, any>;
+  results: ShellConversionResults;
 
   constructor() {
     this.scriptsDir = "./scripts";
@@ -95,7 +106,9 @@ class ShellConverter {
       const files = await fs.readdir(this.scriptsDir);
       return files.filter((file) => file.endsWith(".sh"));
     } catch (error: any) {
-      throw new Error(`Failed to read scripts directory: ${error.message}`);
+      throw new Error(`Failed to read scripts directory: ${error.message}`, {
+        cause: error,
+      });
     }
   }
 
@@ -126,7 +139,9 @@ class ShellConverter {
       console.log(`✅ Created: ${jsPath}`);
       return jsPath;
     } catch (error: any) {
-      throw new Error(`Failed to convert ${shellFile}: ${error.message}`);
+      throw new Error(`Failed to convert ${shellFile}: ${error.message}`, {
+        cause: error,
+      });
     }
   }
 
@@ -297,7 +312,7 @@ const files = await glob.glob('${namePattern}', {
         const grepOptions = grepMatch[3] || "";
 
         // Convert common source commands
-        let sourceConversion = "";
+        let sourceConversion;
         if (sourceCommand.startsWith("cat ")) {
           const filePath = sourceCommand
             .substring(4)

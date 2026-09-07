@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **NeurolinkOptions** = `object`
 
-Defined in: [types/conversation.ts:404](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L404)
+Defined in: [types/conversation.ts:468](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L468)
 
 NeuroLink initialization options
 Configuration for creating NeuroLink instances with conversation memory
@@ -19,7 +19,7 @@ Configuration for creating NeuroLink instances with conversation memory
 
 > `optional` **conversationMemory?**: [`ConversationMemoryConfig`](ConversationMemoryConfig.md)
 
-Defined in: [types/conversation.ts:406](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L406)
+Defined in: [types/conversation.ts:470](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L470)
 
 Conversation memory configuration
 
@@ -29,7 +29,7 @@ Conversation memory configuration
 
 > `optional` **sessionId?**: `string`
 
-Defined in: [types/conversation.ts:409](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L409)
+Defined in: [types/conversation.ts:473](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L473)
 
 Session identifier for conversation context
 
@@ -39,6 +39,6 @@ Session identifier for conversation context
 
 > `optional` **observability?**: [`ObservabilityConfig`](ObservabilityConfig.md)
 
-Defined in: [types/conversation.ts:412](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L412)
+Defined in: [types/conversation.ts:476](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L476)
 
 Observability configuration

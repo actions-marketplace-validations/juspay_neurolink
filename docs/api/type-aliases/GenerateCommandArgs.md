@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -6,9 +6,9 @@
 
 # Type Alias: GenerateCommandArgs
 
-> **GenerateCommandArgs** = [`BaseCommandArgs`](BaseCommandArgs.md) & `object`
+> **GenerateCommandArgs** = [`BaseCommandArgs`](BaseCommandArgs.md) & [`CliToolRoutingFlags`](CliToolRoutingFlags.md) & [`CliClassifierRouterFlags`](CliClassifierRouterFlags.md) & `object`
 
-Defined in: [types/cli.ts:59](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L59)
+Defined in: [types/cli.ts:62](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L62)
 
 Generate command arguments
 

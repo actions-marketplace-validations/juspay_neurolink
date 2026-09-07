@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **AllToolsMap** = `object`
 
-Defined in: [types/tools.ts:468](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L468)
+Defined in: [types/tools.ts:519](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L519)
 
 Full directAgentTools map, with the opt-in bashTool appended.
 
@@ -16,46 +16,46 @@ Full directAgentTools map, with the opt-in bashTool appended.
 
 ### getCurrentTime
 
-> **getCurrentTime**: `Tool`
+> **getCurrentTime**: [`Tool`](Tool.md)
 
-Defined in: [types/tools.ts:469](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L469)
+Defined in: [types/tools.ts:520](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L520)
 
 ---
 
 ### calculateMath
 
-> **calculateMath**: `Tool`
+> **calculateMath**: [`Tool`](Tool.md)
 
-Defined in: [types/tools.ts:470](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L470)
+Defined in: [types/tools.ts:521](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L521)
 
 ---
 
 ### readFile
 
-> **readFile**: `Tool`
+> **readFile**: [`Tool`](Tool.md)
 
-Defined in: [types/tools.ts:471](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L471)
+Defined in: [types/tools.ts:522](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L522)
 
 ---
 
 ### listDirectory
 
-> **listDirectory**: `Tool`
+> **listDirectory**: [`Tool`](Tool.md)
 
-Defined in: [types/tools.ts:472](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L472)
+Defined in: [types/tools.ts:523](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L523)
 
 ---
 
 ### writeFile
 
-> **writeFile**: `Tool`
+> **writeFile**: [`Tool`](Tool.md)
 
-Defined in: [types/tools.ts:473](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L473)
+Defined in: [types/tools.ts:524](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L524)
 
 ---
 
 ### executeBashCommand?
 
-> `optional` **executeBashCommand?**: `Tool`
+> `optional` **executeBashCommand?**: [`Tool`](Tool.md)
 
-Defined in: [types/tools.ts:474](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L474)
+Defined in: [types/tools.ts:525](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L525)

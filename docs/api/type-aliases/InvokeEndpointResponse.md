@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **InvokeEndpointResponse** = `object`
 
-Defined in: [types/providers.ts:1192](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1192)
+Defined in: [types/providers.ts:1544](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1544)
 
 Response from SageMaker endpoint invocation
 
@@ -18,7 +18,7 @@ Response from SageMaker endpoint invocation
 
 > `optional` **Body?**: `Uint8Array`
 
-Defined in: [types/providers.ts:1194](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1194)
+Defined in: [types/providers.ts:1546](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1546)
 
 Response body
 
@@ -28,7 +28,7 @@ Response body
 
 > `optional` **ContentType?**: `string`
 
-Defined in: [types/providers.ts:1196](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1196)
+Defined in: [types/providers.ts:1548](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1548)
 
 Content type of the response
 
@@ -38,7 +38,7 @@ Content type of the response
 
 > `optional` **InvokedProductionVariant?**: `string`
 
-Defined in: [types/providers.ts:1198](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1198)
+Defined in: [types/providers.ts:1550](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1550)
 
 Invoked production variant
 
@@ -48,6 +48,6 @@ Invoked production variant
 
 > `optional` **CustomAttributes?**: `string`
 
-Defined in: [types/providers.ts:1200](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1200)
+Defined in: [types/providers.ts:1552](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1552)
 
 Custom attributes in the response

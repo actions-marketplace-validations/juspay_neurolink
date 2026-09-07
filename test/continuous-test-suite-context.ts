@@ -101,6 +101,8 @@ import {
   log,
   logSection,
   type ColorName,
+  withCaseTimeout,
+  isCaseTimeout,
 } from "./helpers/harness.js";
 
 import { assertDistFresh } from "./helpers/distFreshness.js";
@@ -1989,6 +1991,125 @@ async function testTokenEstimationAccuracy(
   }
 }
 
+// --- Test: FileDetector.loadFromURL retries transient network failures ---
+// Regression coverage for Plan 07 Task 7 (fileDetector's local withRetry
+// migrated onto core/infrastructure/retry.ts). Verifies retry BEHAVIOR is
+// unchanged post-migration: a transient connection failure is retried and
+// the eventual successful response is still returned.
+async function testFileDetectorLoadFromURLRetry(): Promise<boolean | null> {
+  const testName =
+    "FileDetector - loadFromURL retries transient failures then succeeds";
+  logTest(testName, "TESTING");
+
+  const http = await import("node:http");
+  const expectedBody = "retry-migration-fixture-ok";
+  const failuresBeforeSuccess = 2;
+  let requestCount = 0;
+
+  const server = http.createServer((req, res) => {
+    // Count GETs only. loadFromURL issues a HEAD pre-flight whose failure is
+    // swallowed and never charged against the retry budget, so counting every
+    // method would let the assertion below pass without any retry happening.
+    if (req.method !== "GET") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end();
+      return;
+    }
+    requestCount++;
+    if (requestCount <= failuresBeforeSuccess) {
+      // Reset the connection to trigger a retryable transient network error
+      // (ECONNRESET), the class of failure this retry path exists to survive.
+      req.socket.destroy();
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end(expectedBody);
+  });
+
+  let bindError: Error | undefined;
+  let port = 0;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", (err) => reject(err));
+      server.listen(0, "127.0.0.1", () => {
+        server.unref();
+        resolve();
+      });
+    });
+    const address = server.address();
+    port = typeof address === "object" && address ? address.port : 0;
+  } catch (err) {
+    bindError = err instanceof Error ? err : new Error(String(err));
+  }
+
+  if (bindError || !port) {
+    logTest(
+      testName,
+      "SKIP",
+      `cannot bind local HTTP server in this environment: ${bindError?.message ?? "no port assigned"}`,
+    );
+    try {
+      server.close();
+    } catch {
+      /* already closed */
+    }
+    return null;
+  }
+
+  try {
+    // loadFromURL is `private static` in the source, but that's a
+    // compile-time-only modifier — at runtime it's a plain static method on
+    // FileDetector, which is what this test exercises directly rather than
+    // routing through the full detectAndProcess() pipeline.
+    const { FileDetector } = await import("../dist/utils/fileDetector.js");
+    const detector = FileDetector as unknown as {
+      loadFromURL: (
+        url: string,
+        options?: {
+          maxRetries?: number;
+          retryDelay?: number;
+          timeout?: number;
+        },
+      ) => Promise<Buffer>;
+    };
+
+    const buffer = await detector.loadFromURL(
+      `http://127.0.0.1:${port}/fixture.txt`,
+      { maxRetries: failuresBeforeSuccess, retryDelay: 20, timeout: 5000 },
+    );
+
+    if (buffer.toString("utf-8") !== expectedBody) {
+      logTest(testName, "FAIL", "response body did not match fixture");
+      return false;
+    }
+    if (requestCount !== failuresBeforeSuccess + 1) {
+      logTest(
+        testName,
+        "FAIL",
+        `expected ${failuresBeforeSuccess + 1} total requests, saw ${requestCount}`,
+      );
+      return false;
+    }
+
+    logTest(
+      testName,
+      "PASS",
+      `retried ${failuresBeforeSuccess} transient failures then succeeded on attempt ${requestCount}`,
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logTest(testName, "FAIL", `loadFromURL did not recover: ${msg}`);
+    return false;
+  } finally {
+    try {
+      server.close();
+    } catch {
+      /* already closed */
+    }
+  }
+}
+
 // --- Test 18: Concurrent Conversations ---
 async function testConcurrentConversations(
   _sdk: NeuroLink,
@@ -2267,7 +2388,7 @@ async function callSdk(
 async function test_2_0_static_artifact_contains_fix(): Promise<void> {
   const testName = "2.0 — STATIC: shipped artifact contains the fix code";
   const fs = await import("node:fs/promises");
-  const path = "dist/lib/neurolink.js";
+  const path = "dist/neurolink.js";
   let src: string;
   try {
     src = await fs.readFile(path, "utf-8");
@@ -2730,7 +2851,7 @@ async function test_6_static_artifact_shape(): Promise<void> {
   // StreamHandler). Verify the literal carries finishReason / usage /
   // providerError so downstream telemetry has structured failure context.
   const fs = await import("node:fs/promises");
-  const path = "dist/lib/utils/noOutputSentinel.js";
+  const path = "dist/utils/noOutputSentinel.js";
   let src: string;
   try {
     src = await fs.readFile(path, "utf-8");
@@ -2821,7 +2942,7 @@ async function test_6_1_all_providers_wired(): Promise<void> {
   const fs = await import("node:fs/promises");
   for (const p of [...providers.map((n) => `providers/${n}`), ...otherSites]) {
     const testName = `6.1 — ${p} wired to NoOutput sentinel helper`;
-    const path = `dist/lib/${p}.js`;
+    const path = `dist/${p}.js`;
     let src: string;
     try {
       src = await fs.readFile(path, "utf-8");
@@ -2856,7 +2977,7 @@ async function test_6_1_all_providers_wired(): Promise<void> {
 async function test_6_2_helper_produces_full_sentinel(): Promise<void> {
   const testName =
     "6.2 — RUNTIME: buildNoOutputSentinel produces all 6 enriched keys";
-  const mod = await import("../dist/lib/utils/noOutputSentinel.js");
+  const mod = await import("../dist/utils/noOutputSentinel.js");
   if (typeof mod.buildNoOutputSentinel !== "function") {
     return recordIssue06(
       testName,
@@ -2915,7 +3036,7 @@ async function test_6_2_helper_produces_full_sentinel(): Promise<void> {
 async function test_6_3_helper_reads_partial_values(): Promise<void> {
   const testName =
     "6.3 — RUNTIME: buildNoOutputSentinel reads partial values from result-like";
-  const mod = await import("../dist/lib/utils/noOutputSentinel.js");
+  const mod = await import("../dist/utils/noOutputSentinel.js");
 
   // Case A: resolved result fields surface to the sentinel.
   const errA = new Error("Stream produced no output");
@@ -2977,7 +3098,7 @@ async function test_6_3_helper_reads_partial_values(): Promise<void> {
 async function test_6_4_helper_extracts_cause(): Promise<void> {
   const testName =
     "6.4 — RUNTIME: buildNoOutputSentinel surfaces error.cause into modelResponseRaw";
-  const mod = await import("../dist/lib/utils/noOutputSentinel.js");
+  const mod = await import("../dist/utils/noOutputSentinel.js");
 
   // Case A: error has a `cause` (AI SDK wraps the underlying provider error).
   const errA = new Error("AI_NoOutputGeneratedError") as Error & {
@@ -3181,7 +3302,7 @@ async function test_6_6_streamhandler_no_duplicate_sentinel(): Promise<void> {
   // Read the shipped artifact and verify the catch block returns after
   // yielding the sentinel (so the post-stream detection block doesn't run).
   const fs = await import("node:fs/promises");
-  const path = "dist/lib/core/modules/StreamHandler.js";
+  const path = "dist/core/modules/StreamHandler.js";
   let src: string;
   try {
     src = await fs.readFile(path, "utf-8");
@@ -3235,7 +3356,7 @@ async function test_6_7_pipeline_b_preserves_status_message(): Promise<void> {
   const testName =
     "6.7 — REGRESSION: Pipeline B applyNonErrorLangfuseLevel preserves enriched langfuse.status_message";
   const fs = await import("node:fs/promises");
-  const path = "dist/lib/services/server/ai/observability/instrumentation.js";
+  const path = "dist/services/server/ai/observability/instrumentation.js";
   let src: string;
   try {
     src = await fs.readFile(path, "utf-8");
@@ -3278,12 +3399,47 @@ async function test_6_8_fullstream_providers_gate_on_content_yielded(): Promise<
   const testName =
     "6.8 — REGRESSION: OpenRouter/LiteLLM gate post-stream NoOutput detect on contentYielded, not raw chunkCount";
   const fs = await import("node:fs/promises");
-  const targets = [
-    "dist/lib/providers/openRouter.js",
-    "dist/lib/providers/litellm.js",
-  ];
+
+  // OpenRouter and LiteLLM are directories in src (client.ts + index.ts),
+  // not flat files, so the compiled output is `.../openRouter/client.js`
+  // — never a flat `openRouter.js`. Both provider classes `extends
+  // OpenAIChatCompletionsProvider` and inherit its stream loop rather than
+  // reimplementing it, so `contentYielded` itself only appears in the
+  // shared base class's compiled output, not in either provider's own
+  // file. The base class also doesn't call a `detectPostStreamNoOutput`
+  // helper (that's a separate mechanism StreamHandler.ts uses for
+  // providers that don't extend this base) — it builds the sentinel
+  // inline via `buildNoOutputSentinel`/`stampNoOutputSpan`. So this test
+  // checks two things: the shared base class still gates on
+  // `contentYielded` (not raw chunk count) before emitting the sentinel,
+  // and each provider still inherits that gate rather than growing its
+  // own unguarded stream path.
+  const basePath = "dist/providers/openaiChatCompletionsBase.js";
+  const providerTargets: Record<string, string> = {
+    OpenRouter: "dist/providers/openRouter/client.js",
+    LiteLLM: "dist/providers/litellm/client.js",
+  };
   const issues: string[] = [];
-  for (const path of targets) {
+
+  let baseSrc = "";
+  try {
+    baseSrc = await fs.readFile(basePath, "utf-8");
+  } catch (err) {
+    issues.push(`cannot read ${basePath}: ${(err as Error).message}`);
+  }
+  if (baseSrc) {
+    const baseGatesOnContentYielded =
+      /contentYielded\s*===\s*0[\s\S]{0,400}?(buildNoOutputSentinel|stampNoOutputSpan)/.test(
+        baseSrc,
+      );
+    if (!baseGatesOnContentYielded) {
+      issues.push(
+        `${basePath}: 'contentYielded === 0 ... (buildNoOutputSentinel|stampNoOutputSpan)' pattern not found`,
+      );
+    }
+  }
+
+  for (const [name, path] of Object.entries(providerTargets)) {
     let src: string;
     try {
       src = await fs.readFile(path, "utf-8");
@@ -3291,24 +3447,18 @@ async function test_6_8_fullstream_providers_gate_on_content_yielded(): Promise<
       issues.push(`cannot read ${path}: ${(err as Error).message}`);
       continue;
     }
-    // Look for the production-fix gate. Both providers should reference
-    // `contentYielded` (the corrected counter). If either still uses
-    // `chunkCount` near `detectPostStreamNoOutput`, the gate is dead.
-    const usesContentYielded =
-      /contentYielded\s*===\s*0[\s\S]{0,400}?detectPostStreamNoOutput/.test(
-        src,
-      );
-    if (!usesContentYielded) {
+    if (!/extends\s+OpenAIChatCompletionsProvider/.test(src)) {
       issues.push(
-        `${path}: 'contentYielded === 0 ... detectPostStreamNoOutput' pattern not found`,
+        `${path}: ${name} no longer extends OpenAIChatCompletionsProvider — shared contentYielded gate is not inherited`,
       );
     }
   }
+
   if (issues.length === 0) {
     recordIssue06(
       testName,
       "PASS",
-      `both fullStream providers gate post-stream detect on contentYielded`,
+      `both fullStream providers inherit the shared base class's contentYielded-gated post-stream detect`,
     );
   } else {
     recordIssue06(testName, "FAIL", `bug-confirmed: ${issues.join("; ")}`);
@@ -3335,7 +3485,7 @@ async function test_6_9_all_wired_sites_stamp_otel_span(): Promise<void> {
   ];
   for (const t of targets) {
     const testName = `6.9 — ${t} stamps OTel span via stampNoOutputSpan`;
-    const path = `dist/lib/${t}.js`;
+    const path = `dist/${t}.js`;
     let src: string;
     try {
       src = await fs.readFile(path, "utf-8");
@@ -3367,7 +3517,7 @@ async function test_6_9_all_wired_sites_stamp_otel_span(): Promise<void> {
 async function test_6_10_status_message_handles_v6_usage(): Promise<void> {
   const testName =
     "6.10 — REGRESSION: buildNoOutputStatusMessage reads AI SDK v6 usage fields";
-  const mod = await import("../dist/lib/utils/noOutputSentinel.js");
+  const mod = await import("../dist/utils/noOutputSentinel.js");
   // v6 shape
   const v6 = mod.buildNoOutputStatusMessage("stop", {
     inputTokens: 42,
@@ -3403,7 +3553,7 @@ async function test_6_11_wrapper_excludes_sentinel_from_fallback_gate(): Promise
   const testName =
     "6.11 — REGRESSION: NeuroLink stream wrapper excludes NoOutputSentinel from fallback content gate";
   const fs = await import("node:fs/promises");
-  const path = "dist/lib/neurolink.js";
+  const path = "dist/neurolink.js";
   let src: string;
   try {
     src = await fs.readFile(path, "utf-8");
@@ -3444,7 +3594,7 @@ async function test_6_12_media_chunks_count_as_real_output(): Promise<void> {
   const testName =
     "6.12 — REGRESSION: wrapper counts audio/image chunks as real output (no spurious fallback)";
   const fs = await import("node:fs/promises");
-  const path = "dist/lib/neurolink.js";
+  const path = "dist/neurolink.js";
   let src: string;
   try {
     src = await fs.readFile(path, "utf-8");
@@ -3489,7 +3639,7 @@ async function test_6_12_media_chunks_count_as_real_output(): Promise<void> {
 async function test_6_13_helper_accepts_underlying_error(): Promise<void> {
   const testName =
     "6.13 — REGRESSION: buildNoOutputSentinel accepts underlyingError and prefers it for providerError/modelResponseRaw";
-  const mod = await import("../dist/lib/utils/noOutputSentinel.js");
+  const mod = await import("../dist/utils/noOutputSentinel.js");
   const aiSdkError = new Error(
     "No output generated. Check the stream for errors.",
   );
@@ -3553,11 +3703,11 @@ async function test_6_14_providers_capture_and_pass_error(): Promise<void> {
   // during the native migration. Assert the capture on the base for those, and
   // on their own file for self-streaming providers (openRouter, anthropic).
   const baseSrc = await fs
-    .readFile("dist/lib/providers/openaiChatCompletionsBase.js", "utf-8")
+    .readFile("dist/providers/openaiChatCompletionsBase.js", "utf-8")
     .catch(() => "");
   for (const t of targets) {
     const testName = `6.14 — ${t} captures onError and passes underlyingError to NoOutput helpers`;
-    const path = `dist/lib/${t}.js`;
+    const path = `dist/${t}.js`;
     let src: string;
     try {
       src = await fs.readFile(path, "utf-8");
@@ -3725,6 +3875,10 @@ async function runAllTests(): Promise<void> {
       name: "Concurrent Conversations",
       fn: () => testConcurrentConversations(sharedSdk),
     },
+    {
+      name: "FileDetector loadFromURL Retry",
+      fn: () => testFileDetectorLoadFromURLRetry(),
+    },
     // Observability Tests — DELETED. Coverage now lives in
     // continuous-test-suite-observability.ts; this duplicate was ~92 lines.
   ];
@@ -3732,7 +3886,7 @@ async function runAllTests(): Promise<void> {
   for (const test of tests) {
     logSection(test.name);
     try {
-      const result = await test.fn();
+      const result = await withCaseTimeout(test.name, test.fn);
       recordTest(
         test.name,
         result === true,
@@ -3742,6 +3896,19 @@ async function runAllTests(): Promise<void> {
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       recordTest(test.name, false, false, msg);
+
+      // A case bound is not an ordinary failure: Promise.race cannot cancel, so
+      // the abandoned case is still running. Continuing would run the loop's
+      // cleanup and inter-case delay underneath live work, and record every
+      // remaining case as "not run". Stop at the first one.
+      if (isCaseTimeout(error)) {
+        log(
+          `\n\u{1F6D1} ABORTING: "${test.name}" was abandoned by its timeout and is still executing. ` +
+            `Remaining cases are NOT run — this process no longer has clean state.`,
+          "red",
+        );
+        break;
+      }
     }
     await globalCleanup();
     await new Promise((r) => setTimeout(r, TEST_CONFIG.interTestDelay));

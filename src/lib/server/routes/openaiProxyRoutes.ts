@@ -25,6 +25,7 @@ import {
   handleTranslatedJsonRequest,
   handleTranslatedStreamRequest,
 } from "../../proxy/proxyTranslationEngine.js";
+import { buildClientAttribution } from "../../proxy/clientAttribution.js";
 import { logRequest } from "../../proxy/requestLogger.js";
 import { buildProxyTranslationPlan } from "../../proxy/routingPolicy.js";
 import type {
@@ -180,6 +181,7 @@ async function handleOpenAIToAnthropicBridge(args: {
       toolCount,
       account: "",
       accountType: "openai-bridge",
+      ...buildClientAttribution(ctx.headers),
       responseStatus,
       responseTimeMs: Date.now() - requestStartTime,
       ...extra,
@@ -467,6 +469,11 @@ export function createOpenAIProxyRoutes(
                 toolCount: Object.keys(parsed.tools).length,
                 clientApp: "openai-compat",
                 userAgent: ctx.headers["user-agent"] ?? "",
+                // Without this the tracer defaults to "anthropic" and every
+                // non-Anthropic model prices to $0 (the anthropic table has no
+                // _default), while a claude-* alias routed elsewhere prices at
+                // Claude rates. Both are wrong in opposite directions.
+                provider: targetProvider ?? "openai-compatible",
               },
               ctx.headers,
             );

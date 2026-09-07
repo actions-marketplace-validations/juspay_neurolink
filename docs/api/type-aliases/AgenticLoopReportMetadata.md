@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **AgenticLoopReportMetadata** = `object`
 
-Defined in: [types/conversation.ts:487](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L487)
+Defined in: [types/conversation.ts:566](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L566)
 
 Metadata for an individual agentic loop report
 A conversation session can have multiple reports tracked via this type
@@ -19,7 +19,7 @@ A conversation session can have multiple reports tracked via this type
 
 > **reportId**: `string`
 
-Defined in: [types/conversation.ts:489](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L489)
+Defined in: [types/conversation.ts:568](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L568)
 
 Unique identifier for this report
 
@@ -29,7 +29,7 @@ Unique identifier for this report
 
 > **reportType**: [`AgenticLoopReportType`](AgenticLoopReportType.md)
 
-Defined in: [types/conversation.ts:491](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L491)
+Defined in: [types/conversation.ts:570](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L570)
 
 Platform/category of the report
 
@@ -39,7 +39,7 @@ Platform/category of the report
 
 > **reportStatus**: [`AgenticLoopReportStatus`](AgenticLoopReportStatus.md)
 
-Defined in: [types/conversation.ts:493](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L493)
+Defined in: [types/conversation.ts:572](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L572)
 
 Current status of the report
 
@@ -49,7 +49,7 @@ Current status of the report
 
 > `optional` **auditPeriod?**: `object`
 
-Defined in: [types/conversation.ts:495](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L495)
+Defined in: [types/conversation.ts:574](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L574)
 
 Optional audit period date range for the report
 

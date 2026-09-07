@@ -1,5 +1,6 @@
 #!/usr/bin/env tsx
 import "dotenv/config";
+import { withCaseTimeout, isCaseTimeout } from "./helpers/harness.js";
 
 /**
  * Continuous Test Suite: Voice / Speech Integration
@@ -279,7 +280,7 @@ function isValidWAV(buffer: Buffer): boolean {
  * @param durationSeconds - Duration in seconds (default 1)
  * @returns WAV buffer ready for STT testing
  *
- * TODO(stt-fixture): A 440Hz sine tone is non-speech, so STT tests using
+ * TODO(#1318, stt-fixture): A 440Hz sine tone is non-speech, so STT tests using
  * this buffer can only assert response-shape, not transcription content.
  * The next pass should add a small spoken-WAV fixture (with attribution)
  * under test/fixtures/ and have STT cases assert
@@ -1771,12 +1772,12 @@ async function testStreamAudioPromise(sdk: NeuroLink): Promise<boolean | null> {
 async function testStreamTTSUseAiResponseFalse(
   sdk: NeuroLink,
 ): Promise<boolean | null> {
-  // T3: stream() + tts.useAiResponse:false → result.audio resolves to undefined
-  // (must not hang or throw — the resolver-on-finally guarantee from neurolink.ts).
-  logTest("T3: stream() + TTS Mode 1 audio Promise = undefined", "TESTING");
+  // T3: stream() synthesizes whenever tts.enabled is true; useAiResponse keeps
+  // its input-vs-response meaning for generate() and does not gate stream().
+  logTest("T3: stream() + TTS enabled audio Promise resolves", "TESTING");
   if (isCredentialsMissing()) {
     logTest(
-      "T3: stream() + TTS Mode 1 audio Promise = undefined",
+      "T3: stream() + TTS enabled audio Promise resolves",
       "SKIP",
       "creds missing",
     );
@@ -1803,16 +1804,17 @@ async function testStreamTTSUseAiResponseFalse(
         setTimeout(() => resolve("timeout"), 5000),
       ),
     ]);
-    const ok = audio === undefined;
+    const ok =
+      audio !== "timeout" && audio !== undefined && audio.buffer.length > 0;
     logTest(
-      "T3: stream() + TTS Mode 1 audio Promise = undefined",
+      "T3: stream() + TTS enabled audio Promise resolves",
       ok ? "PASS" : "FAIL",
-      `result=${audio === "timeout" ? "TIMEOUT" : typeof audio}`,
+      `result=${audio === "timeout" ? "TIMEOUT" : `bytes=${audio?.buffer.length ?? 0}`}`,
     );
     return ok;
   } catch (err) {
     logTest(
-      "T3: stream() + TTS Mode 1 audio Promise = undefined",
+      "T3: stream() + TTS enabled audio Promise resolves",
       "FAIL",
       err instanceof Error ? err.message : String(err),
     );
@@ -2141,7 +2143,7 @@ async function runAllTests(): Promise<void> {
       fn: () => testStreamAudioPromise(sharedSdk),
     },
     {
-      name: "T3: stream() + TTS Mode 1 audio Promise = undefined",
+      name: "T3: stream() + TTS enabled audio Promise resolves",
       fn: () => testStreamTTSUseAiResponseFalse(sharedSdk),
     },
     {
@@ -2198,12 +2200,25 @@ async function runAllTests(): Promise<void> {
   for (const test of tests) {
     logSection(test.name);
     try {
-      const result = await test.fn();
+      const result = await withCaseTimeout(test.name, test.fn);
       testResults.push({ name: test.name, result, error: null });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       logTest(test.name, "FAIL", `Uncaught: ${msg}`);
       testResults.push({ name: test.name, result: false, error: msg });
+
+      // A case bound is not an ordinary failure: Promise.race cannot cancel, so
+      // the abandoned case is still running. Continuing would run the loop's
+      // cleanup and inter-case delay underneath live work, and record every
+      // remaining case as "not run". Stop at the first one.
+      if (isCaseTimeout(error)) {
+        log(
+          `\n\u{1F6D1} ABORTING: "${test.name}" was abandoned by its timeout and is still executing. ` +
+            `Remaining cases are NOT run — this process no longer has clean state.`,
+          "red",
+        );
+        break;
+      }
     }
     await globalCleanup();
     await new Promise((r) => setTimeout(r, TEST_CONFIG.interTestDelay));

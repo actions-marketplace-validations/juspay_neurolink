@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **HeaderScrubberOptions** = `object`
 
-Defined in: [types/proxy.ts:397](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L397)
+Defined in: [types/proxy.ts:415](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L415)
 
 Options for the HeaderScrubber cloaking plugin.
 
@@ -18,6 +18,6 @@ Options for the HeaderScrubber cloaking plugin.
 
 > `optional` **extraHeaders?**: `string`[]
 
-Defined in: [types/proxy.ts:399](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L399)
+Defined in: [types/proxy.ts:417](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L417)
 
 Additional header names (lower-cased) to strip.

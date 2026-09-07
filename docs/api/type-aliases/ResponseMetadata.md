@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ResponseMetadata** = `object`
 
-Defined in: [types/stream.ts:780](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L780)
+Defined in: [types/stream.ts:976](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L976)
 
 Response metadata from stream
 
@@ -18,7 +18,7 @@ Response metadata from stream
 
 > `optional` **id?**: `string`
 
-Defined in: [types/stream.ts:781](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L781)
+Defined in: [types/stream.ts:977](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L977)
 
 ---
 
@@ -26,7 +26,7 @@ Defined in: [types/stream.ts:781](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **model?**: `string`
 
-Defined in: [types/stream.ts:782](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L782)
+Defined in: [types/stream.ts:978](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L978)
 
 ---
 
@@ -34,7 +34,7 @@ Defined in: [types/stream.ts:782](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **timestamp?**: `number` \| `Date`
 
-Defined in: [types/stream.ts:783](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L783)
+Defined in: [types/stream.ts:979](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L979)
 
 ---
 
@@ -42,4 +42,4 @@ Defined in: [types/stream.ts:783](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **finishReason?**: `string`
 
-Defined in: [types/stream.ts:784](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L784)
+Defined in: [types/stream.ts:980](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L980)

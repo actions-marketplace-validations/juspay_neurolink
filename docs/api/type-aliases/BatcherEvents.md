@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **BatcherEvents**\<`T`\> = `object`
 
-Defined in: [types/mcp.ts:2330](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2330)
+Defined in: [types/mcp.ts:2349](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2349)
 
 Batcher events
 
@@ -24,7 +24,7 @@ Batcher events
 
 > **batchStarted**: `object`
 
-Defined in: [types/mcp.ts:2331](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2331)
+Defined in: [types/mcp.ts:2350](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2350)
 
 #### batchId
 
@@ -40,7 +40,7 @@ Defined in: [types/mcp.ts:2331](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **batchCompleted**: `object`
 
-Defined in: [types/mcp.ts:2332](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2332)
+Defined in: [types/mcp.ts:2351](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2351)
 
 #### batchId
 
@@ -56,7 +56,7 @@ Defined in: [types/mcp.ts:2332](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **batchFailed**: `object`
 
-Defined in: [types/mcp.ts:2333](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2333)
+Defined in: [types/mcp.ts:2352](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2352)
 
 #### batchId
 
@@ -72,7 +72,7 @@ Defined in: [types/mcp.ts:2333](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **requestQueued**: `object`
 
-Defined in: [types/mcp.ts:2334](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2334)
+Defined in: [types/mcp.ts:2353](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2353)
 
 #### requestId
 
@@ -88,7 +88,7 @@ Defined in: [types/mcp.ts:2334](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **flushTriggered**: `object`
 
-Defined in: [types/mcp.ts:2335](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2335)
+Defined in: [types/mcp.ts:2354](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2354)
 
 #### reason
 

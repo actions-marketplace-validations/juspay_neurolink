@@ -15,7 +15,7 @@
  */
 
 import { type Span } from "@opentelemetry/api";
-import { NeuroLinkError } from "./errorHandling.js";
+import { NeuroLinkError, isAbortError } from "./errorHandling.js";
 import { logger } from "./logger.js";
 import { APICallError } from "./generationErrors.js";
 import { parseRetryAfterMs } from "./retryAfter.js";
@@ -60,12 +60,32 @@ export function duckTypedStatusCode(error: unknown): number | undefined {
   if (!error || typeof error !== "object") {
     return undefined;
   }
-  const err = error as { statusCode?: unknown; status?: unknown };
+  const err = error as {
+    statusCode?: unknown;
+    status?: unknown;
+    $metadata?: unknown;
+  };
   if (typeof err.statusCode === "number") {
     return err.statusCode;
   }
   if (typeof err.status === "number") {
     return err.status;
+  }
+  // AWS SDK v3 puts the HTTP status on `$metadata.httpStatusCode` and nowhere
+  // else, so without this branch no AWS error carries a status code as far as
+  // anything here is concerned. That is not only a retry question: this
+  // function also feeds `classifyProviderError` and the retry telemetry, so a
+  // Bedrock or SageMaker 429 was not recognisable as a rate limit, and a 5xx
+  // not recognisable as transient, by any status-based path. Name-based
+  // classification (ThrottlingException, AccessDeniedException) still worked,
+  // which is why this stayed hidden.
+  const metadata = err.$metadata;
+  if (typeof metadata === "object" && metadata !== null) {
+    const httpStatusCode = (metadata as { httpStatusCode?: unknown })
+      .httpStatusCode;
+    if (typeof httpStatusCode === "number") {
+      return httpStatusCode;
+    }
   }
   return undefined;
 }
@@ -110,7 +130,99 @@ export function extractRetryAfterMsFromError(
   return undefined;
 }
 
+/**
+ * An OpenAI-wire `insufficient_quota` error: the account is out of credit or
+ * has hit a spend cap.
+ *
+ * Exported and shared with the OpenAI error table so the retry predicate and
+ * the message a caller sees cannot disagree about what a permanent billing
+ * state looks like. The type is NOT a field on the error — OpenAI puts it
+ * inside the JSON response body, which the SDK keeps as a string — so any
+ * caller that needs it has to parse, and none should do so on its own.
+ *
+ * Deliberately keyed on the error TYPE, never on the word "quota". OpenAI and
+ * xAI send 429 + `type: "insufficient_quota"` for a permanent billing state,
+ * but other providers use "quota" for ordinary throttling — Google's 429 reads
+ * "Quota exceeded for quota metric ...", which IS retryable and must stay that
+ * way. Matching free text here would make Gemini throttling non-retryable and
+ * quietly remove a layer of resilience.
+ */
+export function isOpenAIQuotaExhaustedError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+  const err = error as { type?: unknown; responseBody?: unknown };
+  if (err.type === "insufficient_quota") {
+    return true;
+  }
+  // The SDK keeps the raw payload as a string; the type lives inside it.
+  if (typeof err.responseBody === "string") {
+    try {
+      const parsed: unknown = JSON.parse(err.responseBody);
+      const inner = (parsed as { error?: { type?: unknown } } | null)?.error;
+      return inner?.type === "insufficient_quota";
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
+ * True when `error` is an abort, or wraps one at any depth via `cause`.
+ *
+ * `isAbortError` alone is not enough here because it inspects one value, and
+ * by the time a provider failure reaches the retry wrapper it has usually been
+ * re-thrown inside a provider-specific error whose `name` no longer says
+ * "AbortError". The depth bound stops a self-referential or maliciously deep
+ * `cause` chain from hanging the classifier; nothing legitimate nests further.
+ */
+function isAbortLike(error: unknown, depth = 0): boolean {
+  if (depth > 8 || error === null || typeof error !== "object") {
+    return isAbortError(error);
+  }
+  if (isAbortError(error)) {
+    return true;
+  }
+  const { cause } = error as { cause?: unknown };
+  return cause === undefined || cause === error
+    ? false
+    : isAbortLike(cause, depth + 1);
+}
+
 export function isRetryableProviderError(error: unknown): boolean {
+  // Ahead of everything, for the same reason as the quota branch below but a
+  // worse failure: the caller has already walked away. Retrying a cancelled
+  // turn cannot succeed — the signal stays aborted, so every further attempt
+  // rejects without reaching the network — and it costs the full ladder,
+  // 2 retries at the NO_HINT_FLOOR_MS floor, before the turn ends.
+  //
+  // Measured on SageMaker before this guard: abort at 400ms, provider failed
+  // at 232ms with "Request aborted", then two more attempts 10s apart each
+  // failing in 1ms without a request leaving the process, and the turn finally
+  // threw at 21,996ms — 55x the time the cancellation should have taken, with
+  // `name` by then reading "Error" rather than "AbortError".
+  //
+  // The cause chain matters and is not defensive padding. Providers wrap
+  // transport failures in their own error class on the way up: SageMaker's
+  // handleSageMakerError() stamps an unrecognised error `statusCode: 500`
+  // while keeping the original as `cause`. That fabricated 500 is what made an
+  // abort look retryable here — the duck-typed status branch below reads it
+  // and returns true, outranking the wrapper's own `retryable: false`. Reading
+  // through `cause` finds the abort whatever wrapped it.
+  if (isAbortLike(error)) {
+    return false;
+  }
+
+  // Before every other branch, including the SDK's own flag: a 429 carrying
+  // `insufficient_quota` is marked retryable by the AI SDK because it only
+  // looks at the status code. Retrying it burns the full ladder — 3 attempts
+  // and ~20s of backoff, since no Retry-After accompanies these — on a state
+  // that cannot change until someone tops up the account.
+  if (isOpenAIQuotaExhaustedError(error)) {
+    return false;
+  }
+
   // Preferred path: use the AI SDK's own branded type check + isRetryable flag
   if (APICallError.isInstance(error)) {
     return error.isRetryable;

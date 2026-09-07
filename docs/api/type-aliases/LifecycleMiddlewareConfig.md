@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **LifecycleMiddlewareConfig** = `object`
 
-Defined in: [types/middleware.ts:333](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L333)
+Defined in: [types/middleware.ts:358](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L358)
 
 Configuration for the lifecycle middleware.
 Pass callbacks to observe generation/streaming lifecycle events.
@@ -19,7 +19,7 @@ Pass callbacks to observe generation/streaming lifecycle events.
 
 > `optional` **onFinish?**: [`OnFinishCallback`](OnFinishCallback.md)
 
-Defined in: [types/middleware.ts:334](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L334)
+Defined in: [types/middleware.ts:359](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L359)
 
 ---
 
@@ -27,7 +27,7 @@ Defined in: [types/middleware.ts:334](https://github.com/juspay/neurolink/blob/f
 
 > `optional` **onError?**: [`OnErrorCallback`](OnErrorCallback.md)
 
-Defined in: [types/middleware.ts:335](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L335)
+Defined in: [types/middleware.ts:360](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L360)
 
 ---
 
@@ -35,4 +35,21 @@ Defined in: [types/middleware.ts:335](https://github.com/juspay/neurolink/blob/f
 
 > `optional` **onChunk?**: [`OnChunkCallback`](OnChunkCallback.md)
 
-Defined in: [types/middleware.ts:336](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L336)
+Defined in: [types/middleware.ts:361](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L361)
+
+---
+
+### timeoutMs?
+
+> `optional` **timeoutMs?**: `number`
+
+Defined in: [types/middleware.ts:372](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L372)
+
+Per-callback deadline in milliseconds applied to every
+`onChunk` / `onFinish` / `onError` invocation. When a callback
+exceeds this it is logged and abandoned — generate()/stream()
+still resolves or rejects on schedule.
+
+Defaults to the `NEUROLINK_LIFECYCLE_TIMEOUT_MS` env var (also
+read by the CLI) and ultimately falls back to 5_000. Set `0`
+to make consumer callbacks effectively fire-and-forget.

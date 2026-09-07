@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **FallbackEntry** = `object`
 
-Defined in: [types/subscription.ts:1109](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L1109)
+Defined in: [types/subscription.ts:1192](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1192)
 
 A fallback chain entry
 
@@ -18,7 +18,7 @@ A fallback chain entry
 
 > **provider**: `string`
 
-Defined in: [types/subscription.ts:1110](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L1110)
+Defined in: [types/subscription.ts:1193](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1193)
 
 ---
 
@@ -26,4 +26,14 @@ Defined in: [types/subscription.ts:1110](https://github.com/juspay/neurolink/blo
 
 > **model**: `string`
 
-Defined in: [types/subscription.ts:1111](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L1111)
+Defined in: [types/subscription.ts:1194](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1194)
+
+---
+
+### reasoningEffort?
+
+> `optional` **reasoningEffort?**: [`CodexReasoningEffort`](CodexReasoningEffort.md)
+
+Defined in: [types/subscription.ts:1196](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1196)
+
+Explicit Codex fallback effort. Omit to use the upstream default.

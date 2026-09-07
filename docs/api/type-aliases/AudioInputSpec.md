@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **AudioInputSpec** = `object`
 
-Defined in: [types/stream.ts:139](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L139)
+Defined in: [types/stream.ts:151](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L151)
 
 ## Properties
 
@@ -16,7 +16,7 @@ Defined in: [types/stream.ts:139](https://github.com/juspay/neurolink/blob/ff50c
 
 > **frames**: `AsyncIterable`\<`Buffer`\>
 
-Defined in: [types/stream.ts:140](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L140)
+Defined in: [types/stream.ts:152](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L152)
 
 ---
 
@@ -24,7 +24,7 @@ Defined in: [types/stream.ts:140](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **sampleRateHz?**: `number`
 
-Defined in: [types/stream.ts:141](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L141)
+Defined in: [types/stream.ts:153](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L153)
 
 ---
 
@@ -32,7 +32,7 @@ Defined in: [types/stream.ts:141](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **encoding?**: [`PCMEncoding`](PCMEncoding.md)
 
-Defined in: [types/stream.ts:142](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L142)
+Defined in: [types/stream.ts:154](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L154)
 
 ---
 
@@ -40,4 +40,4 @@ Defined in: [types/stream.ts:142](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **channels?**: `1`
 
-Defined in: [types/stream.ts:143](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L143)
+Defined in: [types/stream.ts:155](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L155)

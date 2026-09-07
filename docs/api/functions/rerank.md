@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **rerank**(`results`, `query`, `model`, `options?`): `Promise`\<[`RerankResult`](../type-aliases/RerankResult.md)[]\>
 
-Defined in: [rag/reranker/reranker.ts:41](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/rag/reranker/reranker.ts#L41)
+Defined in: [rag/reranker/reranker.ts:41](https://github.com/juspay/neurolink/blob/release/src/lib/rag/reranker/reranker.ts#L41)
 
 Rerank vector search results using multi-factor scoring
 

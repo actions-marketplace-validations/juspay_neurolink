@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **RouteResult** = `object`
 
-Defined in: [types/proxy.ts:441](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L441)
+Defined in: [types/proxy.ts:459](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L459)
 
 ## Properties
 
@@ -16,7 +16,7 @@ Defined in: [types/proxy.ts:441](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **provider**: `string` \| `null`
 
-Defined in: [types/proxy.ts:442](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L442)
+Defined in: [types/proxy.ts:460](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L460)
 
 ---
 
@@ -24,4 +24,4 @@ Defined in: [types/proxy.ts:442](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **model**: `string`
 
-Defined in: [types/proxy.ts:443](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L443)
+Defined in: [types/proxy.ts:461](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L461)

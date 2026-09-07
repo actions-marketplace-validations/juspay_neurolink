@@ -10,14 +10,73 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
+import {
+  getCatalogJsonEntries,
+  catalogEnvVar,
+} from "../../src/lib/providers/catalog/loader.js";
+import { CATALOG_PROVIDER_IDS } from "../../src/lib/providers/catalog/index.generated.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const ROOT_DIR = join(__dirname, "../..");
 
+// Every provider registered through the JSON catalog (providerRegistry.ts's
+// OPENAI_COMPAT_CATALOG loop, backed by ConfiguredOpenAICompatProvider) —
+// no external SDK module to check, and its API-key env var is defined by
+// its own JSON entry rather than hand-listed here.
+const CATALOG_PROVIDER_ID_SET = new Set<string>(CATALOG_PROVIDER_IDS);
+
+// Local to this validation script: distinct from src/lib/types' provider
+// health-check types (e.g. ProviderHealthStatusOptions), which use a
+// different field set for a different subsystem. Reusing those here would
+// mean renaming every field this script reads/writes below (isHealthy vs.
+// functional, configurationIssues vs. error, etc.) — a behavioral rewrite,
+// not a type fix.
+type ProviderValidationDetails = {
+  hasApiKey?: boolean;
+  moduleInstalled?: boolean;
+};
+
+type ProviderValidationPerformance = {
+  responseTime?: number;
+  status?: string;
+};
+
+type ProviderValidationResult = {
+  provider: string;
+  status: string;
+  available: boolean;
+  configured: boolean;
+  functional: boolean;
+  performance: ProviderValidationPerformance;
+  error: string | null;
+  details: ProviderValidationDetails;
+};
+
+type ProviderValidationSummary = {
+  total: number;
+  available: number;
+  configured: number;
+  functional: number;
+  errors: Array<{ provider: string; error: string | null }>;
+};
+
+type ProviderValidationHealth = {
+  score: number;
+  recommendations: string[];
+  status: string;
+};
+
+type ProviderValidationResults = {
+  timestamp: string;
+  providers: Record<string, ProviderValidationResult>;
+  summary: ProviderValidationSummary;
+  health?: ProviderValidationHealth;
+};
+
 class ProviderValidator {
-  providers: any[];
-  results: Record<string, any>;
+  providers: string[];
+  results: ProviderValidationResults;
   envFile: string;
   configFile: string;
 
@@ -30,8 +89,10 @@ class ProviderValidator {
       "azure",
       "huggingface",
       "ollama",
-      "mistral",
-      "groq",
+      // The 9 JSON-catalog providers (cerebras, cloudflare, fireworks, groq,
+      // mistral, perplexity, sambanova, together-ai, xai) — derived so a new
+      // catalog entry is picked up here automatically.
+      ...CATALOG_PROVIDER_IDS,
     ];
 
     this.results = {
@@ -152,8 +213,8 @@ class ProviderValidator {
   /**
    * Validate individual provider
    */
-  async validateProvider(provider: string) {
-    const result = {
+  async validateProvider(provider: string): Promise<ProviderValidationResult> {
+    const result: ProviderValidationResult = {
       provider,
       status: "unknown",
       available: false,
@@ -217,8 +278,15 @@ class ProviderValidator {
       azure: "AZURE_OPENAI_API_KEY",
       huggingface: "HUGGINGFACE_API_KEY",
       ollama: "OLLAMA_HOST",
-      mistral: "MISTRAL_API_KEY",
-      groq: "GROQ_API_KEY",
+      // Catalog providers' env var names come from their own JSON entry
+      // (respects per-entry envOverrides, e.g. together-ai's
+      // TOGETHER_API_KEY) instead of being hand-guessed here.
+      ...Object.fromEntries(
+        getCatalogJsonEntries().map((entry) => [
+          entry.id,
+          catalogEnvVar(entry, "apiKey"),
+        ]),
+      ),
     };
 
     const envKey = keyMappings[provider];
@@ -230,18 +298,31 @@ class ProviderValidator {
    */
   async checkModuleAvailability(provider: string) {
     const moduleMap: Record<string, string> = {
-      openai: "@ai-sdk/openai",
-      anthropic: "@ai-sdk/anthropic",
-      google: "@ai-sdk/google",
+      // Native SDKs — the @ai-sdk/* wrappers these used to name are gone.
+      anthropic: "@anthropic-ai/sdk",
+      google: "@google/genai",
       "aws-bedrock": "@aws-sdk/client-bedrock",
-      azure: "@ai-sdk/openai",
-      huggingface: "@huggingface/inference",
       ollama: "ollama",
-      mistral: "@ai-sdk/mistral",
-      groq: "groq-sdk",
     };
 
+    // openai and azure speak the chat-completions wire through the in-repo
+    // OpenAIChatCompletionsProvider, exactly like the catalog providers below.
+    // They named @ai-sdk/openai until that package was removed, at which point
+    // resolving it reported both as unavailable.
+    const NATIVE_WIRE_PROVIDERS = new Set(["openai", "azure"]);
+
     try {
+      // All 9 JSON-catalog providers (mistral and groq included — they no
+      // longer use @ai-sdk/mistral / groq-sdk, see providerRegistry.ts's
+      // OPENAI_COMPAT_CATALOG loop) share the in-repo
+      // ConfiguredOpenAICompatProvider wire client, so there is no external
+      // SDK module to resolve.
+      if (CATALOG_PROVIDER_ID_SET.has(provider)) {
+        return true;
+      }
+      if (NATIVE_WIRE_PROVIDERS.has(provider)) {
+        return true;
+      }
       const moduleName = moduleMap[provider];
       if (!moduleName) {
         return false;
@@ -294,6 +375,17 @@ class ProviderValidator {
     // For now, we'll do basic connectivity tests
     // In a real implementation, this would make actual API calls
 
+    // Catalog providers all follow the same "<id>_connectivity" naming
+    // (hyphens normalized to underscores, matching the aws-bedrock ->
+    // aws_bedrock_connectivity convention below) — derived rather than
+    // hand-listed so a new catalog entry needs no case added here.
+    if (CATALOG_PROVIDER_ID_SET.has(provider)) {
+      return {
+        test: `${provider.replace(/-/g, "_")}_connectivity`,
+        status: "simulated",
+      };
+    }
+
     switch (provider) {
       case "openai":
         return { test: "openai_connectivity", status: "simulated" };
@@ -309,10 +401,6 @@ class ProviderValidator {
         return { test: "huggingface_connectivity", status: "simulated" };
       case "ollama":
         return { test: "ollama_connectivity", status: "simulated" };
-      case "mistral":
-        return { test: "mistral_connectivity", status: "simulated" };
-      case "groq":
-        return { test: "groq_connectivity", status: "simulated" };
       default:
         throw new Error(`Unknown provider: ${provider}`);
     }

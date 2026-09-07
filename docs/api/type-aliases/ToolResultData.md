@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ToolResultData** = `object`
 
-Defined in: [types/conversation.ts:215](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L215)
+Defined in: [types/conversation.ts:250](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L250)
 
 Structured metadata for tool_result messages.
 
@@ -18,7 +18,7 @@ Structured metadata for tool_result messages.
 
 > `optional` **success?**: `boolean`
 
-Defined in: [types/conversation.ts:217](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L217)
+Defined in: [types/conversation.ts:252](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L252)
 
 Whether the tool execution succeeded
 
@@ -28,7 +28,7 @@ Whether the tool execution succeeded
 
 > `optional` **expression?**: `string`
 
-Defined in: [types/conversation.ts:219](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L219)
+Defined in: [types/conversation.ts:254](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L254)
 
 Expression that was evaluated (for calculation tools)
 
@@ -38,7 +38,7 @@ Expression that was evaluated (for calculation tools)
 
 > `optional` **result?**: `unknown`
 
-Defined in: [types/conversation.ts:225](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L225)
+Defined in: [types/conversation.ts:260](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L260)
 
 The tool execution result.
 
@@ -53,7 +53,7 @@ populated from content for backward compatibility and will be removed in a futur
 
 > `optional` **type?**: `string`
 
-Defined in: [types/conversation.ts:227](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L227)
+Defined in: [types/conversation.ts:262](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L262)
 
 Result type hint
 
@@ -63,6 +63,6 @@ Result type hint
 
 > `optional` **error?**: `string`
 
-Defined in: [types/conversation.ts:229](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L229)
+Defined in: [types/conversation.ts:264](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L264)
 
 Error message if execution failed

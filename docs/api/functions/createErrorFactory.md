@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **createErrorFactory**\<`TCodes`\>(`feature`, `codes`): `object`
 
-Defined in: [core/infrastructure/baseError.ts:30](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/core/infrastructure/baseError.ts#L30)
+Defined in: [core/infrastructure/baseError.ts:30](https://github.com/juspay/neurolink/blob/release/src/lib/core/infrastructure/baseError.ts#L30)
 
 ## Type Parameters
 

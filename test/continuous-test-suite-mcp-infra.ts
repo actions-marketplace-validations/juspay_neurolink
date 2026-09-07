@@ -67,11 +67,14 @@ import {
 import { defineSuite, logSection } from "./helpers/harness.js";
 
 import { assertDistFresh } from "./helpers/distFreshness.js";
+import type { McpCacheConfig } from "../src/lib/types/index.js";
 
 // Fail loudly rather than silently testing a stale build (see distFreshness.ts).
 assertDistFresh();
 
-const { recordTest, runSuite } = defineSuite("MCP Infrastructure");
+const { recordTest, runSuite } = defineSuite("MCP Infrastructure", {
+  offline: true,
+});
 
 /**
  * Dispose a NeuroLink instance from a `finally` block without masking the
@@ -90,6 +93,123 @@ async function disposeQuietly(
   } catch {
     // Swallow dispose errors so the real test failure (recorded already
     // in the surrounding catch) remains the salient diagnostic.
+  }
+}
+
+/**
+ * The retry loop must not be able to overshoot the caller's ceiling.
+ *
+ * `timeout` bounds ONE attempt; the loop then runs `maxRetries + 1` of them,
+ * so a tool that reliably hangs used to burn the product with nothing
+ * bounding the total. The surfaced error reported the per-attempt bound
+ * beside the whole-execution elapsed time, which reads as a timeout that was
+ * never enforced. Both halves are asserted here: the ceiling holds, and the
+ * error says which bound it is talking about.
+ */
+async function testToolTotalTimeoutBudget(): Promise<void> {
+  logSection("Tool total-timeout budget");
+  let sdk: InstanceType<typeof NeuroLink> | null = null;
+  try {
+    sdk = new NeuroLink();
+    sdk.registerTool("hangs_forever", {
+      name: "hangs_forever",
+      description: "Never settles, so every attempt hits its timeout",
+      inputSchema: { type: "object", properties: {} },
+      execute: () => new Promise(() => {}),
+    });
+
+    // 4 attempts x 200ms would be 800ms; the budget says stop at 450ms.
+    const start = Date.now();
+    let thrown: unknown;
+    try {
+      await sdk.executeTool(
+        "hangs_forever",
+        {},
+        {
+          timeout: 200,
+          maxRetries: 3,
+          retryDelayMs: 10,
+          totalTimeoutMs: 450,
+          bypassBatcher: true,
+        },
+      );
+    } catch (error) {
+      thrown = error;
+    }
+    const elapsed = Date.now() - start;
+
+    recordTest("total budget rejects the call", thrown !== undefined);
+    // Generous upper bound: the point is that it is nowhere near the 800ms
+    // the unbounded loop would have spent, not that the timer is precise.
+    recordTest(
+      "total budget caps elapsed time below the attempt product",
+      elapsed < 700,
+    );
+
+    const context = (
+      thrown as { context?: Record<string, unknown> } | undefined
+    )?.context;
+    recordTest(
+      "timeout error reports the attempt bound",
+      context?.attemptTimeoutMs === 200,
+    );
+    recordTest(
+      "timeout error reports the total bound",
+      context?.totalTimeoutMs === 450,
+    );
+    recordTest(
+      "timeout error reports which attempt it was",
+      typeof context?.attempt === "number" &&
+        typeof context?.maxAttempts === "number",
+    );
+    // maxRetries: 3 means four attempts. Assert the reported metadata rather
+    // than inferring the retry count from the clock, which cannot distinguish
+    // "stopped at the ceiling" from "failed early for another reason".
+    recordTest(
+      "reported attempt count matches the configured retry budget",
+      context?.maxAttempts === 4 &&
+        typeof context?.attempt === "number" &&
+        context.attempt >= 1 &&
+        context.attempt <= 4,
+    );
+
+    // Default path: omitting totalTimeoutMs must not change anything, so the
+    // ceiling falls back to timeout x attempts and all three attempts run.
+    const defaultStart = Date.now();
+    let defaultThrown: unknown;
+    try {
+      await sdk.executeTool(
+        "hangs_forever",
+        {},
+        { timeout: 100, maxRetries: 2, retryDelayMs: 10, bypassBatcher: true },
+      );
+    } catch (error) {
+      defaultThrown = error;
+    }
+    const defaultElapsed = Date.now() - defaultStart;
+    recordTest(
+      "default budget still rejects the call",
+      defaultThrown !== undefined,
+    );
+    // timeout 100 x 3 attempts + retryDelayMs 10 x 2 waits = 320ms. The
+    // default ceiling must reproduce BOTH terms. Computing it as
+    // timeout x attempts alone lands at 300 and clamps the third attempt
+    // below its configured 100ms — the defect this asserts against.
+    recordTest(
+      "default budget reproduces the full envelope including retry delays",
+      defaultElapsed >= 300,
+    );
+    const defaultContext = (
+      defaultThrown as { context?: Record<string, unknown> } | undefined
+    )?.context;
+    recordTest(
+      "default ceiling is derived from attempts AND delays",
+      defaultContext?.totalTimeoutMs === 320,
+    );
+  } catch (error) {
+    recordTest("Tool total-timeout budget", false);
+  } finally {
+    await disposeQuietly(sdk);
   }
 }
 
@@ -135,7 +255,12 @@ async function testToolCache(): Promise<void> {
   try {
     recordTest("ToolCache class exported", ToolCache !== undefined);
 
-    const cache = new ToolCache({ ttl: 60000, maxSize: 100 });
+    const cacheConfig: McpCacheConfig = {
+      ttl: 60000,
+      maxSize: 100,
+      strategy: "lru",
+    };
+    const cache = new ToolCache(cacheConfig);
     recordTest("ToolCache instantiation", cache !== undefined);
 
     const key = "test-tool-result";
@@ -150,7 +275,14 @@ async function testToolCache(): Promise<void> {
     cache.invalidate("test-tool-result");
     recordTest("ToolCache.invalidate()", cache.get(key) === undefined);
 
-    recordTest("ToolCache.isExpired()", typeof cache.isExpired === "function");
+    // ToolCache.isExpired() is a private implementation method; there is no
+    // public surface for this check, so the cast intentionally goes through
+    // `unknown` to read it without altering the assertion's runtime meaning.
+    recordTest(
+      "ToolCache.isExpired()",
+      typeof (cache as unknown as { isExpired?: unknown }).isExpired ===
+        "function",
+    );
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     recordTest("ToolCache tests", false, false, msg);
@@ -252,6 +384,49 @@ async function testCoreMCPExports(): Promise<void> {
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     recordTest("Core MCP exports", false, false, msg);
+  }
+}
+
+async function testExternalServerManagerSignalListeners(): Promise<void> {
+  logSection("ExternalServerManager Signal Listener Tests");
+
+  try {
+    // Regression: each manager used to register its own SIGINT/SIGTERM/beforeExit
+    // handlers and never remove them, so a run that constructed one manager per
+    // delegated worker crossed Node's 10-listener default and warned
+    // MaxListenersExceeded. The handlers are shared now: however many managers
+    // exist, the process carries at most ONE cleanup listener per signal.
+    const before = {
+      sigint: process.listenerCount("SIGINT"),
+      sigterm: process.listenerCount("SIGTERM"),
+      beforeExit: process.listenerCount("beforeExit"),
+    };
+    const managers = Array.from(
+      { length: 14 },
+      () => new ExternalServerManager(),
+    );
+    recordTest(
+      "14 managers add at most one SIGINT listener",
+      process.listenerCount("SIGINT") <= before.sigint + 1,
+    );
+    recordTest(
+      "14 managers add at most one SIGTERM listener",
+      process.listenerCount("SIGTERM") <= before.sigterm + 1,
+    );
+    recordTest(
+      "14 managers add at most one beforeExit listener",
+      process.listenerCount("beforeExit") <= before.beforeExit + 1,
+    );
+    await Promise.all(managers.map((manager) => manager.shutdown()));
+    const late = new ExternalServerManager();
+    recordTest(
+      "a manager constructed after shutdowns still adds no extra listener",
+      process.listenerCount("SIGINT") <= before.sigint + 1,
+    );
+    await late.shutdown();
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    recordTest("ExternalServerManager signal listeners", false, false, msg);
   }
 }
 
@@ -1282,6 +1457,7 @@ await runSuite(async () => {
   await testToolCache();
   await testRequestBatcher();
   await testCoreMCPExports();
+  await testExternalServerManagerSignalListeners();
 
   // Part 1b — Extended MCP modules
   await testCircuitBreakerBlocking();
@@ -1302,4 +1478,7 @@ await runSuite(async () => {
   await testWiredMiddleware();
   await testWiredPublicAPIs();
   await testWiredDispose();
+
+  // Tool execution budget
+  await testToolTotalTimeoutBudget();
 });

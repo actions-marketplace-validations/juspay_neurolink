@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **LoadedProxyConfig** = `object`
 
-Defined in: [types/proxy.ts:1245](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1245)
+Defined in: [types/proxy.ts:3088](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L3088)
 
 Partial proxy config consumed by the start command.
 
@@ -18,7 +18,7 @@ Partial proxy config consumed by the start command.
 
 > `optional` **routing?**: `Partial`\<[`ProxyModelRouterConfig`](ProxyModelRouterConfig.md)\> & `object`
 
-Defined in: [types/proxy.ts:1246](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1246)
+Defined in: [types/proxy.ts:3089](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L3089)
 
 #### Type Declaration
 

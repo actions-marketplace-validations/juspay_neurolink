@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ValidationResult** = `object`
 
-Defined in: [types/tools.ts:209](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L209)
+Defined in: [types/tools.ts:260](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L260)
 
 Validation result for runtime checks
 Moved from src/lib/mcp/contracts/mcpContract.ts
@@ -19,7 +19,7 @@ Moved from src/lib/mcp/contracts/mcpContract.ts
 
 > **valid**: `boolean`
 
-Defined in: [types/tools.ts:210](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L210)
+Defined in: [types/tools.ts:261](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L261)
 
 ---
 
@@ -27,7 +27,7 @@ Defined in: [types/tools.ts:210](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **missing**: `string`[]
 
-Defined in: [types/tools.ts:211](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L211)
+Defined in: [types/tools.ts:262](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L262)
 
 ---
 
@@ -35,7 +35,7 @@ Defined in: [types/tools.ts:211](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **warnings**: `string`[]
 
-Defined in: [types/tools.ts:212](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L212)
+Defined in: [types/tools.ts:263](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L263)
 
 ---
 
@@ -43,4 +43,4 @@ Defined in: [types/tools.ts:212](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **recommendations**: `string`[]
 
-Defined in: [types/tools.ts:213](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L213)
+Defined in: [types/tools.ts:264](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L264)

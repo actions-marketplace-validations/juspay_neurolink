@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **NeuroLinkMiddlewareMetadata** = `object`
 
-Defined in: [types/middleware.ts:13](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L13)
+Defined in: [types/middleware.ts:38](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L38)
 
 Metadata type for NeuroLink middleware
 Provides additional information about middleware without affecting execution
@@ -19,7 +19,7 @@ Provides additional information about middleware without affecting execution
 
 > **id**: `string`
 
-Defined in: [types/middleware.ts:15](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L15)
+Defined in: [types/middleware.ts:40](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L40)
 
 Unique identifier for the middleware
 
@@ -29,7 +29,7 @@ Unique identifier for the middleware
 
 > **name**: `string`
 
-Defined in: [types/middleware.ts:17](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L17)
+Defined in: [types/middleware.ts:42](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L42)
 
 Human-readable name
 
@@ -39,7 +39,7 @@ Human-readable name
 
 > `optional` **description?**: `string`
 
-Defined in: [types/middleware.ts:19](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L19)
+Defined in: [types/middleware.ts:44](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L44)
 
 Description of what the middleware does
 
@@ -49,7 +49,7 @@ Description of what the middleware does
 
 > `optional` **priority?**: `number`
 
-Defined in: [types/middleware.ts:21](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L21)
+Defined in: [types/middleware.ts:46](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L46)
 
 Priority for ordering (higher = earlier in chain)
 
@@ -59,7 +59,7 @@ Priority for ordering (higher = earlier in chain)
 
 > `optional` **defaultEnabled?**: `boolean`
 
-Defined in: [types/middleware.ts:23](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L23)
+Defined in: [types/middleware.ts:48](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L48)
 
 Whether this middleware is enabled by default
 
@@ -69,6 +69,6 @@ Whether this middleware is enabled by default
 
 > `optional` **configSchema?**: `Record`\<`string`, `unknown`\>
 
-Defined in: [types/middleware.ts:25](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L25)
+Defined in: [types/middleware.ts:50](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L50)
 
 Configuration schema for the middleware

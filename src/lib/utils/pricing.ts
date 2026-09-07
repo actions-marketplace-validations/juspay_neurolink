@@ -1,4 +1,92 @@
 import type { TokenUsage } from "../types/index.js";
+import {
+  getManifestForProvider,
+  resolveManifestEntryExact,
+} from "../models/manifestRegistry.js";
+import { getCatalogJsonEntries } from "../providers/catalog/loader.js";
+
+/**
+ * Per-model pricing for the JSON-catalog providers, derived from
+ * models.catalog[*].pricingPerMTok (dollars-per-million → dollars-per-token,
+ * matching this file's unit convention). `_default` is the rate of the
+ * provider's own models.default model — mirroring what every hand-written
+ * catalog-provider block already did pre-migration (e.g. xai's `_default`
+ * was always grok-3's rate, xai's default model).
+ *
+ * `pricingPerMTok.cachedInput`, where present, maps to this file's
+ * `cacheRead` field — same semantics (price for a cached-read hit), just a
+ * different field name in the two shapes.
+ *
+ * A provider contributes no block here when its catalog carries zero
+ * `pricingPerMTok` data anywhere — fireworks (a fully refreshed model
+ * roster with no sourced pricing yet) and cloudflare (bills per "neuron",
+ * not per token — there's no USD-per-token figure to source). Both stay
+ * entirely hand-written below with their pre-existing symbolic/estimated
+ * rates, since the JSON has nothing to derive. Mistral's catalog likewise
+ * has no pricingPerMTok data, and its hand block below uses coarse model
+ * names ("mistral-large", "codestral", …) that don't match the JSON's real
+ * ids ("mistral-large-latest", "codestral-latest", …) — it stays
+ * hand-written too.
+ */
+const CATALOG_PRICING: Record<
+  string,
+  Record<
+    string,
+    {
+      input: number;
+      output: number;
+      cacheRead?: number;
+      cacheCreation?: number;
+    }
+  >
+> = Object.fromEntries(
+  getCatalogJsonEntries().flatMap((entry) => {
+    const priced = Object.fromEntries(
+      Object.entries(entry.models.catalog).flatMap(([modelId, spec]) =>
+        spec.pricingPerMTok
+          ? [
+              [
+                modelId,
+                {
+                  input: spec.pricingPerMTok.input / 1_000_000,
+                  output: spec.pricingPerMTok.output / 1_000_000,
+                  ...(spec.pricingPerMTok.cachedInput !== undefined
+                    ? { cacheRead: spec.pricingPerMTok.cachedInput / 1_000_000 }
+                    : {}),
+                },
+              ] as const,
+            ]
+          : [],
+      ),
+    );
+    if (Object.keys(priced).length === 0) {
+      return [];
+    }
+    const defaultRate =
+      entry.models.catalog[entry.models.default]?.pricingPerMTok;
+    return [
+      [
+        entry.id,
+        {
+          ...(defaultRate
+            ? {
+                _default: {
+                  input: defaultRate.input / 1_000_000,
+                  output: defaultRate.output / 1_000_000,
+                  // Without this, a request falling back to `_default`
+                  // bills cached tokens at the full input rate.
+                  ...(defaultRate.cachedInput !== undefined
+                    ? { cacheRead: defaultRate.cachedInput / 1_000_000 }
+                    : {}),
+                },
+              }
+            : {}),
+          ...priced,
+        },
+      ] as const,
+    ];
+  }),
+);
 
 /**
  * Per-token pricing data (USD per token). Updated Feb 2026.
@@ -24,6 +112,47 @@ const PRICING: Record<
 > = {
   // Anthropic (direct API) — updated March 2026
   anthropic: {
+    // Claude 5 family. Rates from platform.claude.com/docs/en/about-claude/pricing
+    // (checked 2026-08-21). Cache multipliers are the documented ones: a 5-minute
+    // cache write is 1.25x base input, a cache hit 0.1x.
+    "claude-fable-5": {
+      input: 10.0 / 1_000_000,
+      output: 50.0 / 1_000_000,
+      cacheRead: 1.0 / 1_000_000,
+      cacheCreation: 12.5 / 1_000_000,
+    },
+    "claude-mythos-5": {
+      input: 10.0 / 1_000_000,
+      output: 50.0 / 1_000_000,
+      cacheRead: 1.0 / 1_000_000,
+      cacheCreation: 12.5 / 1_000_000,
+    },
+    "claude-opus-5": {
+      input: 5.0 / 1_000_000,
+      output: 25.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+      cacheCreation: 6.25 / 1_000_000,
+    },
+    "claude-opus-4-8": {
+      input: 5.0 / 1_000_000,
+      output: 25.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+      cacheCreation: 6.25 / 1_000_000,
+    },
+    "claude-opus-4-7": {
+      input: 5.0 / 1_000_000,
+      output: 25.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+      cacheCreation: 6.25 / 1_000_000,
+    },
+    // Sonnet 5's $2/$10 launch pricing became the standard price; the
+    // previously scheduled 2026-09-01 rise to $3/$15 was cancelled.
+    "claude-sonnet-5": {
+      input: 2.0 / 1_000_000,
+      output: 10.0 / 1_000_000,
+      cacheRead: 0.2 / 1_000_000,
+      cacheCreation: 2.5 / 1_000_000,
+    },
     // Claude 4.6 family
     "claude-opus-4-6": {
       input: 5.0 / 1_000_000,
@@ -44,6 +173,17 @@ const PRICING: Record<
       cacheRead: 0.3 / 1_000_000,
       cacheCreation: 3.75 / 1_000_000,
     },
+    // Undated aliases for the same models. Clients report the bare name far
+    // more often than the dated one, and without these the longest-prefix
+    // match lands on the previous generation ("claude-sonnet-4"), which both
+    // reports as an inferred rate and would silently drift if the two
+    // generations ever diverge in price.
+    "claude-sonnet-4-5": {
+      input: 3.0 / 1_000_000,
+      output: 15.0 / 1_000_000,
+      cacheRead: 0.3 / 1_000_000,
+      cacheCreation: 3.75 / 1_000_000,
+    },
     "claude-opus-4-5": {
       input: 5.0 / 1_000_000,
       output: 25.0 / 1_000_000,
@@ -51,6 +191,12 @@ const PRICING: Record<
       cacheCreation: 6.25 / 1_000_000,
     },
     "claude-haiku-4-5-20251001": {
+      input: 1.0 / 1_000_000,
+      output: 5.0 / 1_000_000,
+      cacheRead: 0.1 / 1_000_000,
+      cacheCreation: 1.25 / 1_000_000,
+    },
+    "claude-haiku-4-5": {
       input: 1.0 / 1_000_000,
       output: 5.0 / 1_000_000,
       cacheRead: 0.1 / 1_000_000,
@@ -160,6 +306,35 @@ const PRICING: Record<
   },
   // OpenAI — updated March 2026
   openai: {
+    // GPT-5.6 family (Sol/Terra/Luna). Rates reflect OpenAI's 2026-07-30 cut,
+    // which reduced Luna by 80% and Terra by 20%; Sol was unchanged. Many
+    // third-party tables still carry the pre-cut numbers.
+    // List rates. Note that some resellers advertise sol at 50% off
+    // ($2.50/$15.00/$0.25); those are promotional and expire, so the table
+    // carries list price and cache read stays the documented 0.1x of input.
+    "gpt-5.6-sol": {
+      input: 5.0 / 1_000_000,
+      output: 30.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+      cacheCreation: 6.25 / 1_000_000,
+    },
+    "gpt-5.6-terra": {
+      input: 2.0 / 1_000_000,
+      output: 12.0 / 1_000_000,
+      cacheRead: 0.2 / 1_000_000,
+      cacheCreation: 2.5 / 1_000_000,
+    },
+    "gpt-5.6-luna": {
+      input: 0.2 / 1_000_000,
+      output: 1.2 / 1_000_000,
+      cacheRead: 0.02 / 1_000_000,
+      cacheCreation: 0.25 / 1_000_000,
+    },
+    "gpt-5.5": {
+      input: 5.0 / 1_000_000,
+      output: 30.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+    },
     // GPT-5.x family
     // cacheRead = 0.25x input (cached input tokens; no separate cacheCreation).
     "gpt-5.4": {
@@ -408,41 +583,9 @@ const PRICING: Record<
   llamacpp: {
     _default: { input: 0, output: 0 },
   },
-  xai: {
-    _default: { input: 3.0 / 1_000_000, output: 15.0 / 1_000_000 },
-    "grok-3": { input: 3.0 / 1_000_000, output: 15.0 / 1_000_000 },
-    "grok-3-mini": { input: 0.3 / 1_000_000, output: 0.5 / 1_000_000 },
-    "grok-2-latest": { input: 2.0 / 1_000_000, output: 10.0 / 1_000_000 },
-    "grok-2-vision-latest": {
-      input: 2.0 / 1_000_000,
-      output: 10.0 / 1_000_000,
-    },
-    "grok-beta": { input: 5.0 / 1_000_000, output: 15.0 / 1_000_000 },
-  },
-  groq: {
-    _default: { input: 0.59 / 1_000_000, output: 0.79 / 1_000_000 },
-    "llama-3.3-70b-versatile": {
-      input: 0.59 / 1_000_000,
-      output: 0.79 / 1_000_000,
-    },
-    "llama-3.1-8b-instant": {
-      input: 0.05 / 1_000_000,
-      output: 0.08 / 1_000_000,
-    },
-    "llama-3.2-90b-vision-preview": {
-      input: 0.9 / 1_000_000,
-      output: 0.9 / 1_000_000,
-    },
-    "llama-3.2-11b-vision-preview": {
-      input: 0.18 / 1_000_000,
-      output: 0.18 / 1_000_000,
-    },
-    "gemma2-9b-it": { input: 0.2 / 1_000_000, output: 0.2 / 1_000_000 },
-    "mixtral-8x7b-32768": {
-      input: 0.24 / 1_000_000,
-      output: 0.24 / 1_000_000,
-    },
-  },
+  // xai, groq, cerebras, sambanova — derived from the JSON catalog, see
+  // CATALOG_PRICING above.
+  ...CATALOG_PRICING,
   cohere: {
     _default: { input: 2.5 / 1_000_000, output: 10.0 / 1_000_000 },
     "command-r-plus": { input: 2.5 / 1_000_000, output: 10.0 / 1_000_000 },
@@ -452,45 +595,7 @@ const PRICING: Record<
       output: 0.15 / 1_000_000,
     },
   },
-  "together-ai": {
-    _default: { input: 0.88 / 1_000_000, output: 0.88 / 1_000_000 },
-    "meta-llama/Llama-3.3-70B-Instruct-Turbo": {
-      input: 0.88 / 1_000_000,
-      output: 0.88 / 1_000_000,
-    },
-    "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo": {
-      input: 3.5 / 1_000_000,
-      output: 3.5 / 1_000_000,
-    },
-    "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo": {
-      input: 0.88 / 1_000_000,
-      output: 0.88 / 1_000_000,
-    },
-    "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo": {
-      input: 0.18 / 1_000_000,
-      output: 0.18 / 1_000_000,
-    },
-    "mistralai/Mixtral-8x22B-Instruct-v0.1": {
-      input: 1.2 / 1_000_000,
-      output: 1.2 / 1_000_000,
-    },
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": {
-      input: 0.6 / 1_000_000,
-      output: 0.6 / 1_000_000,
-    },
-    "Qwen/Qwen2.5-72B-Instruct-Turbo": {
-      input: 1.2 / 1_000_000,
-      output: 1.2 / 1_000_000,
-    },
-    "deepseek-ai/DeepSeek-R1": {
-      input: 7.0 / 1_000_000,
-      output: 7.0 / 1_000_000,
-    },
-    "deepseek-ai/DeepSeek-V3": {
-      input: 1.25 / 1_000_000,
-      output: 1.25 / 1_000_000,
-    },
-  },
+  // together-ai — derived from the JSON catalog, see CATALOG_PRICING above.
   fireworks: {
     _default: { input: 0.9 / 1_000_000, output: 0.9 / 1_000_000 },
     "accounts/fireworks/models/llama-v3p1-70b-instruct": {
@@ -526,20 +631,7 @@ const PRICING: Record<
       output: 3.0 / 1_000_000,
     },
   },
-  perplexity: {
-    _default: { input: 1.0 / 1_000_000, output: 1.0 / 1_000_000 },
-    sonar: { input: 1.0 / 1_000_000, output: 1.0 / 1_000_000 },
-    "sonar-pro": { input: 3.0 / 1_000_000, output: 15.0 / 1_000_000 },
-    "sonar-reasoning": { input: 1.0 / 1_000_000, output: 5.0 / 1_000_000 },
-    "sonar-reasoning-pro": {
-      input: 2.0 / 1_000_000,
-      output: 8.0 / 1_000_000,
-    },
-    "sonar-deep-research": {
-      input: 2.0 / 1_000_000,
-      output: 8.0 / 1_000_000,
-    },
-  },
+  // perplexity — derived from the JSON catalog, see CATALOG_PRICING above.
   cloudflare: {
     // Cloudflare bills per "neuron"; symbolic per-token rate so cost
     // attribution dashboards have non-zero values.
@@ -582,6 +674,23 @@ const PRICING: Record<
 };
 
 /**
+ * Derives the catalog-provider rows of PROVIDER_ALIASES from each entry's
+ * own `id` and `aliases` — the same stripped-lowercase key format the hand
+ * rows below use ("together-ai" -> "togetherai", "workers-ai" -> "workersai").
+ */
+function buildCatalogProviderAliases(): Record<string, string> {
+  return Object.fromEntries(
+    getCatalogJsonEntries().flatMap((entry) => {
+      const stripped = (s: string) => s.toLowerCase().replace(/[^a-z]/g, "");
+      return [
+        [stripped(entry.id), entry.id] as const,
+        ...entry.aliases.map((alias) => [stripped(alias), entry.id] as const),
+      ];
+    }),
+  );
+}
+
+/**
  * Map of normalized provider aliases to canonical PRICING keys.
  * After stripping non-alpha characters, e.g. "google-ai" becomes "googleai".
  */
@@ -593,8 +702,6 @@ const PROVIDER_ALIASES: Record<string, string> = {
   openai: "openai",
   vertex: "vertex",
   google: "google",
-  mistral: "mistral",
-  mistralai: "mistral",
   azure: "openai",
   azureopenai: "openai",
   bedrock: "anthropic",
@@ -608,18 +715,7 @@ const PROVIDER_ALIASES: Record<string, string> = {
   nvidia: "nvidia-nim",
   lmstudio: "lm-studio",
   llamacpp: "llamacpp",
-  xai: "xai",
-  grok: "xai",
-  groq: "groq",
   cohere: "cohere",
-  togetherai: "together-ai",
-  together: "together-ai",
-  fireworks: "fireworks",
-  perplexity: "perplexity",
-  pplx: "perplexity",
-  cloudflare: "cloudflare",
-  workersai: "cloudflare",
-  cfai: "cloudflare",
   replicate: "replicate",
   voyage: "voyage",
   voyageai: "voyage",
@@ -630,6 +726,14 @@ const PROVIDER_ALIASES: Record<string, string> = {
   sd: "stability",
   ideogram: "ideogram",
   recraft: "recraft",
+  // 9 JSON-catalog providers (cerebras, cloudflare, fireworks, groq,
+  // mistral, perplexity, sambanova, together-ai, xai), derived from each
+  // entry's id/aliases above.
+  ...buildCatalogProviderAliases(),
+  // Not in mistral.json's `aliases` array (only "grok", "together",
+  // "pplx", "workers-ai"/"cf-ai" are real catalog aliases) — a pre-existing
+  // lenient alias kept explicitly since it can't be derived from the catalog.
+  mistralai: "mistral",
 };
 
 /**
@@ -640,9 +744,54 @@ const PROVIDER_ALIASES: Record<string, string> = {
  *
  * @returns The rate entry, or undefined when the combination is unknown.
  */
+/**
+ * Whether the tail left over after a longest-prefix match is only a version or
+ * date stamp — e.g. "claude-sonnet-4-5-20250929-v1:0" against the table key
+ * "claude-sonnet-4-5". That is the *same* model carrying a release suffix, so
+ * its rate is quoted, not inferred.
+ *
+ * Deliberately narrow: "gpt-5.6-sol" against "gpt-5" leaves ".6-sol", which is
+ * a different model generation and stays flagged as inferred.
+ */
+const VERSION_SUFFIX_RE =
+  /^[-@](\d{8}|v\d+(:\d+)?|latest)([-@:](\d{8}|v\d+(:\d+)?))*$/;
+
+function isVersionOnlySuffix(model: string, key: string): boolean {
+  if (!model.startsWith(key) || model === key) {
+    return false;
+  }
+  return VERSION_SUFFIX_RE.test(model.slice(key.length));
+}
+
+/**
+ * Whether `model` matches a provider manifest by the manifest's own
+ * canonical id or by one of its declared aliases — deliberately excludes
+ * resolveManifestEntryExact's longest-prefix fallback. See the call site in
+ * findRates for why the prefix path is unsafe to use for pricing precedence.
+ */
+function isManifestNamedMatch(provider: string, model: string): boolean {
+  const manifest = getManifestForProvider(provider);
+  if (!manifest) {
+    return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(manifest.models, model)) {
+    return true;
+  }
+  return Object.values(manifest.models).some((entry) =>
+    entry.aliases.includes(model),
+  );
+}
+
 function findRates(
   provider: string,
   model: string,
+  /**
+   * Set to true when the rates came from a literal table key rather than a
+   * prefix/fallback match. Threaded as an out-param so there is exactly one
+   * lookup implementation — a second hand-written copy drifted from this one
+   * and mislabelled every Bedrock and Vertex-Gemini hit.
+   */
+  matchKind?: { exact: boolean },
 ):
   | {
       input: number;
@@ -659,6 +808,9 @@ function findRates(
     for (const providerPricing of Object.values(PRICING)) {
       // Exact match
       if (providerPricing[model]) {
+        if (matchKind) {
+          matchKind.exact = true;
+        }
         return providerPricing[model];
       }
       const sortedKeys = Object.keys(providerPricing).sort(
@@ -697,8 +849,51 @@ function findRates(
       ? model.replace(/^.*\banthropic\./, "")
       : model;
 
+  // Manifest-backed exact/alias match takes precedence over legacy PRICING
+  // (see Task 8 of the model metadata consolidation plan). Deliberately
+  // gated to a NAMED match only (manifest's own id or a declared alias) —
+  // never resolveManifestEntryExact's longest-prefix fallback. The
+  // manifest's model set is coarser-grained than PRICING's for several
+  // live ids today (e.g. openai's manifest names only "gpt-5" while
+  // PRICING.openai carries distinct exact entries for
+  // gpt-5.1/5.4/5.5/5.6-sol/terra/luna); letting the manifest's prefix
+  // match run first would silently steal a more specific PRICING entry's
+  // rate — confirmed: resolveManifestEntryExact("openai", "gpt-5.4")
+  // prefix-matches onto the "gpt-5" entry, $1.25/$10 instead of the
+  // correct $2.5/$15. Everything the manifest doesn't name exactly or
+  // alias — including a named entry with no pricingPerMTok, e.g.
+  // claude-sonnet-5 — falls straight through to PRICING's unchanged
+  // exact+prefix match below, which is exactly "legacy PRICING as the
+  // fallback for entries the manifest lacks."
+  if (isManifestNamedMatch(normalizedProvider, modelKey)) {
+    const manifestEntry = resolveManifestEntryExact(
+      normalizedProvider,
+      modelKey,
+    );
+    if (manifestEntry?.pricingPerMTok) {
+      if (matchKind) {
+        matchKind.exact = true;
+      }
+      return {
+        input: manifestEntry.pricingPerMTok.input / 1_000_000,
+        output: manifestEntry.pricingPerMTok.output / 1_000_000,
+        cacheRead:
+          manifestEntry.pricingPerMTok.cacheRead !== undefined
+            ? manifestEntry.pricingPerMTok.cacheRead / 1_000_000
+            : undefined,
+        cacheCreation:
+          manifestEntry.pricingPerMTok.cacheWrite !== undefined
+            ? manifestEntry.pricingPerMTok.cacheWrite / 1_000_000
+            : undefined,
+      };
+    }
+  }
+
   // Exact match
   if (providerPricing[modelKey]) {
+    if (matchKind) {
+      matchKind.exact = true;
+    }
     return providerPricing[modelKey];
   }
 
@@ -708,6 +903,9 @@ function findRates(
     .sort((a, b) => b.length - a.length);
   const key = sortedKeys.find((k) => modelKey.startsWith(k));
   if (key) {
+    if (matchKind && isVersionOnlySuffix(modelKey, key)) {
+      matchKind.exact = true;
+    }
     return providerPricing[key];
   }
 
@@ -720,6 +918,9 @@ function findRates(
     const googlePricing = PRICING["google"];
     if (googlePricing) {
       if (googlePricing[model]) {
+        if (matchKind) {
+          matchKind.exact = true;
+        }
         return googlePricing[model];
       }
       const googleKeys = Object.keys(googlePricing).sort(
@@ -788,6 +989,20 @@ export function calculateCost(
  * USD price, and any caller gated by `hasPricing()` should treat them as
  * non-billable rather than zero-cost-billable.
  */
+/**
+ * Whether a model's rates came from an exact table entry or were inferred.
+ *
+ * `findRates` falls back to a longest-prefix match, so an unlisted model can
+ * silently inherit a listed one's rates — e.g. "gpt-5.6-sol" matches the
+ * "gpt-5" entry and is billed at its price. That is a guess, not a quote, and
+ * a caller reporting spend needs to be able to say which it had.
+ */
+export function isExactPricingMatch(provider: string, model: string): boolean {
+  const matchKind = { exact: false };
+  const rates = findRates(provider, model, matchKind);
+  return rates !== undefined && matchKind.exact;
+}
+
 export function hasPricing(provider: string, model: string): boolean {
   const rates = findRates(provider, model);
   if (!rates) {

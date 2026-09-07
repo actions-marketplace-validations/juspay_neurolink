@@ -15,9 +15,10 @@
 
 import { SpanKind, SpanStatusCode, type Span } from "@opentelemetry/api";
 import { getModelId } from "../../providers/providerTypeUtils.js";
-import { resolveSamplingParams } from "../../models/modelRegistry.js";
 import { tracers } from "../../telemetry/tracers.js";
 import type {
+  StepResult,
+  GenerateTextResult,
   UnknownRecord,
   ToolCallObject,
   AIProviderName,
@@ -27,13 +28,10 @@ import type {
   NeuroLinkEvents,
   StandardRecord,
   TextGenerationOptions,
-  ToolCallRepairFunction,
   ToolExecutionRecord,
-  ToolSet,
   TypedEventEmitter,
 } from "../../types/index.js";
 import { logger } from "../../utils/logger.js";
-import { emitToolEndFromStepFinish } from "../../utils/toolEndEmitter.js";
 import { calculateCost } from "../../utils/pricing.js";
 import { withProviderRetry } from "../../utils/providerRetry.js";
 import { parseTimeout } from "../../utils/timeout.js";
@@ -47,29 +45,19 @@ import {
   DEFAULT_MAX_STEPS,
   DEFAULT_WRAPUP_TIME_LEAD_MS,
 } from "../constants.js";
-import {
-  createStepBudgetGuard,
-  estimateFixedOverheadTokens,
-} from "../../context/stepBudgetGuard.js";
+import {} from "../../context/stepBudgetGuard.js";
 import {
   isTemperatureDeprecatedError,
   isSchemaComplexityError,
   isToolsSchemaConflictError,
-  isToolsSchemaExclusionInForce,
 } from "./structuredOutputPolicy.js";
-import { coerceJsonToSchema } from "../../utils/json/coerce.js";
-import { convertZodToJsonSchema } from "../../utils/schemaConversion.js";
-import type {
-  LanguageModel,
-  ModelMessage,
-  PrepareStepFunction,
-  Tool,
-  ZodUnknownSchema,
-} from "../../types/index.js";
+import {
+  coerceJsonToSchema,
+  recoverScalarRoot,
+  schemaAccepts,
+} from "../../utils/json/coerce.js";
+import type { LanguageModel, ModelMessage, Tool } from "../../types/index.js";
 import { NoObjectGeneratedError } from "../../utils/generationErrors.js";
-import { Output, stepCountIs } from "../../utils/tool.js";
-import { generateText } from "../../utils/generation.js";
-import { extractSystemMessages } from "../../utils/systemMessages.js";
 
 const genTracer = tracers.generation;
 
@@ -156,74 +144,6 @@ export function resolveTurnBudget(
 }
 
 /**
- * Merge the per-call providerOptions namespaces for generateText. Both the
- * timeout forwarding (`neurolink.timeoutMs`, read by NeuroLink's delegating
- * chat-completions models) and Gemini thinking (`google.thinkingConfig`) may
- * apply on the same call — built here as ONE object because two conditional
- * `providerOptions:` spreads in the args literal would silently clobber each
- * other (object spread does not deep-merge).
- */
-function buildProviderOptions(
-  options: TextGenerationOptions,
-  isGoogleProvider: boolean,
-  callerTimeoutMs: number | undefined,
-  finalResultSchema: Record<string, unknown> | undefined,
-): Parameters<typeof generateText>[0]["providerOptions"] {
-  const providerOptions: Record<string, Record<string, unknown>> = {};
-  if (callerTimeoutMs !== undefined) {
-    providerOptions.neurolink = { timeoutMs: callerTimeoutMs };
-  }
-  if (finalResultSchema) {
-    providerOptions.anthropic = { finalResultSchema };
-  }
-  if (options.thinkingConfig?.enabled && isGoogleProvider) {
-    // Gemini 3 uses thinkingLevel; Gemini 2.5 uses thinkingBudget.
-    providerOptions.google = {
-      thinkingConfig: {
-        ...(options.thinkingConfig.thinkingLevel && {
-          thinkingLevel: options.thinkingConfig.thinkingLevel,
-        }),
-        ...(options.thinkingConfig.budgetTokens &&
-          !options.thinkingConfig.thinkingLevel && {
-            thinkingBudget: options.thinkingConfig.budgetTokens,
-          }),
-        includeThoughts: true,
-      },
-    };
-  }
-  return Object.keys(providerOptions).length > 0
-    ? (providerOptions as Parameters<typeof generateText>[0]["providerOptions"])
-    : undefined;
-}
-
-/**
- * Build the prepareStep result for a forced wrap-up step: tools withdrawn
- * (toolChoice: "none") plus an honest time message (native-loop parity) —
- * without the message, weaker models keep trying to emit tool calls and leak
- * raw tool-call tokens into the text answer.
- */
-function buildWrapupStepResult(
-  prepared: Record<string, unknown> | undefined,
-  stepMessages: ModelMessage[],
-): Record<string, unknown> {
-  const baseMessages =
-    (prepared as { messages?: ModelMessage[] } | undefined)?.messages ??
-    stepMessages;
-  return {
-    ...(prepared ?? {}),
-    messages: [
-      ...baseMessages,
-      {
-        role: "user" as const,
-        content:
-          "The time budget for this task is nearly exhausted. Do not call any more tools. Give your best final answer NOW from the information already gathered, and note anything you could not verify in the remaining time.",
-      },
-    ],
-    toolChoice: "none" as const,
-  };
-}
-
-/**
  * GenerationHandler class - Handles text generation operations for AI providers
  */
 export class GenerationHandler {
@@ -263,7 +183,11 @@ export class GenerationHandler {
      */
     private readonly deps: {
       getEmitterFn?: () => TypedEventEmitter<NeuroLinkEvents> | undefined;
-      generateTextFn?: typeof generateText;
+      // Local signature: the ai package's generateText is gone. Only tests
+      // inject this; production always takes the native provider paths.
+      generateTextFn?: (
+        options: Record<string, unknown>,
+      ) => Promise<GenerateTextResult<Record<string, Tool>, unknown>>;
     } = {},
   ) {}
 
@@ -271,330 +195,38 @@ export class GenerationHandler {
    * Helper method to call generateText with optional structured output
    * @private
    */
+  /**
+   * The ai-package generate loop.
+   *
+   * Unreachable: every text provider now implements a native generate() and
+   * none of them return here. That was established by trapping the seam —
+   * replacing the ai package's generateText with a throwing stub left the full
+   * provider matrix passing and zero cells reaching it — and non-text request
+   * kinds return from runGenerateInActiveContext before this handler is
+   * consulted.
+   *
+   * Kept as an explicit failure rather than deleted outright so a provider
+   * added without a native generate() fails loudly here instead of silently
+   * reintroducing a dependency on the removed package.
+   */
   private async callGenerateText(
-    model: LanguageModel,
-    messages: ModelMessage[],
-    tools: Record<string, Tool>,
-    options: TextGenerationOptions,
-    callConfig: {
-      shouldUseTools: boolean;
-      includeStructuredOutput: boolean;
-      /** Anchor for the turn deadline — the ORIGINAL executeGeneration start,
-       *  shared across fallback/provider retries so they can't refresh the
-       *  wall-clock budget. */
-      turnStartMs: number;
-    },
-  ): Promise<Awaited<ReturnType<typeof generateText>>> {
-    const { shouldUseTools, includeStructuredOutput, turnStartMs } = callConfig;
-    // Check if this is a Google provider (for provider-specific options)
-    const isGoogleProvider =
-      this.providerName === "google-ai" || this.providerName === "vertex";
-
-    // Check if this is an Anthropic provider (includes Vertex+Claude)
-    const isAnthropicProvider =
-      this.providerName === "anthropic" ||
-      this.providerName === "bedrock" ||
-      (this.providerName === "vertex" && this.modelName?.startsWith("claude-"));
-
-    // Gemini 2.5 and earlier cannot use tools + structured JSON output simultaneously.
-    // When both are requested on a Google provider, disable structured output (tools take priority).
-    const wantsStructuredOutput =
-      includeStructuredOutput &&
-      (!!options.schema ||
-        options.output?.format === "json" ||
-        options.output?.format === "structured");
-    // The tools↔schema conflict is a Gemini-only API limitation. Vertex+Claude
-    // supports both simultaneously, so only exclude for actual Gemini models.
-    const useStructuredOutput =
-      wantsStructuredOutput &&
-      !isToolsSchemaExclusionInForce(
-        this.providerName,
-        this.modelName,
-        shouldUseTools,
-        Object.keys(tools).length,
-      );
-
-    // Annotate the last tool with cache_control so the full tool-definition
-    // block becomes a cache breakpoint for Anthropic-family providers.
-    // Non-Anthropic providers harmlessly ignore unknown providerOptions.
-    // Note: The AI SDK Tool type doesn't yet include providerOptions, so we
-    // use a type assertion. The Anthropic adapter reads this at runtime.
-    //
-    // Deliberately NOT a clone: the record is call-scoped (built fresh in
-    // BaseProvider.prepareGenerationContext) and the AI SDK re-reads it on
-    // every agent-loop step, so `search_tools` hydration (tools.discovery)
-    // can add discovered tools mid-loop and have them callable on the next
-    // step. A clone would freeze the tool set for the whole call.
-    const toolsWithCache: Record<
-      string,
-      Tool & { providerOptions?: Record<string, unknown> }
-    > = tools;
-    if (
-      isAnthropicProvider &&
-      shouldUseTools &&
-      Object.keys(toolsWithCache).length > 0
-    ) {
-      const toolNames = Object.keys(toolsWithCache);
-      const lastToolName = toolNames[toolNames.length - 1];
-      if (lastToolName && toolsWithCache[lastToolName]) {
-        const lastTool = toolsWithCache[lastToolName] as Tool & {
-          providerOptions?: Record<string, unknown>;
-        };
-        toolsWithCache[lastToolName] = {
-          ...lastTool,
-          providerOptions: {
-            ...(lastTool.providerOptions ?? {}),
-            anthropic: { cacheControl: { type: "ephemeral" } },
-          },
-        };
-      }
-    }
-
-    const prepareStep = options.prepareStep;
-
-    const { callerTimeoutMs, turnBudgetMs, wrapupLeadMs, turnDeadline } =
-      resolveTurnBudget(options, turnStartMs);
-    let wrapupForced = false;
-    // The native Anthropic Messages surface cannot combine AI-SDK structured
-    // output with tools (see structuredOutputPolicy — experimental_output
-    // replaces the tools array), so `useStructuredOutput` is false above and
-    // the schema would simply be dropped for every agent/MCP turn. Hand the
-    // JSON Schema to the provider instead: it appends an additive
-    // `final_result` tool and returns the answer as that tool's arguments,
-    // keeping the real tools callable. Bedrock is deliberately excluded — it
-    // runs on the third-party @ai-sdk/amazon-bedrock model, which has no such
-    // handling.
-    const finalResultSchema =
-      this.providerName === "anthropic" &&
-      !!options.schema &&
-      shouldUseTools &&
-      Object.keys(tools).length > 0
-        ? (convertZodToJsonSchema(options.schema as ZodUnknownSchema) as Record<
-            string,
-            unknown
-          >)
-        : undefined;
-    const providerOptions = buildProviderOptions(
-      options,
-      isGoogleProvider,
-      callerTimeoutMs,
-      finalResultSchema,
+    _model: LanguageModel,
+    _messages: ModelMessage[],
+    _tools: Record<string, Tool>,
+    _options: TextGenerationOptions,
+    _callConfig: unknown,
+  ): Promise<GenerateTextResult<Record<string, Tool>, unknown>> {
+    throw new Error(
+      "GenerationHandler.callGenerateText is no longer implemented: every provider must supply a native generate(). See docs/plans/2026-09-03-completing-the-ai-sdk-removal.md",
     );
-
-    // Hoist system-role messages into generateText's top-level `system` option
-    // rather than passing them inside `messages` (deprecated by the AI SDK,
-    // rejected in v7). See extractSystemMessages for the rationale. (#1024)
-    const { system, messages: nonSystemMessages } =
-      extractSystemMessages(messages);
-
-    // Per-step context budget guard: the tool loop appends assistant turns and
-    // tool results on every step — growth the pre-call budget check never
-    // sees. Estimate each step's projected request and deterministically
-    // reclaim budget (truncate old tool outputs, then drop oldest exchanges)
-    // so long agentic runs cannot overflow the model's window mid-loop.
-    // Parity with the googleVertex native loops' createContextGuard, upgraded
-    // from stop-only to compact-and-continue. The caller's prepareStep result
-    // wins on conflicts; the guard only contributes `messages`.
-    //
-    // Overhead is resolved PER STEP because `toolsWithCache` is deliberately
-    // mutable (search_tools hydration adds discovered tools mid-loop) — a
-    // once-captured estimate would undercount later steps. Tools are only
-    // ever added, so memoizing on tool count keeps the common step O(1).
-    let cachedOverhead = { toolCount: -1, tokens: 0 };
-    const stepBudgetGuard = createStepBudgetGuard({
-      provider: this.providerName ?? "unknown",
-      model: this.modelName,
-      maxTokens: options.maxTokens,
-      getFixedOverheadTokens: () => {
-        const toolCount = shouldUseTools
-          ? Object.keys(toolsWithCache).length
-          : 0;
-        if (toolCount !== cachedOverhead.toolCount) {
-          cachedOverhead = {
-            toolCount,
-            tokens: estimateFixedOverheadTokens(
-              system,
-              shouldUseTools ? toolsWithCache : undefined,
-              this.providerName,
-            ),
-          };
-        }
-        return cachedOverhead.tokens;
-      },
-    });
-
-    // Registry-driven strip: models that reject sampling params (Sonnet 5 /
-    // Opus 4.7+ / Fable 5 families — e.g. Claude on Bedrock or behind any
-    // AI-SDK provider) must not receive temperature. Applies uniformly to
-    // every provider on this loop path; the reactive
-    // isTemperatureDeprecatedError retry below remains the safety net.
-    const samplingParams = resolveSamplingParams(
-      this.providerName,
-      getModelId(model, this.modelName || ""),
-      options.temperature !== undefined
-        ? { temperature: options.temperature }
-        : {},
-      "aiSdk.generateText",
-    );
-
-    const result = await (this.deps.generateTextFn ?? generateText)({
-      model,
-      ...(system && { system }),
-      messages: nonSystemMessages,
-      ...(shouldUseTools &&
-        Object.keys(toolsWithCache).length > 0 && { tools: toolsWithCache }),
-      stopWhen: stepCountIs(options.maxSteps ?? DEFAULT_MAX_STEPS),
-      ...(shouldUseTools &&
-        options.toolChoice && { toolChoice: options.toolChoice }),
-      experimental_prepareStep: (async (stepOptions) => {
-        // Public contract preserved: a caller-supplied prepareStep receives
-        // the ORIGINAL AI-SDK step options, exactly as before the guard
-        // existed — callers that inspect message history see the real thing.
-        const callerResult = prepareStep
-          ? await prepareStep({
-              ...stepOptions,
-              maxSteps: options.maxSteps ?? DEFAULT_MAX_STEPS,
-            })
-          : undefined;
-        // The guard runs LAST, on the messages that will actually be sent:
-        // the caller's override when one was returned (out-of-contract for
-        // NeuroLink's public prepareStep type, but possible at runtime), else
-        // the step's own messages. It never replaces a caller's content
-        // choices — it only reclaims budget from whatever was chosen.
-        const callerMessages = (
-          callerResult as { messages?: ModelMessage[] } | undefined
-        )?.messages;
-        // Usage feedback: the provider's REAL prompt-token count for the
-        // previous step calibrates the guard's char-based estimator (see
-        // createStepBudgetGuard) — free precision, no tokenizer.
-        const previousStep = stepOptions.steps[stepOptions.steps.length - 1];
-        const compacted = stepBudgetGuard(
-          callerMessages ?? stepOptions.messages,
-          previousStep?.usage?.inputTokens,
-        );
-        const prepared = compacted
-          ? { ...(callerResult ?? {}), messages: compacted }
-          : callerResult;
-        // Wrap-up: inside the lead window before the turn deadline, stop
-        // offering tools so this step produces the final answer. Overrides
-        // any caller toolChoice — an honest partial beats a discarded turn.
-        if (
-          turnDeadline !== undefined &&
-          shouldUseTools &&
-          Date.now() >= turnDeadline - wrapupLeadMs
-        ) {
-          if (!wrapupForced) {
-            wrapupForced = true;
-            logger.warn(
-              "[GenerationHandler] Turn budget nearly exhausted — forcing wrap-up (toolChoice: none)",
-              {
-                provider: this.providerName,
-                turnBudgetMs,
-                wrapupLeadMs,
-                stepNumber: stepOptions.stepNumber,
-              },
-            );
-          }
-          return buildWrapupStepResult(prepared, stepOptions.messages);
-        }
-        return prepared;
-      }) satisfies PrepareStepFunction,
-      temperature: samplingParams.temperature,
-      maxOutputTokens: options.maxTokens,
-      maxRetries: 0, // NL11: Disable AI SDK's invisible internal retries; we handle retries with OTel instrumentation
-      abortSignal: options.abortSignal,
-      // Schema-driven tool-call repair (BZ-665): fixes near-miss tool names
-      // (case/substring/Levenshtein) and — for tools whose schema carries a
-      // validator — coerces mis-typed arguments ("123" → 123) and remaps
-      // near-miss parameter names before the call is marked invalid. Wired
-      // for every AI-SDK-loop provider; native loops have their own paths.
-      ...(shouldUseTools &&
-        !options.disableToolCallRepair && {
-          experimental_repairToolCall: (async (
-            ...repairArgs: Parameters<ToolCallRepairFunction<ToolSet>>
-          ) => {
-            // Lazy import to avoid a circular dependency at module load time
-            const { createToolCallRepair } =
-              await import("../../utils/toolCallRepair.js");
-            return createToolCallRepair()(...repairArgs);
-          }) as ToolCallRepairFunction<ToolSet>,
-        }),
-      // Forward the caller's resolved timeout to the model layer: the AI-SDK
-      // V3 call options carry no `timeout`, so delegating chat-completions
-      // models (litellm & friends) could otherwise only ever apply their
-      // provider default per step — an explicit `timeout: "15m"` bounded the
-      // outer loop while each step stayed capped at the default.
-      // Merged namespaces (neurolink timeout forwarding + Gemini thinking) —
-      // built as ONE object; see buildProviderOptions.
-      ...(providerOptions && { providerOptions }),
-      ...(useStructuredOutput &&
-        options.schema && {
-          experimental_output: Output.object({ schema: options.schema }),
-        }),
-      // Anthropic thinking: experimental_thinking with budgetTokens.
-      // (Gemini thinking rides providerOptions.google above.)
-      ...(options.thinkingConfig?.enabled &&
-        isAnthropicProvider &&
-        options.thinkingConfig.budgetTokens &&
-        !options.thinkingConfig.thinkingLevel && {
-          experimental_thinking: {
-            type: "enabled" as const,
-            budgetTokens: options.thinkingConfig.budgetTokens,
-          },
-        }),
-      experimental_telemetry: this.getTelemetryConfigFn(options, "generate"),
-      onStepFinish: ({ toolCalls, toolResults }) => {
-        logger.info("Tool execution completed", { toolResults, toolCalls });
-
-        // Emit tool:end events for Pipeline B (metrics aggregator).
-        // This surfaces AI-SDK-driven tool completions as telemetry events
-        // so that tool spans are created even when the SDK runs tools
-        // internally (gaps G5 / S2).
-        emitToolEndFromStepFinish(
-          this.deps.getEmitterFn?.(),
-          toolResults as Array<{
-            toolName: string;
-            output?: unknown;
-            result?: unknown;
-            error?: string;
-          }>,
-        );
-
-        // Handle tool execution storage
-        this.handleToolStorageFn(
-          toolCalls,
-          toolResults,
-          options,
-          new Date(),
-        ).catch((error: unknown) => {
-          logger.warn("[GenerationHandler] Failed to store tool executions", {
-            provider: this.providerName,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        });
-      },
-    });
-    if (wrapupForced) {
-      // Non-enumerable marker read by formatEnhancedResult to report
-      // stopReason "time-limit" — the result object itself is the only
-      // artifact that travels from this call to result formatting.
-      Object.defineProperty(result, "__nlTurnWrapup", {
-        value: true,
-        enumerable: false,
-      });
-    }
-    return result;
   }
 
-  /**
-   * Execute the generation with AI SDK
-   */
   async executeGeneration(
     model: LanguageModel,
     messages: ModelMessage[],
     tools: Record<string, Tool>,
     options: TextGenerationOptions,
-  ): Promise<Awaited<ReturnType<typeof generateText>>> {
+  ): Promise<GenerateTextResult<Record<string, Tool>, unknown>> {
     return genTracer.startActiveSpan(
       "neurolink.executeGeneration",
       { kind: SpanKind.INTERNAL },
@@ -694,16 +326,7 @@ export class GenerationHandler {
               finishReason: result.finishReason,
               stepCount: result.steps?.length || 0,
               steps: result.steps?.map(
-                (
-                  step: {
-                    stepType?: string;
-                    text?: string;
-                    toolCalls?: Array<{ toolName: string }>;
-                    toolResults?: Array<{ toolName: string }>;
-                    finishReason?: string;
-                  },
-                  i: number,
-                ) => ({
+                (step: StepResult<Record<string, Tool>>, i: number) => ({
                   stepIndex: i,
                   stepType: step.stepType,
                   textLength: step.text?.length || 0,
@@ -916,7 +539,7 @@ export class GenerationHandler {
    */
   private setUsageSpanAttributes(
     span: Span,
-    result: Awaited<ReturnType<typeof generateText>>,
+    result: GenerateTextResult<Record<string, Tool>, unknown>,
   ): void {
     const aggregate = result.totalUsage ?? result.usage;
     if (!aggregate) {
@@ -939,7 +562,7 @@ export class GenerationHandler {
   }
 
   private extractCacheMetricsFromProviderMetadata(
-    generateResult: Awaited<ReturnType<typeof generateText>>,
+    generateResult: GenerateTextResult<Record<string, Tool>, unknown>,
   ): {
     cacheCreationTokens?: number;
     cacheReadTokens?: number;
@@ -975,7 +598,7 @@ export class GenerationHandler {
    * Log generation completion information
    */
   logGenerationComplete(
-    generateResult: Awaited<ReturnType<typeof generateText>>,
+    generateResult: GenerateTextResult<Record<string, Tool>, unknown>,
   ): void {
     const cacheMetrics =
       this.extractCacheMetricsFromProviderMetadata(generateResult);
@@ -1003,7 +626,7 @@ export class GenerationHandler {
    * Extract tool information from generation result
    */
   extractToolInformation(
-    generateResult: Awaited<ReturnType<typeof generateText>>,
+    generateResult: GenerateTextResult<Record<string, Tool>, unknown>,
   ): {
     toolsUsed: string[];
     toolExecutions: Array<{
@@ -1049,7 +672,10 @@ export class GenerationHandler {
             toolsUsed.push(toolName);
 
             let callArgs: StandardRecord = {};
-            if (tcRecord.args) {
+            if (tcRecord.input) {
+              // AI SDK v6 carries tool-call arguments as `input`.
+              callArgs = tcRecord.input as StandardRecord;
+            } else if (tcRecord.args) {
               callArgs = tcRecord.args as StandardRecord;
             } else if (tcRecord.arguments) {
               callArgs = tcRecord.arguments as StandardRecord;
@@ -1096,7 +722,7 @@ export class GenerationHandler {
    * Format the enhanced result
    */
   formatEnhancedResult(
-    generateResult: Awaited<ReturnType<typeof generateText>>,
+    generateResult: GenerateTextResult<Record<string, Tool>, unknown>,
     tools: Record<string, Tool>,
     toolsUsed: string[],
     toolExecutions: ToolExecutionRecord[],
@@ -1133,9 +759,9 @@ export class GenerationHandler {
         }
         return coerced.content;
       }
-      try {
-        const scalar: unknown = JSON.parse(strippedText);
-        if (scalar === "") {
+      const scalar = recoverScalarRoot(strippedText, options.schema);
+      switch (scalar.kind) {
+        case "empty":
           // A JSON-encoded empty string is an EMPTY completion, not a
           // recovered scalar — normalize to a true empty ('' content, no
           // structuredData) so callers' empty-response handling fires
@@ -1145,19 +771,32 @@ export class GenerationHandler {
             { provider: this.providerName, model: this.modelName },
           );
           return "";
-        }
-        if (scalar !== null && scalar !== undefined) {
-          structuredData = scalar;
+        case "accepted":
+          // A JSON scalar root is only real structured data when the caller's
+          // schema actually accepts it. Under an OBJECT schema a recovered
+          // string/number is the raw completion in disguise (the shape a
+          // truncated response degrades to) — publishing it would hand the
+          // caller a `structuredData` that violates the schema they passed.
+          structuredData = scalar.value;
           return strippedText;
-        }
-      } catch {
-        // not JSON at all — fall through to raw text + WARN
+        case "rejected":
+          logger.warn(
+            "[GenerationHandler] recovered a JSON scalar the requested schema rejects; leaving structuredData unset",
+            {
+              provider: this.providerName,
+              model: this.modelName,
+              scalarType: typeof scalar.value,
+            },
+          );
+          return strippedText;
+        case "nullish":
+        case "not-json":
+          logger.warn(
+            "[GenerationHandler] schema requested but no JSON could be recovered from model text; returning raw text",
+            { provider: this.providerName, model: this.modelName },
+          );
+          return strippedText;
       }
-      logger.warn(
-        "[GenerationHandler] schema requested but no JSON could be recovered from model text; returning raw text",
-        { provider: this.providerName, model: this.modelName },
-      );
-      return strippedText;
     };
     if (useStructuredOutput) {
       try {
@@ -1173,7 +812,23 @@ export class GenerationHandler {
         const rawTextEcho =
           typeof experimentalOutput === "string" &&
           experimentalOutput === (generateResult.text ?? "");
-        if (experimentalOutput !== undefined && !rawTextEcho) {
+        // The equality check above only catches an EXACT echo. On a multi-step
+        // or truncated turn the echo can differ from `text` (a different step's
+        // text, a fence, trailing whitespace), and a raw string would then be
+        // published as `structuredData` under an object schema — the "returned
+        // a string instead of the schema object" failure. A string is trusted
+        // as structured output ONLY when the caller's schema accepts it
+        // (string-root schemas keep working); otherwise it is coerced like any
+        // other raw model text.
+        const untrustedStringOutput =
+          typeof experimentalOutput === "string" &&
+          !!options.schema &&
+          !schemaAccepts(options.schema, experimentalOutput);
+        if (
+          experimentalOutput !== undefined &&
+          !rawTextEcho &&
+          !untrustedStringOutput
+        ) {
           // AI-SDK already parsed + schema-validated the object. Expose it
           // directly and serialise canonically — no hand-parsing needed.
           structuredData = experimentalOutput;

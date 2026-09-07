@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,17 +8,41 @@
 
 > **YamlModule** = `object`
 
-Defined in: [types/proxy.ts:1199](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1199)
+Defined in: [types/proxy.ts:2982](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L2982)
 
-Shape of the dynamically-imported js-yaml module.
+Shape of the dynamically-imported js-yaml module. `dump` is optional —
+read-only consumers (proxy config loader) only need `load`; writers
+(CLI primary-account commands) check `dump` before calling.
 
 ## Properties
+
+### dump?
+
+> `optional` **dump?**: (`obj`, `opts?`) => `string`
+
+Defined in: [types/proxy.ts:2984](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L2984)
+
+#### Parameters
+
+##### obj
+
+`unknown`
+
+##### opts?
+
+`Record`\<`string`, `unknown`\>
+
+#### Returns
+
+`string`
+
+---
 
 ### default?
 
 > `optional` **default?**: `object`
 
-Defined in: [types/proxy.ts:1201](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1201)
+Defined in: [types/proxy.ts:2985](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L2985)
 
 #### load()
 
@@ -34,13 +58,31 @@ Defined in: [types/proxy.ts:1201](https://github.com/juspay/neurolink/blob/ff50c
 
 `unknown`
 
+#### dump?
+
+> `optional` **dump?**: (`obj`, `opts?`) => `string`
+
+##### Parameters
+
+###### obj
+
+`unknown`
+
+###### opts?
+
+`Record`\<`string`, `unknown`\>
+
+##### Returns
+
+`string`
+
 ## Methods
 
 ### load()
 
 > **load**(`content`): `unknown`
 
-Defined in: [types/proxy.ts:1200](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1200)
+Defined in: [types/proxy.ts:2983](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L2983)
 
 #### Parameters
 

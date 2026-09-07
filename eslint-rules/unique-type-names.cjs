@@ -10,9 +10,20 @@
  * rule invocations. ESLint loads the plugin once per process, so a single
  * `pnpm run lint` sees every file and can report duplicates.
  *
- * Caveat: when running ESLint on a subset of files (e.g., lint-staged on a
- * partial diff), this rule only checks that subset. The pre-push/CI run on
- * the full project catches everything.
+ * Caveat: when running ESLint on a subset of files (e.g. lint-staged on a
+ * partial diff), this rule only checks that subset — a duplicate is invisible
+ * unless BOTH declarations are in the same run.
+ *
+ * What that means in practice, checked rather than assumed: this rule returns
+ * early for any file outside `src/lib/types/` (see `isInsideTypesFolder`), and
+ * every `neurolink` rule is enabled only for a files glob rooted at `src`.
+ * So CI's `eslint src/` already gives this rule a complete view — a duplicate
+ * introduced in `src/lib/types/` is caught by that run alone, verified by
+ * planting one and watching it fail.
+ *
+ * `.husky/pre-push` lints nothing, and the pre-commit hook's full-project lint
+ * is skippable with `--no-verify`, but neither matters here: the scoped CI run
+ * is sufficient for this rule. The lint-staged caveat above is the real one.
  */
 
 "use strict";

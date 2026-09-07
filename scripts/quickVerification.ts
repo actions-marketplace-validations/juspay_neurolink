@@ -6,8 +6,7 @@
  */
 
 import { execSync } from "child_process";
-import { writeFileSync, existsSync, readdirSync } from "fs";
-import path from "path";
+import { writeFileSync, existsSync } from "fs";
 
 const TIMESTAMP = new Date().toISOString().replace(/[:.]/g, "-");
 
@@ -27,7 +26,7 @@ function log(message: string, success = true): void {
 
 function runQuickTest(command: string, description: string): boolean {
   try {
-    const output = execSync(command, { encoding: 'utf8', timeout: 30000 });
+    execSync(command, { encoding: 'utf8', timeout: 30000 });
     log(`${description} - SUCCESS`);
     return true;
   } catch (error) {
@@ -67,21 +66,6 @@ runQuickTest('pnpm run test:providers', 'Continuous Test Suite');
 // Test CLI basics
 console.log('\n💻 TESTING CLI');
 runQuickTest('pnpm cli generate "test" --provider google-ai', 'CLI Generation');
-
-// Check demo files
-console.log('\n🎭 CHECKING DEMO FILES');
-const demoFiles = [
-  'scripts/examples/healthMonitoring-demo.ts',
-  'scripts/examples/dynamic-chain-demo.ts'
-];
-
-demoFiles.forEach(file => {
-  if (existsSync(file)) {
-    log(`Demo available: ${file}`);
-  } else {
-    log(`Demo missing: ${file}`, false);
-  }
-});
 
 // Generate report
 const report = {

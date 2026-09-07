@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ConfigUpdateOptions** = `object`
 
-Defined in: [types/config.ts:338](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L338)
+Defined in: [types/config.ts:469](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L469)
 
 Configuration update options
 
@@ -18,7 +18,7 @@ Configuration update options
 
 > `optional` **createBackup?**: `boolean`
 
-Defined in: [types/config.ts:339](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L339)
+Defined in: [types/config.ts:470](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L470)
 
 ---
 
@@ -26,7 +26,7 @@ Defined in: [types/config.ts:339](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **validate?**: `boolean`
 
-Defined in: [types/config.ts:340](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L340)
+Defined in: [types/config.ts:471](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L471)
 
 ---
 
@@ -34,7 +34,7 @@ Defined in: [types/config.ts:340](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **merge?**: `boolean`
 
-Defined in: [types/config.ts:341](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L341)
+Defined in: [types/config.ts:472](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L472)
 
 ---
 
@@ -42,7 +42,7 @@ Defined in: [types/config.ts:341](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **reason?**: `string`
 
-Defined in: [types/config.ts:342](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L342)
+Defined in: [types/config.ts:473](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L473)
 
 ---
 
@@ -50,4 +50,4 @@ Defined in: [types/config.ts:342](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **silent?**: `boolean`
 
-Defined in: [types/config.ts:343](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L343)
+Defined in: [types/config.ts:474](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L474)

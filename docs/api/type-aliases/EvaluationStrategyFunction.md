@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **EvaluationStrategyFunction** = (`options`, `result`, `config?`) => `Promise`\<\{ `evaluationResult`: [`EvaluationResult`](EvaluationResult.md); `evalContext`: [`EnhancedEvaluationContext`](EnhancedEvaluationContext.md); \}\>
 
-Defined in: [types/evaluation.ts:575](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/evaluation.ts#L575)
+Defined in: [types/evaluation.ts:570](https://github.com/juspay/neurolink/blob/release/src/lib/types/evaluation.ts#L570)
 
 Function that performs evaluation and returns results.
 
@@ -16,7 +16,7 @@ Function that performs evaluation and returns results.
 
 ### options
 
-`LanguageModelV3CallOptions`
+[`LanguageModelV3CallOptions`](LanguageModelV3CallOptions.md)
 
 ### result
 

@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **AbortSignalMiddlewareOptions** = `object`
 
-Defined in: [types/middleware.ts:344](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L344)
+Defined in: [types/middleware.ts:397](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L397)
 
 Options for the abort-signal middleware.
 
@@ -18,7 +18,7 @@ Options for the abort-signal middleware.
 
 > `optional` **onAbort?**: (`ctx`) => `void`
 
-Defined in: [types/middleware.ts:345](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L345)
+Defined in: [types/middleware.ts:398](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L398)
 
 #### Parameters
 
@@ -36,4 +36,4 @@ Defined in: [types/middleware.ts:345](https://github.com/juspay/neurolink/blob/f
 
 > `optional` **timeout?**: `number`
 
-Defined in: [types/middleware.ts:346](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L346)
+Defined in: [types/middleware.ts:399](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L399)

@@ -11,7 +11,7 @@ import {
   AnthropicModels,
   BedrockModels,
 } from "../constants/enums.js";
-import { API_KEY_LENGTHS, PROJECT_ID_FORMAT } from "./providerConfig.js";
+import { PROJECT_ID_FORMAT, satisfiesFallbacks } from "./providerConfig.js";
 import { basename } from "path";
 import { createProxyFetch } from "../proxy/proxyFetch.js";
 import type {
@@ -19,6 +19,8 @@ import type {
   ProviderHealthStatusOptions,
 } from "../types/index.js";
 import { DEFAULT_OLLAMA_MODEL } from "../providers/ollama/constants.js";
+import { ProviderFactory } from "../factories/providerFactory.js";
+import { PROVIDER_DESCRIPTORS } from "../factories/providerDescriptors.js";
 
 export class ProviderHealthChecker {
   private static healthCache = new Map<
@@ -259,62 +261,41 @@ export class ProviderHealthChecker {
         providerName,
       });
 
-      // Method 1: Check GOOGLE_APPLICATION_CREDENTIALS (file-based)
-      const credentialsFile = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-      let fileBasedAuthValid = false;
+      // Derive auth-var acceptance from the vertex descriptor instead of a
+      // hand-maintained var list, so this stays in sync with the real
+      // gating logic (hasGoogleCredentials() in googleVertex/client.ts and
+      // googleVertex/utils.ts): extraRequired.every(...) ||
+      // extraRequiredFallbacks.some(...), the same pattern used by
+      // hasProviderEnvVars() (providerUtils.ts), setup.ts, and
+      // environmentManager.ts. The old two-method check here only
+      // recognized GOOGLE_APPLICATION_CREDENTIALS or the
+      // GOOGLE_AUTH_CLIENT_EMAIL + GOOGLE_AUTH_PRIVATE_KEY pair — missing
+      // GOOGLE_SERVICE_ACCOUNT_KEY and, most importantly,
+      // GOOGLE_APPLICATION_CREDENTIALS_NEUROLINK, the descriptor's
+      // documented first-priority fallback. A user configured via that
+      // var alone had a fully working Vertex provider but was reported
+      // unhealthy here. Note: this is a presence-only check — it no
+      // longer verifies the GOOGLE_APPLICATION_CREDENTIALS file actually
+      // exists on disk (the old file-based method did via fs.access),
+      // matching the presence-only semantics already used by the other
+      // three callers of this pattern.
+      const descriptor = ProviderFactory.getDescriptor(AIProviderName.VERTEX);
+      const { extraRequired, extraRequiredFallbacks } =
+        descriptor?.envVars ?? {};
 
-      if (credentialsFile) {
-        logger.debug("Checking GOOGLE_APPLICATION_CREDENTIALS file");
+      const hasValidAuth =
+        (extraRequired ?? []).every((v) => !!process.env[v]) ||
+        satisfiesFallbacks(extraRequiredFallbacks, process.env);
 
-        try {
-          const { promises: fs } = await import("fs");
-          try {
-            await fs.access(credentialsFile);
-            fileBasedAuthValid = true;
-          } catch {
-            fileBasedAuthValid = false;
-          }
-          logger.debug("File auth check result", {
-            fileExists: fileBasedAuthValid,
-          });
-        } catch (error) {
-          logger.debug("File auth check error", {
-            error: String(error),
-          });
-          fileBasedAuthValid = false;
-        }
-      }
-
-      // Method 2: Check individual environment variables
-      const hasIndividualAuth = !!(
-        process.env.GOOGLE_AUTH_CLIENT_EMAIL &&
-        process.env.GOOGLE_AUTH_PRIVATE_KEY
-      );
-
-      logger.debug("Individual auth check", {
-        hasClientEmail: !!process.env.GOOGLE_AUTH_CLIENT_EMAIL,
-        hasPrivateKey: !!process.env.GOOGLE_AUTH_PRIVATE_KEY,
-        hasIndividualAuth,
-      });
-
-      // Vertex is valid if EITHER auth method works
-      const hasValidAuth = fileBasedAuthValid || hasIndividualAuth;
-
-      logger.debug("Vertex auth final result", {
-        fileBasedAuthValid,
-        hasIndividualAuth,
-        hasValidAuth,
-      });
+      logger.debug("Vertex auth final result", { hasValidAuth });
 
       if (hasValidAuth) {
         healthStatus.hasApiKey = true;
-        logger.debug("Vertex auth SUCCESS", {
-          authMethod: fileBasedAuthValid ? "file-based" : "individual-env-vars",
-        });
+        logger.debug("Vertex auth SUCCESS");
       } else {
         healthStatus.hasApiKey = false;
         healthStatus.configurationIssues.push(
-          `Vertex AI authentication not found: neither GOOGLE_APPLICATION_CREDENTIALS file nor individual credentials (GOOGLE_AUTH_CLIENT_EMAIL + GOOGLE_AUTH_PRIVATE_KEY) are properly configured`,
+          "Vertex AI authentication not found: set GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_APPLICATION_CREDENTIALS_NEUROLINK, GOOGLE_SERVICE_ACCOUNT_KEY, or both GOOGLE_AUTH_CLIENT_EMAIL and GOOGLE_AUTH_PRIVATE_KEY",
         );
         logger.debug("Vertex auth FAILED", {
           reason: "No valid auth method found",
@@ -508,119 +489,111 @@ export class ProviderHealthChecker {
   }
 
   /**
-   * Get required environment variables for a provider
+   * Get required environment variables for a provider.
+   *
+   * Returns `[]` for providers with `descriptor.credentialsResolvedExternally
+   * === true` (Vertex, Bedrock, LiteLLM) — the check in
+   * checkEnvironmentConfiguration() below ANDs every entry in the returned
+   * list together, which can't express Vertex's file-OR-individual-creds-
+   * OR-service-account auth, Bedrock's AWS SDK default provider chain
+   * (profile / IAM role, no env vars at all), or LiteLLM's documented
+   * zero-config local proxy. Their real requirement is validated by
+   * checkProviderSpecificConfig()'s dedicated per-provider checks instead.
+   * Naively deriving [apiKey, ...extraRequired] from the descriptor for
+   * these three (as for the other 27 providers) would make
+   * checkEnvironmentConfiguration() push a false "missing environment
+   * variables" issue — and therefore isHealthy=false — for legitimate
+   * fallback-based Vertex auth, AWS_PROFILE/IAM-role Bedrock auth, and
+   * unauthenticated local LiteLLM proxies. See hasProviderEnvVars() in
+   * providerUtils.ts for the equivalent OR-aware check used for
+   * auto-select gating. See `ProviderDescriptor.credentialsResolvedExternally`
+   * (types/providers.ts) for the field's full documentation.
    */
-  private static getRequiredEnvironmentVariables(
-    providerName: AIProviderName,
-  ): string[] {
-    switch (providerName) {
-      case AIProviderName.ANTHROPIC:
-        return ["ANTHROPIC_API_KEY"];
-      case AIProviderName.OPENAI:
-        return ["OPENAI_API_KEY"];
-      case AIProviderName.VERTEX:
-        // Vertex AI requires authentication, but not via a single environment variable.
-        // Authentication can be provided via a credential file or individual credentials + project.
-        // The required authentication is checked in checkProviderSpecificConfig instead of here.
-        // Returning an empty array here does NOT mean authentication is not required.
-        return [];
-      case AIProviderName.GOOGLE_AI:
-        return ["GOOGLE_AI_API_KEY"];
-      case AIProviderName.BEDROCK:
-        // Bedrock credentials are resolved via AWS SDK default provider chain.
-        // Region/auth validated in provider-specific checks.
-        return [];
-      case AIProviderName.AZURE:
-        return ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"];
-      case AIProviderName.LITELLM:
-        return [];
-      case AIProviderName.OLLAMA:
-        return []; // Ollama typically doesn't require API keys
-      default:
-        return [];
+  static getRequiredEnvironmentVariables(providerName: string): string[] {
+    // Resolve the descriptor FIRST so the field check below is keyed on
+    // the canonical, alias-resolved `descriptor.credentialsResolvedExternally`
+    // — not the raw, possibly-aliased `providerName` argument. Checking the
+    // raw input here would let documented aliases (e.g. "googleVertex" for
+    // vertex, "aws" for bedrock) skip the delegation and fall through to
+    // the naive [apiKey, ...extraRequired] derivation below, reproducing
+    // the exact false "missing environment variables" regression this
+    // field exists to prevent.
+    const descriptor = ProviderFactory.getDescriptor(providerName);
+    if (!descriptor) {
+      return [];
     }
+    if (descriptor.credentialsResolvedExternally) {
+      return [];
+    }
+    const { apiKey, extraRequired } = descriptor.envVars;
+    return [...(apiKey ? [apiKey] : []), ...(extraRequired ?? [])];
   }
 
   /**
-   * Get API key environment variable for a provider
+   * Get API key environment variable for a provider.
+   *
+   * Dead code at its sole call site today (checkApiKeyValidity() early-
+   * returns for VERTEX/OLLAMA/BEDROCK/LITELLM before reaching this), but
+   * now `static` (public) so a future direct caller is plausible — hence
+   * the two intentional diffs from the original hand-written switch are
+   * documented here rather than left silent:
+   *   - vertex: old switch returned "GOOGLE_APPLICATION_CREDENTIALS"
+   *     (one of several valid auth vars); the descriptor's `envVars.apiKey`
+   *     is "GOOGLE_CLOUD_PROJECT_ID" instead — the actual identity var for
+   *     the provider, not one specific credential-supply mechanism.
+   *   - ollama: old switch returned "OLLAMA_BASE_URL"; the descriptor has
+   *     no `envVars.apiKey` for ollama (it's a local, unauthenticated
+   *     runtime), so this now returns "".
+   * Both are kept deliberately (semantically truer identity vars) rather
+   * than reproduced byte-for-byte from the old switch.
    */
-  private static getApiKeyEnvironmentVariable(
-    providerName: AIProviderName,
-  ): string {
-    switch (providerName) {
-      case AIProviderName.ANTHROPIC:
-        return "ANTHROPIC_API_KEY";
-      case AIProviderName.OPENAI:
-        return "OPENAI_API_KEY";
-      case AIProviderName.VERTEX:
-        return "GOOGLE_APPLICATION_CREDENTIALS";
-      case AIProviderName.GOOGLE_AI:
-        return "GOOGLE_AI_API_KEY";
-      case AIProviderName.BEDROCK:
-        return "AWS_ACCESS_KEY_ID";
-      case AIProviderName.AZURE:
-        return "AZURE_OPENAI_API_KEY";
-      case AIProviderName.LITELLM:
-        return "LITELLM_API_KEY";
-      case AIProviderName.OLLAMA:
-        return "OLLAMA_BASE_URL";
-      default:
-        return "";
-    }
+  static getApiKeyEnvironmentVariable(providerName: string): string {
+    return ProviderFactory.getDescriptor(providerName)?.envVars.apiKey ?? "";
   }
 
   /**
    * Validate API key format for a provider
    */
-  private static validateApiKeyFormat(
-    providerName: AIProviderName,
-    apiKey: string,
-  ): boolean {
-    switch (providerName) {
-      case AIProviderName.ANTHROPIC:
-        return (
-          apiKey.startsWith("sk-ant-") &&
-          apiKey.length >= API_KEY_LENGTHS.ANTHROPIC_MIN
-        );
-      case AIProviderName.OPENAI:
-        return (
-          apiKey.startsWith("sk-") &&
-          apiKey.length >= API_KEY_LENGTHS.OPENAI_MIN
-        );
-      case AIProviderName.GOOGLE_AI:
-        return apiKey.length >= API_KEY_LENGTHS.GOOGLE_AI_EXACT; // Basic length check
-      case AIProviderName.VERTEX:
-        return apiKey.endsWith(".json") || apiKey.includes("type"); // JSON key format
-      case AIProviderName.BEDROCK:
-        return apiKey.length >= API_KEY_LENGTHS.AWS_ACCESS_KEY; // AWS access key length
-      case AIProviderName.AZURE:
-        return apiKey.length >= API_KEY_LENGTHS.AZURE_MIN; // Azure OpenAI API key length
-      case AIProviderName.LITELLM:
-        return apiKey.length > 0;
-      case AIProviderName.OLLAMA:
-        return true; // Ollama usually doesn't require specific format
-      default:
-        return true; // Default to true for unknown providers
+  static validateApiKeyFormat(providerName: string, apiKey: string): boolean {
+    // Vertex's "API key" is really a credentials file path (or an inline
+    // JSON blob via GOOGLE_SERVICE_ACCOUNT_KEY) — never governed by the
+    // shared API_KEY_FORMATS regexes. Preserved exactly from the original
+    // switch even though checkApiKeyValidity() early-returns before ever
+    // reaching this call for Vertex today; kept correct for any other/
+    // future caller.
+    if (providerName === AIProviderName.VERTEX) {
+      return apiKey.endsWith(".json") || apiKey.includes("type");
     }
+    const descriptor = ProviderFactory.getDescriptor(providerName);
+    if (!descriptor?.apiKeyFormatPattern) {
+      // Providers with no documented format (or local runtimes / providers
+      // usable with zero configuration) are accepted as-is — matches the
+      // old switch's per-provider `default: true`/no-format-check branches
+      // (ollama, litellm).
+      if (descriptor?.localRuntime || descriptor?.envVars.optional) {
+        return true;
+      }
+      return apiKey.length > 0;
+    }
+    return descriptor.apiKeyFormatPattern.test(apiKey);
   }
 
   /**
    * Get health check endpoint for connectivity testing
    */
-  private static getProviderHealthEndpoint(
-    providerName: AIProviderName,
-  ): string | null {
-    switch (providerName) {
-      case AIProviderName.ANTHROPIC:
-        return null; // Anthropic doesn't have a public health endpoint
+  static getProviderHealthEndpoint(providerName: string): string | null {
+    const descriptor = ProviderFactory.getDescriptor(providerName);
+    if (descriptor?.healthCheck !== "models-probe") {
+      return null;
+    }
+    // OpenAI/LiteLLM/Ollama each need a provider-specific URL builder that
+    // isn't pure descriptor data (LiteLLM/Ollama depend on the configured
+    // base URL) — keep the existing per-provider dispatch for the 3
+    // models-probe providers, now gated on the descriptor instead of a
+    // hardcoded name list.
+    switch (descriptor.name) {
       case AIProviderName.OPENAI:
         return "https://api.openai.com/v1/models";
-      case AIProviderName.GOOGLE_AI:
-        return null; // No public health endpoint
-      case AIProviderName.VERTEX:
-        return null; // Complex authentication required
-      case AIProviderName.BEDROCK:
-        return null; // AWS endpoints vary by region
       case AIProviderName.LITELLM:
         return this.getLiteLLMModelsUrl();
       case AIProviderName.OLLAMA:
@@ -709,7 +682,7 @@ export class ProviderHealthChecker {
     }
 
     if (!hasValidAuth) {
-      hasValidAuth = this.checkIndividualGoogleCredentials(healthStatus);
+      hasValidAuth = this.checkExtraRequiredFallbackCredentials(healthStatus);
     }
 
     if (!hasValidAuth) {
@@ -717,7 +690,7 @@ export class ProviderHealthChecker {
         "Google Cloud authentication not configured or credentials file missing",
       );
       healthStatus.recommendations.push(
-        "Set either GOOGLE_APPLICATION_CREDENTIALS (valid file path), GOOGLE_SERVICE_ACCOUNT_KEY (base64), or both GOOGLE_AUTH_CLIENT_EMAIL and GOOGLE_AUTH_PRIVATE_KEY",
+        "Set either GOOGLE_APPLICATION_CREDENTIALS (valid file path), GOOGLE_APPLICATION_CREDENTIALS_NEUROLINK, GOOGLE_SERVICE_ACCOUNT_KEY (base64), or both GOOGLE_AUTH_CLIENT_EMAIL and GOOGLE_AUTH_PRIVATE_KEY",
       );
     }
 
@@ -757,18 +730,26 @@ export class ProviderHealthChecker {
   }
 
   /**
-   * Check individual Google credentials
+   * Check Vertex's non-file auth fallbacks (GOOGLE_APPLICATION_CREDENTIALS_
+   * NEUROLINK, GOOGLE_SERVICE_ACCOUNT_KEY, or the GOOGLE_AUTH_CLIENT_EMAIL +
+   * GOOGLE_AUTH_PRIVATE_KEY pair) via the descriptor's extraRequiredFallbacks
+   * instead of a hand-maintained env-var list, so this stays in sync with
+   * the real gating logic (hasGoogleCredentials()) the same way
+   * checkApiKeyValidity()'s vertex branch does. The previous hand-rolled
+   * version only recognized GOOGLE_SERVICE_ACCOUNT_KEY or the email+key
+   * pair — missing GOOGLE_APPLICATION_CREDENTIALS_NEUROLINK, the
+   * descriptor's documented first-priority fallback.
    */
-  private static checkIndividualGoogleCredentials(
+  private static checkExtraRequiredFallbackCredentials(
     healthStatus: ProviderHealthStatusOptions,
   ): boolean {
-    const hasServiceAccountKey = !!process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
-    const hasIndividualCredentials = !!(
-      process.env.GOOGLE_AUTH_CLIENT_EMAIL &&
-      process.env.GOOGLE_AUTH_PRIVATE_KEY
+    const descriptor = ProviderFactory.getDescriptor(AIProviderName.VERTEX);
+    const hasValidAuth = satisfiesFallbacks(
+      descriptor?.envVars.extraRequiredFallbacks,
+      process.env,
     );
 
-    if (hasServiceAccountKey || hasIndividualCredentials) {
+    if (hasValidAuth) {
       healthStatus.hasApiKey = true;
       return true;
     }
@@ -1123,15 +1104,37 @@ export class ProviderHealthChecker {
       return;
     }
 
-    const availability = await this.checkLiteLLMAvailability({
-      model: this.getConfiguredLiteLLMModel(),
-      timeout,
-    });
+    // Only pin the availability check to a specific model when the user
+    // explicitly configured one. The fallback default ("openai/gpt-4o-mini")
+    // is a guess, not configuration — proxies that serve a different model
+    // set (every self-hosted gateway) were reported "Not configured" here
+    // while generate/stream against them worked fine with explicit models.
+    const configuredModel = process.env.LITELLM_MODEL;
+    let failureReason: string | undefined;
+    if (configuredModel) {
+      const availability = await this.checkLiteLLMAvailability({
+        model: configuredModel,
+        timeout,
+      });
+      if (!availability.available) {
+        failureReason = availability.reason ?? "unknown error";
+      }
+    } else {
+      // No configured model: a reachable proxy with any models counts.
+      try {
+        const models = await this.getLiteLLMAvailableModels(timeout);
+        if (models.length === 0) {
+          failureReason = "LiteLLM returned an empty model list";
+        }
+      } catch (error) {
+        failureReason = error instanceof Error ? error.message : String(error);
+      }
+    }
 
-    if (!availability.available) {
+    if (failureReason !== undefined) {
       healthStatus.isConfigured = false;
       healthStatus.configurationIssues.push(
-        `LiteLLM runtime check failed: ${availability.reason ?? "unknown error"}`,
+        `LiteLLM runtime check failed: ${failureReason}`,
       );
       healthStatus.recommendations.push(
         "Start the LiteLLM proxy and ensure the configured model is available from /v1/models",
@@ -1927,16 +1930,16 @@ export class ProviderHealthChecker {
    * Uses fast, cached health checks to avoid blocking initialization
    */
   static async getBestHealthyProvider(
-    preferredProviders: string[] = [
-      "litellm",
-      "ollama",
-      "openai",
-      "anthropic",
-      "vertex",
-      "google-ai",
-      "bedrock",
-      "azure",
-    ],
+    // Auto-select preference comes from the descriptors too — a SEPARATE
+    // ordering from the sweep (local/cheap runtimes first), carried by
+    // autoSelectPreference rather than defaultHealthSweepPriority.
+    preferredProviders: string[] = PROVIDER_DESCRIPTORS.filter(
+      (d) => d.autoSelectPreference !== undefined,
+    )
+      .sort(
+        (a, b) => (a.autoSelectPreference ?? 0) - (b.autoSelectPreference ?? 0),
+      )
+      .map((d) => d.name as string),
   ): Promise<string | null> {
     const healthStatuses = await this.checkAllProvidersHealth({
       includeConnectivityTest: false, // Quick config check only
@@ -1981,16 +1984,18 @@ export class ProviderHealthChecker {
   static async checkAllProvidersHealth(
     options: ProviderHealthCheckOptions = {},
   ): Promise<ProviderHealthStatusOptions[]> {
-    const providers: AIProviderName[] = [
-      AIProviderName.VERTEX,
-      AIProviderName.GOOGLE_AI,
-      AIProviderName.ANTHROPIC,
-      AIProviderName.OPENAI,
-      AIProviderName.BEDROCK,
-      AIProviderName.AZURE,
-      AIProviderName.LITELLM,
-      AIProviderName.OLLAMA,
-    ];
+    // Sweep membership and ORDER come from the descriptors. Order is
+    // behaviour: auto-select takes the first healthy provider, so the
+    // priority field, not the descriptor array's layout, decides preference.
+    const providers: AIProviderName[] = PROVIDER_DESCRIPTORS.filter(
+      (d) => d.defaultHealthSweepPriority !== undefined,
+    )
+      .sort(
+        (a, b) =>
+          (a.defaultHealthSweepPriority ?? 0) -
+          (b.defaultHealthSweepPriority ?? 0),
+      )
+      .map((d) => d.name);
 
     const healthChecks = providers.map((provider) =>
       this.checkProviderHealth(provider, options),

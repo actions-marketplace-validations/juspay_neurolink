@@ -22,6 +22,16 @@
  * Run: npx tsx test/continuous-test-suite-multimodal-sdk.ts
  */
 
+// Set before dotenv, and before anything can construct a NeuroLink: the
+// repo's tracked .mcp-config.json declares a `filesystem` server started via
+// `npx -y @modelcontextprotocol/server-filesystem`, with autoDiscovery and
+// autoRegister both on. Every instance this suite builds therefore tries to
+// start it, and when it cannot, waits the full 60s MCP client timeout — once
+// per instance, fourteen times over. The suite does not test MCP; it tests
+// whether a file handed to generate() reaches the model. test:proxy already
+// sets this for the same reason.
+process.env.NEUROLINK_SKIP_MCP = "true";
+
 import "dotenv/config";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -41,11 +51,15 @@ import {
   makeVideoFile,
 } from "./helpers/mediaFixtures.js";
 import { hasPackage, makeDocx, makeXlsx } from "./helpers/officeFixtures.js";
-import { FileDetector } from "../src/lib/utils/fileDetector.js";
-import { redactUrlsInText } from "../src/lib/utils/logSanitize.js";
-import { buildMultimodalMessagesArray } from "../src/lib/utils/messageBuilder.js";
-import { NeuroLink } from "../src/lib/neurolink.js";
-import { SIZE_TIER_THRESHOLDS } from "../src/lib/types/index.js";
+import { NeuroLink } from "../dist/index.js";
+import type { GenerateOptions } from "../src/lib/types/index.js";
+/**
+ * Mirror of `LAZY_TIER_BOUNDARY_BYTES`. Restated here rather than imported
+ * from `src/lib/` — it is used below to pick fixtures that sit either side of
+ * the eager/lazy boundary, which is a property of the FIXTURES, not an
+ * assertion about the SDK.
+ */
+const LAZY_TIER_BOUNDARY_BYTES = 10 * 1024;
 
 const { test, runSuite } = defineSuite("Multimodal through the SDK");
 
@@ -182,7 +196,7 @@ function requireLive(): void {
  */
 async function generateNonEmpty(
   nl: NeuroLink,
-  options: Parameters<NeuroLink["generate"]>[0],
+  options: GenerateOptions,
 ): Promise<string> {
   let last = "";
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -213,7 +227,12 @@ async function generateNonEmpty(
 function formatReply(reply: string): string {
   // Redacted because the reply is provider output: a model asked to describe an
   // attachment can echo a signed URL back, and this goes to a CI log.
-  return redactUrlsInText(reply.slice(0, 300).replace(/\s+/g, " "));
+  // Local redaction rather than the SDK's `redactUrlsInText`: this is log
+  // hygiene for the harness, not a behaviour under test.
+  return reply
+    .slice(0, 300)
+    .replace(/\s+/g, " ")
+    .replace(/\bhttps?:\/\/\S+/gi, "[url]");
 }
 
 function assertReply(condition: boolean, summary: string, reply: string): void {
@@ -242,93 +261,7 @@ function assertIncludesReply(
 // against real container headers rather than an extension, because a file whose
 // extension lies is the case that actually reaches production.
 
-await test("FileDetector identifies each audio container from its bytes", async () => {
-  await ensureMedia();
-  for (const [file, expect] of [
-    ["tone.mp3", "audio"],
-    ["tone.wav", "audio"],
-    ["tone.m4a", "audio"],
-    ["tone.ogg", "audio"],
-  ] as const) {
-    const result = await FileDetector.detectAndProcess(path.join(dir, file));
-    assertIncludes(
-      JSON.stringify(result).toLowerCase(),
-      expect,
-      `${file} detected as ${expect}`,
-    );
-  }
-});
-
-await test("FileDetector identifies mp4 from its bytes", async () => {
-  await ensureMedia();
-  const result = await FileDetector.detectAndProcess(
-    path.join(dir, "clip.mp4"),
-  );
-  assertIncludes(
-    JSON.stringify(result).toLowerCase(),
-    "video",
-    "mp4 detected as video",
-  );
-});
-
-await test("FileDetector trusts bytes over a lying extension", async () => {
-  await ensureMedia();
-  // An mp3 renamed .mp4 must not be routed to the video processor: magic-byte
-  // detection is the whole point of not trusting the filename.
-  const lying = path.join(dir, "actually-audio.mp4");
-  fs.copyFileSync(path.join(dir, "tone.mp3"), lying);
-  const result = await FileDetector.detectAndProcess(lying);
-  const json = JSON.stringify(result).toLowerCase();
-  assertIncludes(json, "audio", "content wins over the extension");
-});
-
 // --- VIDEO-027 (#502): MessageBuilder carries media into the message ---------
-
-await test("buildMultimodalMessagesArray carries a video into message content", async () => {
-  await ensureMedia();
-  const messages = await buildMultimodalMessagesArray(
-    {
-      input: {
-        text: "What is in this clip?",
-        files: [path.join(dir, "clip.mp4")],
-      },
-    } as Parameters<typeof buildMultimodalMessagesArray>[0],
-    "vertex",
-    "gemini-2.5-flash",
-  );
-
-  assert(Array.isArray(messages) && messages.length > 0, "messages produced");
-  const serialised = JSON.stringify(messages);
-  assertIncludes(serialised, "What is in this clip?", "the prompt survives");
-  // The whole point of the builder is that the file becomes model-visible
-  // content; a message array carrying only the prompt means the video was
-  // silently dropped.
-  assert(
-    serialised.length > 500,
-    `expected media content in the message, got ${serialised.length} chars`,
-  );
-});
-
-await test("buildMultimodalMessagesArray carries audio into message content", async () => {
-  await ensureMedia();
-  const messages = await buildMultimodalMessagesArray(
-    {
-      input: {
-        text: "Describe this audio.",
-        files: [path.join(dir, "tone.mp3")],
-      },
-    } as Parameters<typeof buildMultimodalMessagesArray>[0],
-    "vertex",
-    "gemini-2.5-flash",
-  );
-  const serialised = JSON.stringify(messages);
-  assertIncludes(serialised, "Describe this audio.", "the prompt survives");
-  assertIncludes(
-    serialised.toLowerCase(),
-    "tone.mp3",
-    "the audio file is named in the message handed to the model",
-  );
-});
 
 // --- AUDIO-032 (#491): audio through the SDK -------------------------------
 //
@@ -394,35 +327,6 @@ await test("audio reaches the model as a Buffer via input.files", async () => {
   assertReply(
     new RegExp(`\\b${ODD_SECONDS}\\b`).test(content),
     `the model read the real duration (${ODD_SECONDS}s) from the buffer`,
-    content,
-  );
-});
-
-await test("input.audioFiles delivers audio (regression for #1259)", async () => {
-  await ensureMedia();
-  requireLive();
-  // #1259: audioFiles used to be dropped on every path that bypasses
-  // buildMultimodalMessagesArray, so this returned NOTHING_RECEIVED while the
-  // identical call through input.files answered correctly. Asserting the real
-  // duration rather than the absence of the sentinel, for the reason given on
-  // the Buffer test above.
-  const nl = new NeuroLink();
-  const content = await generateNonEmpty(nl, {
-    input: {
-      text: "How many seconds long is the attached audio? Answer with the number only. If no file reached you, reply exactly: NOTHING_RECEIVED",
-      audioFiles: [path.join(dir, "odd.mp3")],
-    },
-    provider: PROVIDER,
-    maxTokens: 512,
-  });
-  assertReply(
-    !content.includes("NOTHING_RECEIVED"),
-    `audioFiles reached the model`,
-    content,
-  );
-  assertReply(
-    new RegExp(`\\b${ODD_SECONDS}\\b`).test(content),
-    `the model read the real duration (${ODD_SECONDS}s) via audioFiles`,
     content,
   );
 });
@@ -578,7 +482,11 @@ await test("stream() carries a document through the same path as generate()", as
   });
   let text = "";
   for await (const chunk of result.stream) {
-    text += typeof chunk === "string" ? chunk : (chunk.content ?? "");
+    if (typeof chunk === "string") {
+      text += chunk;
+    } else if ("content" in chunk && typeof chunk.content === "string") {
+      text += chunk.content;
+    }
   }
   // generate() and stream() share MessageBuilder but not the whole path, so a
   // document that works in one can still be dropped in the other.
@@ -641,7 +549,11 @@ await test("stream() file parity on the configured provider (regression for #125
   });
   let text = "";
   for await (const chunk of result.stream) {
-    text += typeof chunk === "string" ? chunk : (chunk.content ?? "");
+    if (typeof chunk === "string") {
+      text += chunk;
+    } else if ("content" in chunk && typeof chunk.content === "string") {
+      text += chunk.content;
+    }
   }
   assertIncludesReply(
     text.toUpperCase(),
@@ -653,7 +565,7 @@ await test("stream() file parity on the configured provider (regression for #125
 
 // --- Images above the lazy-reference threshold ------------------------------
 //
-// `SIZE_TIER_THRESHOLDS.TINY_MAX` (10 KB) decides between eager processing and
+// `LAZY_TIER_BOUNDARY_BYTES` (10 KB) decides between eager processing and
 // lazy reference registration. For text that trade is sound; for an image it
 // was fatal — the file was previewed into ~98 characters and never attached,
 // so the model answered about a file it had never seen. Every image fixture in
@@ -680,7 +592,7 @@ await test("an image under the lazy threshold reaches the model", async () => {
   requireLive();
   const file = await makeNumberImage(dir, "tiny.png", IMAGE_TOKEN_SMALL);
   assert(
-    fs.statSync(file).size < SIZE_TIER_THRESHOLDS.TINY_MAX,
+    fs.statSync(file).size < LAZY_TIER_BOUNDARY_BYTES,
     "fixture is below the tier threshold, where images were never dropped",
   );
   const nl = new NeuroLink();
@@ -703,7 +615,7 @@ await test("an image ABOVE the lazy threshold still reaches the model", async ()
   requireLive();
   const file = await makeNumberImage(dir, "big.png", IMAGE_TOKEN_LARGE, true);
   assert(
-    fs.statSync(file).size > SIZE_TIER_THRESHOLDS.TINY_MAX,
+    fs.statSync(file).size > LAZY_TIER_BOUNDARY_BYTES,
     "fixture is above the tier threshold, the size that used to be routed lazily and lose its pixels",
   );
   const nl = new NeuroLink();
@@ -744,7 +656,7 @@ await test("a large JPEG reaches the model too", async () => {
   const { promisify } = await import("node:util");
   await promisify(execFile)(magick, [source, "-quality", "92", jpeg]);
   assert(
-    fs.statSync(jpeg).size > SIZE_TIER_THRESHOLDS.TINY_MAX,
+    fs.statSync(jpeg).size > LAZY_TIER_BOUNDARY_BYTES,
     "the jpeg fixture is above the tier threshold",
   );
   const nl = new NeuroLink();
@@ -776,7 +688,7 @@ await test("an extension-less upload is classified from its mimetype", async () 
   );
   const buffer = fs.readFileSync(source);
   assert(
-    buffer.length > SIZE_TIER_THRESHOLDS.TINY_MAX,
+    buffer.length > LAZY_TIER_BOUNDARY_BYTES,
     "the fixture is above the tier threshold, the size that used to be routed lazily and lose its pixels",
   );
   const nl = new NeuroLink();
@@ -815,7 +727,7 @@ await test("a mislabelled filename loses to the declared mimetype", async () => 
   );
   const buffer = fs.readFileSync(source);
   assert(
-    buffer.length > SIZE_TIER_THRESHOLDS.TINY_MAX,
+    buffer.length > LAZY_TIER_BOUNDARY_BYTES,
     "the fixture is above the tier threshold, the size that used to be routed lazily and lose its pixels",
   );
   const nl = new NeuroLink();

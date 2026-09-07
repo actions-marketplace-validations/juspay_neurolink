@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **getAvailableProviders**(): `string`[]
 
-Defined in: [utils/providerUtils.ts:534](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/utils/providerUtils.ts#L534)
+Defined in: [utils/providerUtils.ts:460](https://github.com/juspay/neurolink/blob/release/src/lib/utils/providerUtils.ts#L460)
 
 Get available provider names
 

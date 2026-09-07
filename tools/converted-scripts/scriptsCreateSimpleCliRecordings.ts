@@ -42,7 +42,7 @@ async function run() {
   log_info("🔨 Building CLI...");
   try {
     execSync("pnpm run build:cli", { cwd: PROJECT_ROOT, stdio: "inherit" });
-  } catch (error: any) {
+  } catch {
     log_error("CLI build failed. Please check the build process.");
     process.exit(1);
   }
@@ -83,7 +83,9 @@ async function run() {
       `node ${CLI_PATH} generate '${rec.question}' --provider ${rec.provider}`;
     const title =
       rec.title ||
-      `NeuroLink - ${rec.provider.charAt(0).toUpperCase() + rec.provider.slice(1)} Provider Demo`;
+      (rec.provider
+        ? `NeuroLink - ${rec.provider.charAt(0).toUpperCase() + rec.provider.slice(1)} Provider Demo`
+        : "NeuroLink - Provider Demo");
 
     try {
       execSync(

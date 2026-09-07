@@ -14,10 +14,8 @@ import type {
   AuthValidateArgs,
   AuthHealthArgs,
 } from "../../lib/types/index.js";
-/**
- * Supported providers for authentication
- */
-const SUPPORTED_PROVIDERS = ["anthropic"] as const;
+/** Providers with first-class credential flows in `neurolink auth`. */
+const AUTH_LOGIN_PROVIDERS = ["anthropic", "codex"] as const;
 
 /**
  * Auth Command Factory
@@ -111,6 +109,52 @@ export class AuthCommandFactory {
             async (argv) => {
               const { handleEnable } = await import("../commands/auth.js");
               await handleEnable(argv as AuthCommandArgs);
+            },
+          )
+          .command(
+            "disable <account>",
+            "Take an account out of the proxy pool until re-enabled",
+            (yargs) => this.buildDisableOptions(yargs),
+            async (argv) => {
+              const { handleDisable } = await import("../commands/auth.js");
+              await handleDisable(argv as AuthCommandArgs);
+            },
+          )
+          .command(
+            "cooldown <action> [account]",
+            "Inspect or clear per-account rate-limit cooldowns",
+            (yargs) =>
+              this.buildCooldownClearOptions(
+                yargs.positional("action", {
+                  type: "string",
+                  choices: ["list", "clear"] as const,
+                  description: "list cooldowns, or clear one/all",
+                  demandOption: true,
+                }),
+              ),
+            async (argv) => {
+              const { handleCooldown } = await import("../commands/auth.js");
+              await handleCooldown(argv as AuthCommandArgs);
+            },
+          )
+          .command(
+            "overage [action]",
+            "Show or set whether the pool may spend paid extra usage",
+            (yargs) =>
+              yargs
+                .positional("action", {
+                  type: "string",
+                  choices: ["status", "auto", "always", "never"] as const,
+                  default: "status",
+                  description: "Policy to apply, or 'status' to show it",
+                })
+                .option("config", {
+                  type: "string",
+                  description: "Path to the proxy config YAML",
+                }),
+            async (argv) => {
+              const { handleOverage } = await import("../commands/auth.js");
+              await handleOverage(argv as AuthCommandArgs);
             },
           )
           .command(
@@ -264,7 +308,7 @@ export class AuthCommandFactory {
       .positional("provider", {
         type: "string",
         description: "AI provider to authenticate with",
-        choices: SUPPORTED_PROVIDERS,
+        choices: AUTH_LOGIN_PROVIDERS,
         demandOption: true,
       })
       .option("method", {
@@ -319,7 +363,7 @@ export class AuthCommandFactory {
       .positional("provider", {
         type: "string",
         description: "AI provider to log out from",
-        choices: SUPPORTED_PROVIDERS,
+        choices: AUTH_LOGIN_PROVIDERS,
         demandOption: true,
       })
       .example("$0 auth logout anthropic", "Clear all Anthropic credentials");
@@ -334,7 +378,7 @@ export class AuthCommandFactory {
         type: "string",
         description:
           "AI provider to check (optional, shows all if not specified)",
-        choices: SUPPORTED_PROVIDERS,
+        choices: AUTH_LOGIN_PROVIDERS,
       })
       .example("$0 auth status", "Show status for all configured providers")
       .example(
@@ -352,7 +396,7 @@ export class AuthCommandFactory {
       .positional("provider", {
         type: "string",
         description: "AI provider to refresh tokens for",
-        choices: SUPPORTED_PROVIDERS,
+        choices: AUTH_LOGIN_PROVIDERS,
         demandOption: true,
       })
       .example("$0 auth refresh anthropic", "Refresh Anthropic OAuth tokens");
@@ -363,8 +407,18 @@ export class AuthCommandFactory {
    */
   private static buildListOptions(yargs: Argv): Argv {
     return yargs
+      .option("refresh", {
+        type: "boolean",
+        default: false,
+        description:
+          "Refresh available provider limits for authenticated accounts; show unsupported providers explicitly",
+      })
       .example("$0 auth list", "List all authenticated accounts")
-      .example("$0 auth list --format json", "List accounts in JSON format");
+      .example("$0 auth list --format json", "List accounts in JSON format")
+      .example(
+        "$0 auth list --refresh",
+        "Fetch fresh session/weekly/model-scoped limits before listing",
+      );
   }
 
   /**
@@ -374,8 +428,7 @@ export class AuthCommandFactory {
     return yargs
       .positional("provider", {
         type: "string",
-        description: "AI provider to remove account from",
-        choices: SUPPORTED_PROVIDERS,
+        description: "Provider namespace to remove an account from",
         demandOption: true,
       })
       .option("label", {
@@ -438,6 +491,66 @@ export class AuthCommandFactory {
         "$0 auth enable anthropic:1-VjRIq",
         "Re-enable a disabled account",
       );
+  }
+
+  /**
+   * Build options for disable subcommand
+   */
+  private static buildDisableOptions(yargs: Argv): Argv {
+    return yargs
+      .positional("account", {
+        type: "string",
+        description: "Account key to disable (e.g., anthropic:1-VjRIq)",
+        demandOption: true,
+      })
+      .option("reason", {
+        type: "string",
+        description: "Why the account is being disabled (shown in auth list)",
+      })
+      .example(
+        "$0 auth disable anthropic:1-VjRIq",
+        "Take an account out of the proxy pool",
+      );
+  }
+
+  /**
+   * Build options for the cooldown subcommands
+   */
+  private static buildCooldownClearOptions(yargs: Argv): Argv {
+    return (
+      yargs
+        .positional("account", {
+          type: "string",
+          description: "Account key whose cooldown should be cleared",
+        })
+        .option("all", {
+          type: "boolean",
+          default: false,
+          description: "Clear cooldowns for every account",
+        })
+        .example(
+          "$0 auth cooldown clear anthropic:1-VjRIq",
+          "Return a parked account to the pool immediately",
+        )
+        // Reject a scope the handler cannot honour rather than silently picking
+        // one. `--all` beats a named account there, so `clear <account> --all`
+        // would wipe every cooldown while reading as a single-account command.
+        .check((argv) => {
+          const action = String(argv.action ?? "");
+          const account = argv.account ? String(argv.account) : undefined;
+          if (action === "clear" && account && argv.all === true) {
+            throw new Error(
+              "Pass an account or --all, not both: --all clears every cooldown.",
+            );
+          }
+          if (action === "list" && (account || argv.all === true)) {
+            throw new Error(
+              "`auth cooldown list` takes no account and no --all; it lists every cooling account.",
+            );
+          }
+          return true;
+        })
+    );
   }
 
   /**

@@ -63,6 +63,10 @@ import type {
   VideoProcessorOptions,
 } from "../../types/index.js";
 import { SIZE_LIMITS_MB } from "../config/index.js";
+import {
+  extensionsForModality,
+  mimeTypesForModality,
+} from "../config/fileTypeRegistry.js";
 import { FileErrorCode } from "../errors/index.js";
 import { tracers, ATTR, withSpan } from "../../telemetry/index.js";
 import { logger } from "../../utils/logger.js";
@@ -123,6 +127,40 @@ async function loadMediaBunny() {
     "Video processing",
   );
   return _mediabunny;
+}
+
+// Keyframe resize (both extraction paths) previously swallowed a missing
+// `sharp` with a fully silent per-frame catch — every frame failed the same
+// way and nothing ever said why. Route the import through this loader so the
+// cause is logged once (not once per frame) the first time it fails; the
+// per-frame catch sites still skip individually, matching prior behavior.
+let sharpLoadWarned = false;
+async function loadSharp() {
+  try {
+    // `typeof import("sharp")` is the MODULE namespace, and sharp 0.35 puts
+    // the callable factory on its `default` export. Typing the import as
+    // `{ default: typeof import("sharp") }` wrapped that namespace a second
+    // time, so `mod.default` came back as a namespace rather than a factory
+    // and every call site failed with "no call signatures".
+    //
+    // imageFormatSupport.ts already reads `sharpModule.default(...)` for the
+    // same reason; this loader is now the one place that normalizes it, so
+    // callers keep calling the returned value directly.
+    const mod = await tryImport<typeof import("sharp")>(
+      "sharp",
+      "Video keyframe resizing",
+    );
+    return mod.default;
+  } catch (error) {
+    if (!sharpLoadWarned) {
+      sharpLoadWarned = true;
+      logger.warn(
+        "[VideoProcessor] sharp is required to resize extracted keyframes but failed to load; keyframe extraction will return no frames",
+        { error: error instanceof Error ? error.message : String(error) },
+      );
+    }
+    throw error;
+  }
 }
 
 // =============================================================================
@@ -207,39 +245,19 @@ const VIDEO_CONFIG = {
   FFPROBE_TIMEOUT_MS: 10_000,
 } as const;
 
-/** Supported video MIME types */
-const SUPPORTED_VIDEO_MIME_TYPES = [
-  "video/mp4",
-  "video/x-matroska",
-  "video/quicktime",
-  "video/webm",
-  "video/x-msvideo",
-  "video/x-ms-wmv",
-  "video/x-flv",
-  "video/3gpp",
-  "video/3gpp2",
-  "video/MP2T",
-  "video/ogg",
-] as const;
+/**
+ * Supported video MIME types — derived from the canonical registry so this
+ * processor and the detector in front of it cannot disagree about what "video"
+ * means. Before the registry they did: .m2ts, .mts, .vob, .3g2 and .ogv were
+ * declared supported here and detected as "unknown", and .mpg/.mpeg were
+ * detected as CSV.
+ */
+const SUPPORTED_VIDEO_MIME_TYPES: readonly string[] =
+  mimeTypesForModality("video");
 
-/** Supported video file extensions */
-const SUPPORTED_VIDEO_EXTENSIONS = [
-  ".mp4",
-  ".m4v",
-  ".mkv",
-  ".mov",
-  ".avi",
-  ".wmv",
-  ".flv",
-  ".webm",
-  ".3gp",
-  ".3g2",
-  ".ts",
-  ".mts",
-  ".m2ts",
-  ".ogv",
-  ".vob",
-] as const;
+/** Supported video file extensions — derived from the canonical registry. */
+const SUPPORTED_VIDEO_EXTENSIONS: readonly string[] =
+  extensionsForModality("video");
 
 /**
  * Maximum video file size in MB.
@@ -886,7 +904,7 @@ export class VideoProcessor extends BaseFileProcessor<ProcessedVideo> {
         const rawFrame = await fs.readFile(framePath);
 
         // Resize to fit within max dimension while preserving aspect ratio
-        const sharp = (await import("sharp")).default;
+        const sharp = await loadSharp();
         const pipeline = sharp(rawFrame).resize(
           VIDEO_CONFIG.FRAME_MAX_DIMENSION,
           VIDEO_CONFIG.FRAME_MAX_DIMENSION,
@@ -1307,7 +1325,7 @@ export class VideoProcessor extends BaseFileProcessor<ProcessedVideo> {
         try {
           await fs.access(framePath);
           const rawFrame = await fs.readFile(framePath);
-          const sharp = (await import("sharp")).default;
+          const sharp = await loadSharp();
           const resized = await sharp(rawFrame)
             .resize(
               VIDEO_CONFIG.FRAME_MAX_DIMENSION,

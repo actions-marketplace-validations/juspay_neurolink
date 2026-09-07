@@ -8,6 +8,7 @@ import { createProxyFetch } from "../../proxy/proxyFetch.js";
 import type {
   OpenAICompatBuildBodyArgs,
   OpenAICompatStreamLifecycleListeners,
+  ProviderErrorRule,
   UnknownRecord,
 } from "../../types/index.js";
 import {
@@ -20,13 +21,17 @@ import {
   isModelAccessDeniedMessage,
   parseAllowedModels,
 } from "../../types/index.js";
+import {
+  classifyProviderError,
+  DEFAULT_ERROR_RULES,
+} from "../../utils/errorClassifier.js";
 import { isAbortError } from "../../utils/errorHandling.js";
 import { logger } from "../../utils/logger.js";
 import { redactUrlCredentials } from "../../utils/logSanitize.js";
 import { isGemini25Model as isCanonicalGemini25Model } from "../../utils/modelDetection.js";
 import { calculateCost } from "../../utils/pricing.js";
 import { getProviderModel } from "../../utils/providerConfig.js";
-import { createTimeoutController, TimeoutError } from "../../utils/timeout.js";
+import { createTimeoutController } from "../../utils/timeout.js";
 import { stripTrailingSlash } from "../openaiChatCompletionsClient.js";
 import { OpenAIChatCompletionsProvider } from "../openaiChatCompletionsBase.js";
 
@@ -335,6 +340,21 @@ export class LiteLLMProvider extends OpenAIChatCompletionsProvider {
   }
 
   /**
+   * generate() rides the SSE wire for LiteLLM: deployments commonly sit
+   * behind proxies/tunnels (e.g. Cloudflare, which 524s an origin that is
+   * silent for ~100s), and a non-streaming completion from a slow model
+   * sends nothing until it is fully done. Streaming keeps bytes flowing for
+   * the whole generation while the base class aggregates into the same
+   * complete result — structuredData coercion, tool calls, stopReason,
+   * usage and the JSON damage flags are unchanged for callers.
+   * Escape hatch: NEUROLINK_LITELLM_SSE_GENERATE=false restores the plain
+   * JSON wire.
+   */
+  protected useStreamingWireForGenerate(): boolean {
+    return process.env.NEUROLINK_LITELLM_SSE_GENERATE !== "false";
+  }
+
+  /**
    * Gemini 2.5 models on LiteLLM have a known compatibility issue with
    * `max_tokens` — strip it before the wire body is built. Applies to
    * both streaming and non-streaming paths.
@@ -421,80 +441,75 @@ export class LiteLLMProvider extends OpenAIChatCompletionsProvider {
   }
 
   public formatProviderError(error: unknown): Error {
-    if (error instanceof TimeoutError) {
-      return new NetworkError(
-        `Request timed out: ${error.message}`,
-        this.providerName,
-      );
-    }
-
+    // Curator P1-1: detect "team not allowed to access model" responses and
+    // surface as ModelAccessDeniedError with the allowed_models array parsed
+    // from the body. Must run before classification (not just before the
+    // "API key" rule) because ModelAccessDeniedError's constructor takes an
+    // `{ provider, requestedModel, allowedModels }` options object rather
+    // than the `(message, provider?)` shape ProviderErrorRule expects, so it
+    // can't be expressed as a declarative rule. No realistic overlap with the
+    // timeout/ECONNREFUSED checks below (disjoint wording), so running this
+    // first is behaviorally identical to the original nesting order.
     const errorRecord = error as UnknownRecord;
     if (
-      errorRecord?.name === "TimeoutError" ||
-      (typeof errorRecord?.message === "string" &&
-        errorRecord.message.toLowerCase().includes("timeout"))
+      typeof errorRecord?.message === "string" &&
+      isModelAccessDeniedMessage(errorRecord.message)
     ) {
-      return new NetworkError(
-        `Request timed out: ${errorRecord?.message || "Unknown timeout"}`,
-        this.providerName,
-      );
+      return new ModelAccessDeniedError(errorRecord.message, {
+        provider: this.providerName,
+        requestedModel: this.modelName,
+        allowedModels: parseAllowedModels(errorRecord.message),
+      });
     }
-    if (typeof errorRecord?.message === "string") {
-      if (
-        errorRecord.message.includes("ECONNREFUSED") ||
-        errorRecord.message.includes("Failed to fetch")
-      ) {
-        return new NetworkError(
+
+    const rules: ProviderErrorRule[] = [
+      // Duck-typed timeout detection (name === "TimeoutError" OR message
+      // contains "timeout") distinct from the `instanceof TimeoutError` check
+      // classifyProviderError already performs first — preserved because
+      // some rejection paths produce a plain object/Error with that shape
+      // rather than a real TimeoutError instance.
+      {
+        match: (ctx) =>
+          ctx.errorName === "TimeoutError" || /timeout/i.test(ctx.message),
+        errorClass: NetworkError,
+        message: (ctx) => `Request timed out: ${ctx.message}`,
+      },
+      {
+        match: (ctx) => /ECONNREFUSED|Failed to fetch/.test(ctx.message),
+        errorClass: NetworkError,
+        // Name the base URL this instance actually dialed — per-request
+        // credentials can override LITELLM_BASE_URL, and an error pointing
+        // at the env value sends the caller debugging the wrong host.
+        message: () =>
           "LiteLLM proxy server not available. Please start the LiteLLM proxy server at " +
-            `${process.env.LITELLM_BASE_URL || "http://localhost:4000"}`,
-          this.providerName,
-        );
-      }
-
-      // Curator P1-1: detect "team not allowed to access model" responses and
-      // surface as ModelAccessDeniedError with the allowed_models array parsed
-      // from the body. Must run before the generic "API key" check because
-      // LiteLLM phrases this as a 403 distinct from auth.
-      if (isModelAccessDeniedMessage(errorRecord.message)) {
-        return new ModelAccessDeniedError(errorRecord.message, {
-          provider: this.providerName,
-          requestedModel: this.modelName,
-          allowedModels: parseAllowedModels(errorRecord.message),
-        });
-      }
-
-      if (
-        errorRecord.message.includes("API_KEY_INVALID") ||
-        errorRecord.message.includes("Invalid API key")
-      ) {
-        return new AuthenticationError(
+          redactUrlCredentials(this.config.baseURL),
+      },
+      {
+        match: (ctx) => /API_KEY_INVALID|Invalid API key/.test(ctx.message),
+        errorClass: AuthenticationError,
+        message:
           "Invalid LiteLLM configuration. Please check your LITELLM_API_KEY environment variable.",
-          this.providerName,
-        );
-      }
-
-      if (errorRecord.message.toLowerCase().includes("rate limit")) {
-        return new RateLimitError(
-          "LiteLLM rate limit exceeded. Please try again later.",
-          this.providerName,
-        );
-      }
-
-      if (
-        errorRecord.message.toLowerCase().includes("model") &&
-        errorRecord.message.toLowerCase().includes("not found")
-      ) {
-        return new InvalidModelError(
+      },
+      {
+        match: (ctx) => /rate limit/i.test(ctx.message),
+        errorClass: RateLimitError,
+        message: "LiteLLM rate limit exceeded. Please try again later.",
+      },
+      {
+        match: (ctx) =>
+          /model/i.test(ctx.message) && /not found/i.test(ctx.message),
+        errorClass: InvalidModelError,
+        message: () =>
           `Model '${this.modelName}' not available in LiteLLM proxy. ` +
-            "Please check your LiteLLM configuration and ensure the model is configured.",
-          this.providerName,
-        );
-      }
-    }
-
-    return new ProviderError(
-      `LiteLLM error: ${errorRecord?.message || "Unknown error"}`,
+          "Please check your LiteLLM configuration and ensure the model is configured.",
+      },
+      ...DEFAULT_ERROR_RULES,
+    ];
+    return classifyProviderError(
+      error,
+      rules,
       this.providerName,
+      this.modelName,
     );
   }
 
@@ -536,7 +551,12 @@ export class LiteLLMProvider extends OpenAIChatCompletionsProvider {
   }
 
   private async fetchModelsFromAPI(): Promise<string[]> {
-    const modelsUrl = `${stripTrailingSlash(this.config.baseURL)}/v1/models`;
+    // Tolerate a `/v1`-suffixed base URL. Chat appends /chat/completions, so
+    // deployments are commonly configured with base = https://host/v1 — but
+    // appending /v1/models to that yields /v1/v1/models, which LiteLLM 404s,
+    // and discovery silently degrades to the hardcoded fallback list.
+    const root = stripTrailingSlash(this.config.baseURL).replace(/\/v1$/, "");
+    const modelsUrl = `${root}/v1/models`;
     const proxyFetch = createProxyFetch();
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);

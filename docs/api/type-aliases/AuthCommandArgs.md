@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **AuthCommandArgs** = [`BaseCommandArgs`](BaseCommandArgs.md) & `object`
 
-Defined in: [types/cli.ts:985](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L985)
+Defined in: [types/cli.ts:1091](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1091)
 
 Auth command arguments interface
 
@@ -53,6 +53,42 @@ Auth command arguments interface
 ### force?
 
 > `optional` **force?**: `boolean`
+
+### refresh?
+
+> `optional` **refresh?**: `boolean`
+
+`auth list --refresh`: fetch fresh provider limits before listing
+
+### config?
+
+> `optional` **config?**: `string`
+
+Path to the proxy config YAML, used by set-/get-/clear-primary
+
+### email?
+
+> `optional` **email?**: `string`
+
+Email passed to `auth set-primary <email>`
+
+### reason?
+
+> `optional` **reason?**: `string`
+
+Why an account is being disabled, recorded by `auth disable`
+
+### action?
+
+> `optional` **action?**: `string`
+
+Subcommand verb for `auth cooldown <action>`
+
+### all?
+
+> `optional` **all?**: `boolean`
+
+`auth cooldown clear --all`
 
 ### \_?
 

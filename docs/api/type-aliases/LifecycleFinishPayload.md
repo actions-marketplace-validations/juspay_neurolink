@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **LifecycleFinishPayload** = `object`
 
-Defined in: [types/middleware.ts:279](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L279)
+Defined in: [types/middleware.ts:304](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L304)
 
 Payload delivered to onFinish callbacks after generation or streaming completes.
 
@@ -18,7 +18,7 @@ Payload delivered to onFinish callbacks after generation or streaming completes.
 
 > **text**: `string`
 
-Defined in: [types/middleware.ts:281](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L281)
+Defined in: [types/middleware.ts:306](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L306)
 
 The generated text content
 
@@ -28,7 +28,7 @@ The generated text content
 
 > `optional` **usage?**: `object`
 
-Defined in: [types/middleware.ts:283](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L283)
+Defined in: [types/middleware.ts:308](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L308)
 
 Token usage from the provider
 
@@ -46,7 +46,7 @@ Token usage from the provider
 
 > **duration**: `number`
 
-Defined in: [types/middleware.ts:285](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L285)
+Defined in: [types/middleware.ts:310](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L310)
 
 Wall-clock duration in milliseconds
 
@@ -56,6 +56,6 @@ Wall-clock duration in milliseconds
 
 > `optional` **finishReason?**: `string`
 
-Defined in: [types/middleware.ts:287](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L287)
+Defined in: [types/middleware.ts:312](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L312)
 
 Why generation stopped

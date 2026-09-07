@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **MCPEnhancementsConfig** = `object`
 
-Defined in: [types/config.ts:101](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L101)
+Defined in: [types/config.ts:198](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L198)
 
 Configuration for MCP enhancement modules wired into generate()/stream() paths.
 
@@ -27,7 +27,7 @@ These modules are automatically applied during tool execution when configured:
 
 > `optional` **cache?**: `object`
 
-Defined in: [types/config.ts:103](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L103)
+Defined in: [types/config.ts:200](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L200)
 
 Tool result caching. Default: enabled. Set enabled: false to opt out.
 
@@ -59,7 +59,7 @@ Eviction strategy. Default: 'lru'
 
 > `optional` **annotations?**: `object`
 
-Defined in: [types/config.ts:113](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L113)
+Defined in: [types/config.ts:210](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L210)
 
 Tool annotation auto-inference. Default: enabled.
 
@@ -79,7 +79,7 @@ Auto-infer annotations from tool name/description. Default: true
 
 > `optional` **router?**: `object`
 
-Defined in: [types/config.ts:119](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L119)
+Defined in: [types/config.ts:216](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L216)
 
 Tool routing for multi-server environments. Auto-activates when 2+ external servers exist.
 
@@ -105,7 +105,7 @@ Enable session affinity. Default: false
 
 > `optional` **batcher?**: `object`
 
-Defined in: [types/config.ts:127](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L127)
+Defined in: [types/config.ts:224](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L224)
 
 Request batching for programmatic executeTool() calls. Default: disabled.
 
@@ -131,7 +131,7 @@ Max wait before flushing batch in ms. Default: 100
 
 > `optional` **discovery?**: `object`
 
-Defined in: [types/config.ts:135](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L135)
+Defined in: [types/config.ts:232](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L232)
 
 Enhanced tool discovery. Default: enabled.
 
@@ -145,7 +145,7 @@ Enhanced tool discovery. Default: enabled.
 
 > `optional` **middleware?**: [`ToolMiddleware`](ToolMiddleware.md)[]
 
-Defined in: [types/config.ts:139](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L139)
+Defined in: [types/config.ts:236](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L236)
 
 Global tool middleware applied to every tool execution. Default: empty.
 
@@ -155,7 +155,7 @@ Global tool middleware applied to every tool execution. Default: empty.
 
 > `optional` **outputLimits?**: `object`
 
-Defined in: [types/config.ts:165](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L165)
+Defined in: [types/config.ts:262](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L262)
 
 Large MCP tool output handling.
 

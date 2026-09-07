@@ -74,6 +74,8 @@ import {
   log,
   logSection,
   type ColorName,
+  withCaseTimeout,
+  isCaseTimeout,
 } from "./helpers/harness.js";
 
 const { recordTest, runSuite } = defineSuite("Media Gen");
@@ -1509,10 +1511,9 @@ async function testVideoGenerationVertexAI(): Promise<boolean | null> {
 
 import { NeuroLink } from '${process.cwd()}/dist/index.js';
 
-import { assertDistFresh } from "./helpers/distFreshness.js";
-
-// Fail loudly rather than silently testing a stale build (see distFreshness.ts).
-assertDistFresh();
+// No freshness check here: this script runs from a temp directory with no
+// ./helpers to import it from, and the parent suite already ran
+// assertDistFresh() against the same dist before writing this file.
 
 async function testVideoGenerationVertexAI() {
   console.log('Testing video generation via Vertex AI generate()...');
@@ -2251,7 +2252,7 @@ async function runAllTests(): Promise<void> {
 
   for (const test of tests) {
     try {
-      const result = await test.fn();
+      const result = await withCaseTimeout(test.name, test.fn);
       recordTest(
         test.name,
         result === true,
@@ -2261,6 +2262,19 @@ async function runAllTests(): Promise<void> {
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       recordTest(test.name, false, false, msg);
+
+      // A case bound is not an ordinary failure: Promise.race cannot cancel, so
+      // the abandoned case is still running. Continuing would run the loop's
+      // cleanup and inter-case delay underneath live work, and record every
+      // remaining case as "not run". Stop at the first one.
+      if (isCaseTimeout(error)) {
+        log(
+          `\n\u{1F6D1} ABORTING: "${test.name}" was abandoned by its timeout and is still executing. ` +
+            `Remaining cases are NOT run — this process no longer has clean state.`,
+          "red",
+        );
+        break;
+      }
     }
     await globalCleanup();
     await new Promise((r) => setTimeout(r, TEST_CONFIG.interTestDelay));

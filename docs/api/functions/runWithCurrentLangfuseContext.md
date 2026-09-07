@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **runWithCurrentLangfuseContext**\<`T`\>(`fn`): () => `Promise`\<`T`\>
 
-Defined in: [services/server/ai/observability/instrumentation.ts:1480](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/services/server/ai/observability/instrumentation.ts#L1480)
+Defined in: [services/server/ai/observability/instrumentation.ts:1515](https://github.com/juspay/neurolink/blob/release/src/lib/services/server/ai/observability/instrumentation.ts#L1515)
 
 Capture the current Langfuse AsyncLocalStorage context and return a wrapper
 that re-enters that context when executing the provided callback.

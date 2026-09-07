@@ -18,6 +18,8 @@
  */
 
 import * as fs from "fs";
+import { withCaseTimeout } from "./helpers/harness.js";
+
 import * as path from "path";
 import { fileURLToPath } from "url";
 import { execFileSync } from "child_process";
@@ -229,7 +231,7 @@ async function runTest(
 ): Promise<TestResult> {
   const startTime = Date.now();
   try {
-    await testFn();
+    await withCaseTimeout(name, testFn);
     const duration = Date.now() - startTime;
     logTest(name, "PASS", `(${duration}ms)`);
     return { name, status: "PASS", duration };
@@ -1156,7 +1158,7 @@ async function testIntegration(): Promise<TestSuiteResult> {
   let MessageBusCtor: MessageBusClass | undefined;
 
   try {
-    const mod = await import("../src/lib/agent/agent.js");
+    const mod = await import("../dist/index.js");
     AgentCtor = mod.Agent as unknown as AgentClass;
     logDebug("Imported Agent class");
   } catch (e) {
@@ -1173,7 +1175,7 @@ async function testIntegration(): Promise<TestSuiteResult> {
   }
 
   try {
-    const mod = await import("../src/lib/agent/agentNetwork.js");
+    const mod = await import("../dist/index.js");
     AgentNetworkCtor = mod.AgentNetwork as unknown as AgentNetworkClass;
     logDebug("Imported AgentNetwork class");
   } catch (e) {
@@ -1190,7 +1192,7 @@ async function testIntegration(): Promise<TestSuiteResult> {
   }
 
   try {
-    const mod = await import("../src/lib/agent/communication/message-bus.js");
+    const mod = await import("../dist/index.js");
     MessageBusCtor = mod.MessageBus as unknown as MessageBusClass;
     logDebug("Imported MessageBus class");
   } catch (e) {

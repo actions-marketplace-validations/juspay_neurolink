@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **HITLExecutionState** = `object`
 
-Defined in: [types/hitl.ts:318](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/hitl.ts#L318)
+Defined in: [types/hitl.ts:321](https://github.com/juspay/neurolink/blob/release/src/lib/types/hitl.ts#L321)
 
 ## Properties
 
@@ -16,4 +16,4 @@ Defined in: [types/hitl.ts:318](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **triggered**: `boolean`
 
-Defined in: [types/hitl.ts:319](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/hitl.ts#L319)
+Defined in: [types/hitl.ts:322](https://github.com/juspay/neurolink/blob/release/src/lib/types/hitl.ts#L322)

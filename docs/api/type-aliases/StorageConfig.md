@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -6,6 +6,13 @@
 
 # Type Alias: StorageConfig
 
-> **StorageConfig** = `StorageConfig`
+> **StorageConfig** = [`HippocampusStorageConfig`](HippocampusStorageConfig.md)
 
-Defined in: [types/conversation.ts:39](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L39)
+Defined in: [types/conversation.ts:67](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L67)
+
+Legacy public alias for the Hippocampus storage configuration.
+The structural definition lives in `./memory.ts`; this re-export keeps
+the SDK surface stable for callers who imported `StorageConfig` from
+the package barrel. Defined as a `type` alias rather than a re-export
+so the canonical `HippocampusStorageConfig` name is the one ESLint
+uniqueness checks see.

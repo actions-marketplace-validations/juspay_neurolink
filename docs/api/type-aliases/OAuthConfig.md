@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **OAuthConfig** = `object`
 
-Defined in: [types/subscription.ts:605](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L605)
+Defined in: [types/subscription.ts:688](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L688)
 
 OAuth configuration for Claude subscription authentication
 
@@ -23,7 +23,7 @@ Used to configure the OAuth client for subscription-based access.
 
 > **clientId**: `string`
 
-Defined in: [types/subscription.ts:610](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L610)
+Defined in: [types/subscription.ts:693](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L693)
 
 OAuth client ID for the application
 
@@ -37,7 +37,7 @@ Obtained from Anthropic developer console
 
 > **redirectUri**: `string`
 
-Defined in: [types/subscription.ts:616](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L616)
+Defined in: [types/subscription.ts:699](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L699)
 
 OAuth redirect URI for the callback
 
@@ -51,7 +51,7 @@ Must match the registered redirect URI in Anthropic console
 
 > **scopes**: `string`[]
 
-Defined in: [types/subscription.ts:622](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L622)
+Defined in: [types/subscription.ts:705](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L705)
 
 OAuth scopes to request
 
@@ -65,7 +65,7 @@ Array of scope strings defining requested permissions
 
 > `optional` **clientSecret?**: `string`
 
-Defined in: [types/subscription.ts:628](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L628)
+Defined in: [types/subscription.ts:711](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L711)
 
 OAuth client secret (optional, for confidential clients)
 
@@ -79,7 +79,7 @@ Only used for server-side OAuth flows
 
 > `optional` **authorizationEndpoint?**: `string`
 
-Defined in: [types/subscription.ts:634](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L634)
+Defined in: [types/subscription.ts:717](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L717)
 
 OAuth authorization endpoint URL
 
@@ -93,7 +93,7 @@ Anthropic's OAuth authorization URL
 
 > `optional` **tokenEndpoint?**: `string`
 
-Defined in: [types/subscription.ts:640](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L640)
+Defined in: [types/subscription.ts:723](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L723)
 
 OAuth token endpoint URL
 
@@ -107,7 +107,7 @@ Anthropic's OAuth token exchange URL
 
 > `optional` **codeVerifier?**: `string`
 
-Defined in: [types/subscription.ts:646](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L646)
+Defined in: [types/subscription.ts:729](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L729)
 
 PKCE code verifier (for public clients)
 
@@ -121,7 +121,7 @@ Used with PKCE flow for enhanced security
 
 > `optional` **state?**: `string`
 
-Defined in: [types/subscription.ts:652](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L652)
+Defined in: [types/subscription.ts:735](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L735)
 
 State parameter for CSRF protection
 

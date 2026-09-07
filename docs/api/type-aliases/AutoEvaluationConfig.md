@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **AutoEvaluationConfig** = `object`
 
-Defined in: [types/middleware.ts:176](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L176)
+Defined in: [types/middleware.ts:201](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L201)
 
 Configuration for the Auto-Evaluation Middleware.
 
@@ -18,7 +18,7 @@ Configuration for the Auto-Evaluation Middleware.
 
 > `optional` **threshold?**: `number`
 
-Defined in: [types/middleware.ts:178](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L178)
+Defined in: [types/middleware.ts:203](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L203)
 
 The minimum score (1-10) for a response to be considered passing.
 
@@ -28,7 +28,7 @@ The minimum score (1-10) for a response to be considered passing.
 
 > `optional` **maxRetries?**: `number`
 
-Defined in: [types/middleware.ts:180](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L180)
+Defined in: [types/middleware.ts:205](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L205)
 
 The maximum number of retry attempts before failing.
 
@@ -38,7 +38,7 @@ The maximum number of retry attempts before failing.
 
 > `optional` **evaluationModel?**: `string`
 
-Defined in: [types/middleware.ts:182](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L182)
+Defined in: [types/middleware.ts:207](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L207)
 
 The model to use for the LLM-as-judge evaluation.
 
@@ -48,7 +48,7 @@ The model to use for the LLM-as-judge evaluation.
 
 > `optional` **blocking?**: `boolean`
 
-Defined in: [types/middleware.ts:187](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L187)
+Defined in: [types/middleware.ts:212](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L212)
 
 If true, the middleware will wait for the evaluation to complete before returning.
 If the evaluation fails, it will throw an error. Defaults to true.
@@ -59,7 +59,7 @@ If the evaluation fails, it will throw an error. Defaults to true.
 
 > `optional` **onEvaluationComplete?**: (`evaluation`) => `void` \| `Promise`\<`void`\>
 
-Defined in: [types/middleware.ts:189](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L189)
+Defined in: [types/middleware.ts:214](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L214)
 
 A callback function to be invoked with the evaluation result.
 
@@ -79,7 +79,7 @@ A callback function to be invoked with the evaluation result.
 
 > `optional` **offTopicThreshold?**: `number`
 
-Defined in: [types/middleware.ts:191](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L191)
+Defined in: [types/middleware.ts:216](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L216)
 
 The score below which a response is considered off-topic.
 
@@ -89,7 +89,7 @@ The score below which a response is considered off-topic.
 
 > `optional` **highSeverityThreshold?**: `number`
 
-Defined in: [types/middleware.ts:193](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L193)
+Defined in: [types/middleware.ts:218](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L218)
 
 The score below which a failing response is considered a high severity alert.
 
@@ -99,7 +99,7 @@ The score below which a failing response is considered a high severity alert.
 
 > `optional` **promptGenerator?**: [`GetPromptFunction`](GetPromptFunction.md)
 
-Defined in: [types/middleware.ts:195](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L195)
+Defined in: [types/middleware.ts:220](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L220)
 
 ---
 
@@ -107,4 +107,4 @@ Defined in: [types/middleware.ts:195](https://github.com/juspay/neurolink/blob/f
 
 > `optional` **provider?**: `string`
 
-Defined in: [types/middleware.ts:197](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L197)
+Defined in: [types/middleware.ts:222](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L222)

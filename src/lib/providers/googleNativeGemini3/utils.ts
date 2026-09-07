@@ -22,6 +22,7 @@ import type {
   GenerateStopReason,
   ZodUnknownSchema,
   ThinkingConfig,
+  AgenticLoopOptions,
   ChatMessage,
   CollectedChunkResult,
   MinimalChatMessage,
@@ -30,30 +31,35 @@ import type {
   NativeFunctionResponse,
   NativeToolDeclarationsResult,
   NativeToolsConfig,
-  TextChannel,
+  StreamChannel,
   ToolWithLegacyParams,
   VertexNativePart,
   VertexSegment,
   VertexToolStep,
   GeminiMultimodalInput,
+  MultimodalAudioEntry,
 } from "../../types/index.js";
+import {
+  needsAudioTranscode,
+  toProviderCompatibleAudio,
+} from "../../adapters/audioFormatSupport.js";
 import { logger } from "../../utils/logger.js";
+import { guardToolExecutor } from "../../core/toolExecutionGuards.js";
 import { resolveSamplingParams } from "../../models/modelRegistry.js";
 import {
   convertZodToJsonSchema,
   ensureNestedSchemaTypes,
   inlineJsonSchema,
   isZodSchema,
-  normalizeJsonSchemaObject,
 } from "../../utils/schemaConversion.js";
 
 import { createNativeThinkingConfig } from "../../utils/thinkingConfig.js";
 import { resolveLiveTool } from "../../tools/toolDiscovery.js";
-import type { ToolExecuteFunction, Tool } from "../../types/index.js";
-import {
-  jsonSchema as aiJsonSchema,
-  tool as createAISDKTool,
-} from "../../utils/tool.js";
+import type {
+  ToolExecuteFunction,
+  Tool,
+  ToolExecutionGuards,
+} from "../../types/index.js";
 
 // ── Functions ──
 
@@ -131,7 +137,7 @@ const GOOGLE_FN_NAME_REGEX = /^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$/;
 
 const GOOGLE_FN_NAME_MAX_LENGTH = 128;
 
-export function sanitizeForGoogleFunctionName(name: string): string {
+function sanitizeForGoogleFunctionName(name: string): string {
   if (GOOGLE_FN_NAME_REGEX.test(name)) {
     return name;
   }
@@ -156,7 +162,7 @@ export function sanitizeForGoogleFunctionName(name: string): string {
  * @param base       The already-sanitized candidate name.
  * @param isTaken    Predicate that returns true if `name` is already used.
  */
-export function resolveUniqueGoogleFunctionName(
+function resolveUniqueGoogleFunctionName(
   base: string,
   isTaken: (name: string) => boolean,
 ): string {
@@ -189,7 +195,7 @@ export function resolveUniqueGoogleFunctionName(
  * Also removes `$schema`, `additionalProperties`, and `default` keys that
  * Gemini's proto format doesn't support.
  */
-export function sanitizeSchemaForGemini(
+function sanitizeSchemaForGemini(
   schema: Record<string, unknown>,
 ): Record<string, unknown> {
   // If this node has anyOf/oneOf, collapse to string type
@@ -324,173 +330,6 @@ export function sanitizeSchemaForGemini(
 }
 
 /**
- * Sanitize Vercel AI SDK tools for Gemini compatibility.
- *
- * For the Vercel AI SDK path (non-native), tool parameters are Zod schemas that
- * get converted to JSON Schema internally by @ai-sdk/google. This conversion
- * doesn't sanitize union types (anyOf/oneOf), causing Gemini proto errors.
- *
- * This function pre-converts each tool's Zod parameters to sanitized JSON Schema
- * and re-wraps with the Vercel AI SDK's jsonSchema() helper.
- */
-export function sanitizeToolsForGemini(tools: Record<string, Tool>): {
-  tools: Record<string, Tool>;
-  dropped: string[];
-  /**
-   * Reverse map: Google-safe sanitized name → original consumer-supplied
-   * name. Lets the calling layer translate tool-call results back so the
-   * sanitization stays transport-only (see CodeRabbit thread, PR #1006).
-   */
-  originalNameMap: Map<string, string>;
-} {
-  const sanitized: Record<string, Tool> = {};
-  const dropped: string[] = [];
-  const renamed: Array<{ from: string; to: string }> = [];
-  const originalNameMap = new Map<string, string>();
-
-  for (const [name, tool] of Object.entries(tools)) {
-    try {
-      // Sanitize the tool name to fit Google's function_declarations regex.
-      // Without this, MCP-imported or user-registered tools whose names contain
-      // characters outside [A-Za-z_][A-Za-z0-9_.:-]{0,127} cause the entire
-      // request to 400 with "Invalid function name", surfacing as a misleading
-      // tool-calling failure. Distinct originals that collapse onto the same
-      // sanitized name (e.g. "my/tool" and "my-tool" → "my_tool") are
-      // disambiguated with a numeric suffix that preserves Google's 128-char
-      // ceiling.
-      const candidate = sanitizeForGoogleFunctionName(name);
-      const safeName = resolveUniqueGoogleFunctionName(
-        candidate,
-        (n) => n in sanitized,
-      );
-      // Always record the mapping so downstream code can translate every
-      // safeName back to the original — including the no-rename identity
-      // mapping, which simplifies the lookup path.
-      originalNameMap.set(safeName, name);
-      if (safeName !== name) {
-        renamed.push({ from: name, to: safeName });
-      }
-
-      // Access the legacy `parameters` field that may exist on older AI SDK tools.
-      // AI SDK v6 uses `inputSchema`, but v3/v4 tools and third-party wrappers use `parameters`.
-      const legacyTool = tool as ToolWithLegacyParams;
-      const params = legacyTool.parameters;
-      if (
-        params &&
-        typeof params === "object" &&
-        "_def" in params &&
-        typeof (params as Record<string, unknown>).parse === "function"
-      ) {
-        const rawJsonSchema = convertZodToJsonSchema(
-          params as ZodUnknownSchema,
-          "openApi3",
-        ) as Record<string, unknown>;
-        const inlined = inlineJsonSchema(rawJsonSchema);
-        // Gemini sanitization strips Zod-only features not supported by the Gemini API:
-        // union types (anyOf/oneOf) are collapsed to string, default values and
-        // additionalProperties are removed. The resulting schema is Gemini-compatible
-        // but loses some type constraints from the original Zod schema.
-        const sanitizedSchema = sanitizeSchemaForGemini(inlined);
-
-        sanitized[safeName] = createAISDKTool({
-          description: tool.description || `Tool: ${safeName}`,
-          inputSchema: aiJsonSchema(sanitizedSchema),
-          execute: tool.execute as ToolExecuteFunction<unknown, unknown>,
-        });
-      } else if (
-        params &&
-        typeof params === "object" &&
-        "jsonSchema" in params
-      ) {
-        // Non-Zod JSON schema (e.g., from ai SDK jsonSchema() helper) — still needs sanitization
-        const rawSchema = (params as Record<string, unknown>)
-          .jsonSchema as Record<string, unknown>;
-        const sanitizedSchema = sanitizeSchemaForGemini(
-          inlineJsonSchema(rawSchema),
-        );
-
-        sanitized[safeName] = createAISDKTool({
-          description: tool.description || `Tool: ${safeName}`,
-          inputSchema: aiJsonSchema(sanitizedSchema),
-          execute: tool.execute as ToolExecuteFunction<unknown, unknown>,
-        });
-      } else {
-        sanitized[safeName] = tool;
-      }
-    } catch (error) {
-      logger.warn(
-        `[Gemini] Failed to sanitize tool "${name}", skipping: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      // Don't fall back to the original tool — an incompatible schema would fail the Gemini request
-      dropped.push(name);
-    }
-  }
-
-  if (renamed.length > 0) {
-    logger.warn(
-      `[Gemini] ${renamed.length} tool name(s) sanitized for Google's function-name regex: ${renamed
-        .map((r) => `"${r.from}" -> "${r.to}"`)
-        .join(", ")}`,
-    );
-  }
-
-  return { tools: sanitized, dropped, originalNameMap };
-}
-
-export function normalizeToolsForJsonSchemaProvider(
-  tools: Record<string, Tool>,
-): {
-  tools: Record<string, Tool>;
-  normalized: string[];
-} {
-  const normalizedTools: Record<string, Tool> = {};
-  const normalized: string[] = [];
-
-  for (const [name, tool] of Object.entries(tools)) {
-    const legacyTool = tool as ToolWithLegacyParams;
-    const toolParams = legacyTool.parameters || tool.inputSchema;
-    let rawSchema: Record<string, unknown>;
-
-    if (isZodSchema(toolParams)) {
-      rawSchema = convertZodToJsonSchema(
-        toolParams as ZodUnknownSchema,
-        "openApi3",
-      ) as Record<string, unknown>;
-    } else if (toolParams && typeof toolParams === "object") {
-      rawSchema = toolParams as Record<string, unknown>;
-    } else {
-      rawSchema = { type: "object", properties: {} };
-    }
-
-    if (
-      rawSchema.jsonSchema &&
-      typeof rawSchema.jsonSchema === "object" &&
-      !rawSchema.type
-    ) {
-      rawSchema = rawSchema.jsonSchema as Record<string, unknown>;
-    }
-
-    const schemaBefore = JSON.stringify(rawSchema);
-    const normalizedSchema = normalizeJsonSchemaObject(rawSchema);
-    if (JSON.stringify(normalizedSchema) !== schemaBefore) {
-      normalized.push(name);
-    }
-
-    const wrappedSchema = aiJsonSchema(normalizedSchema);
-    normalizedTools[name] = {
-      ...tool,
-      inputSchema: wrappedSchema,
-      ...(legacyTool.parameters ? { parameters: wrappedSchema } : {}),
-    } as Tool;
-  }
-
-  return {
-    tools: normalizedTools,
-    normalized,
-  };
-}
-
-/**
  * Convert Vercel AI SDK tools to @google/genai FunctionDeclarations and an execute map.
  *
  * This handles both Zod schemas and plain JSON Schema objects for tool parameters.
@@ -602,26 +441,86 @@ export function buildNativeToolDeclarations(
 }
 
 /**
- * Mid-turn tool sync for the native Gemini loops that build their snapshot
- * via buildNativeToolDeclarations. `search_tools` (tools.discovery) hydrates
- * discovered tools into the live record between steps; without this refresh
- * they stay invisible to the rest of the turn and every call dies as
- * TOOL_NOT_FOUND. Mutates the snapshot in place — the request config holds
- * `toolsConfig` by reference — and returns true when anything was added.
+ * Build the tool record handed to `runAgenticLoop`, routed through the turn's
+ * DedupExecuteMap.
+ *
+ * The engine looks tools up by the name the adapter reports, which is the
+ * ORIGINAL caller-facing name; `executeMap` is keyed by the SANITIZED wire
+ * name Google actually declares. `originalNameMap` is the bridge, and it
+ * carries an entry for every converted tool (identity mappings included), so
+ * iterating it yields exactly the declared, executable set.
+ *
+ * Going through `executeMap.get()` rather than the raw `tool.execute` is the
+ * entire point: `.get()` returns the dedup wrapper, so an identical
+ * {name, args} repeated within one turn is answered from the per-turn cache
+ * instead of running the tool again (BZ-3327). Passing the raw executor looks
+ * identical in every test that calls a tool once, and silently reintroduces
+ * duplicate side effects the moment the model repeats itself.
  */
+export function buildDedupedEngineTools(
+  declarations: NativeToolDeclarationsResult | undefined,
+  tools: Record<string, Tool> | undefined,
+  guards?: ToolExecutionGuards,
+): NonNullable<AgenticLoopOptions["tools"]> {
+  const engineTools: NonNullable<AgenticLoopOptions["tools"]> = {};
+
+  /**
+   * Everything a loop needs around a tool call that the engine does not do
+   * itself, in one place so both the declared and the fallback path get it.
+   *
+   * Order matters. `raceWithAbort` sits INSIDE `withTimeout` so a turn-level
+   * abort is observed the moment it fires rather than after the tool settles,
+   * and the timeout still bounds a tool that neither settles nor honours its
+   * signal. The progress pings bracket the await because the stall watchdog
+   * is a whole-turn interval comparing wall-clock against the last progress
+   * mark — without them a legitimately slow tool reads as a stalled turn and
+   * gets killed.
+   */
+  const guard = (
+    name: string,
+    execute: NonNullable<Tool["execute"]>,
+  ): ((args: Record<string, unknown>, opts: unknown) => Promise<unknown>) =>
+    guards
+      ? guardToolExecutor(name, execute, guards)
+      : async (args: Record<string, unknown>, opts: unknown) =>
+          execute(args, opts as Parameters<typeof execute>[1]);
+
+  if (declarations) {
+    for (const [safeName, originalName] of declarations.originalNameMap) {
+      const execute = declarations.executeMap.get(safeName);
+      if (!execute) {
+        continue;
+      }
+      engineTools[originalName] = { execute: guard(originalName, execute) };
+    }
+    return engineTools;
+  }
+  // No declarations were built (no tools, or a path that skips the snapshot).
+  // Fall back to the caller's own executors so this helper can never REMOVE a
+  // tool that would otherwise have been callable.
+  for (const [name, tool] of Object.entries(tools ?? {})) {
+    const execute = tool?.execute;
+    if (!execute) {
+      continue;
+    }
+    engineTools[name] = { execute: guard(name, execute) };
+  }
+  return engineTools;
+}
+
 export function refreshNativeToolDeclarations(
   liveTools: Record<string, Tool> | undefined,
   current: NativeToolDeclarationsResult,
-): boolean {
+): string[] {
   if (!liveTools) {
-    return false;
+    return [];
   }
   const declaredOriginals = new Set(current.originalNameMap.values());
   const missing = Object.entries(liveTools).filter(
     ([name]) => !declaredOriginals.has(name),
   );
   if (missing.length === 0) {
-    return false;
+    return [];
   }
   const built = buildNativeToolDeclarations(
     Object.fromEntries(missing),
@@ -641,7 +540,12 @@ export function refreshNativeToolDeclarations(
       .map(([name]) => name)
       .join(", ")}`,
   );
-  return true;
+  // The ORIGINAL names, which is what a caller's breaker is keyed by. A tool
+  // that accrued TOOL_NOT_FOUND strikes while it was still deferred was never
+  // really failing — those strikes are snapshot artifacts, and leaving them in
+  // place disables the tool for the rest of the turn at the very moment it
+  // becomes callable.
+  return missing.map(([name]) => name);
 }
 
 /**
@@ -871,85 +775,6 @@ export async function collectStreamChunks(
 }
 
 /**
- * Create a push-based text channel that bridges a background producer
- * (the agentic tool-calling loop) with an async-iterable consumer.
- *
- * This enables truly incremental streaming: text parts are yielded to the
- * caller as they arrive from the network, rather than being buffered until
- * the model finishes generating.
- */
-export function createTextChannel(): TextChannel {
-  const queue: Array<{ content: string }> = [];
-  let done = false;
-  let fatalError: unknown = undefined;
-  // Resolve the current "wait for data" promise when new data arrives
-  let notify: (() => void) | null = null;
-
-  function wake(): void {
-    if (notify) {
-      const fn = notify;
-      notify = null;
-      fn();
-    }
-  }
-
-  function push(text: string): void {
-    if (done) {
-      return;
-    }
-    queue.push({ content: text });
-    wake();
-  }
-
-  function close(): void {
-    done = true;
-    wake();
-  }
-
-  function error(err: unknown): void {
-    done = true;
-    fatalError = err;
-    wake();
-  }
-
-  let readIndex = 0;
-
-  async function* iterable(): AsyncIterable<{ content: string }> {
-    try {
-      while (true) {
-        if (readIndex < queue.length) {
-          yield queue[readIndex++];
-          // Periodically compact consumed chunks to avoid unbounded retention
-          if (readIndex > 1024 && readIndex * 2 >= queue.length) {
-            queue.splice(0, readIndex);
-            readIndex = 0;
-          }
-        } else if (done) {
-          if (fatalError !== undefined) {
-            throw fatalError instanceof Error
-              ? fatalError
-              : new Error(String(fatalError));
-          }
-          return;
-        } else {
-          // Wait until the producer pushes data or signals completion
-          await new Promise<void>((resolve) => {
-            notify = resolve;
-          });
-        }
-      }
-    } finally {
-      // Consumer stopped reading (e.g. disconnect/cancel): stop buffering.
-      done = true;
-      queue.length = 0;
-      notify?.();
-    }
-  }
-
-  return { push, close, error, iterable: iterable() };
-}
-
-/**
  * Iterate a single stream step incrementally, pushing text parts to `channel`
  * as they arrive from the network while simultaneously accumulating the full
  * `CollectedChunkResult` needed for history and token accounting.
@@ -965,7 +790,7 @@ export async function collectStreamChunksIncremental(
     functionCalls?: NativeFunctionCall[];
     [key: string]: unknown;
   }>,
-  channel: TextChannel,
+  channel: StreamChannel<{ content: string }>,
 ): Promise<CollectedChunkResult> {
   const rawResponseParts: unknown[] = [];
   const stepFunctionCalls: NativeFunctionCall[] = [];
@@ -973,6 +798,10 @@ export async function collectStreamChunksIncremental(
   let outputTokens = 0;
   let cacheReadTokens = 0;
   let reasoningTokens = 0;
+  // Surfaced so a caller can map SAFETY / MALFORMED_FUNCTION_CALL rather
+  // than inferring the turn ended normally. Additive: existing callers that
+  // ignore it are unaffected.
+  let finishReason: string | undefined;
 
   for await (const chunk of stream) {
     const chunkRecord = chunk as Record<string, unknown>;
@@ -980,6 +809,10 @@ export async function collectStreamChunksIncremental(
       | Array<Record<string, unknown>>
       | undefined;
     const firstCandidate = candidates?.[0];
+    const candidateFinish = firstCandidate?.finishReason;
+    if (typeof candidateFinish === "string") {
+      finishReason = candidateFinish;
+    }
     const chunkContent = firstCandidate?.content as
       | Record<string, unknown>
       | undefined;
@@ -988,7 +821,7 @@ export async function collectStreamChunksIncremental(
         rawResponseParts.push(part);
         // Forward text parts to the consumer immediately
         if (typeof part.text === "string" && part.text.length > 0) {
-          channel.push(part.text);
+          channel.push({ content: part.text });
         }
       }
     }
@@ -1025,6 +858,7 @@ export async function collectStreamChunksIncremental(
   return {
     rawResponseParts,
     stepFunctionCalls,
+    finishReason,
     inputTokens,
     outputTokens,
     cacheReadTokens,
@@ -1865,6 +1699,66 @@ export function prependConversationMessages(
  * is skipped rather than aborting the entire request, matching prior
  * Vertex behaviour.
  */
+/**
+ * Append audio to a Gemini request as `inlineData` parts.
+ *
+ * Shared by both Gemini front ends. Vertex assembles its request here and AI
+ * Studio assembles it in `buildUserPartsWithMultimodal`; when this lived only in
+ * the Vertex client, AI Studio advertised audio support through
+ * `NATIVE_AUDIO_PROVIDERS` and then silently dropped the bytes.
+ *
+ * Gemini's native request shape is assembled directly rather than taken from the
+ * AI SDK's `file` parts, so audio has to be added explicitly the same way PDFs
+ * and images are — a `{ type: "file" }` part built upstream simply never
+ * reaches this request body. That asymmetry is why attaching a recording
+ * produced only the metadata summary even after the message builder learned to
+ * carry the bytes.
+ *
+ * A container Gemini does not accept is converted first; one that cannot be
+ * converted is skipped rather than sent, because an unsupported inlineData
+ * mimeType fails the whole request, and the caller still has the metadata
+ * summary in the text part.
+ */
+export async function appendNativeAudioParts(
+  userParts: VertexNativePart[],
+  audioFiles: MultimodalAudioEntry[] | undefined,
+  logPrefix: string = "[GeminiNative]",
+): Promise<void> {
+  if (!audioFiles || audioFiles.length === 0) {
+    return;
+  }
+  for (const audio of audioFiles) {
+    // Split on both separators: a Windows-style name reaching a POSIX host
+    // would otherwise keep its whole path, and the extension lookup below
+    // needs the bare filename.
+    const base = audio.filename.split(/[\\/]/).pop() ?? audio.filename;
+    const dot = base.lastIndexOf(".");
+    const extension = dot > 0 ? base.slice(dot) : ".bin";
+    const compatible = await toProviderCompatibleAudio(
+      audio.buffer,
+      audio.mimeType,
+      extension,
+    );
+    if (needsAudioTranscode(compatible.mimeType)) {
+      logger.warn(
+        `${logPrefix} Skipping native audio for ${base}: ${compatible.mimeType} ` +
+          `is not accepted and could not be converted. The metadata summary was ` +
+          `still included.`,
+      );
+      continue;
+    }
+    userParts.push({
+      inlineData: {
+        mimeType: compatible.mimeType,
+        data: compatible.buffer.toString("base64"),
+      },
+    });
+    logger.debug(
+      `${logPrefix} Added native audio part for ${base} (${compatible.mimeType})`,
+    );
+  }
+}
+
 export async function buildUserPartsWithMultimodal(
   input: GeminiMultimodalInput | undefined,
   textOverride?: string,
@@ -1976,6 +1870,13 @@ export async function buildUserPartsWithMultimodal(
       });
     }
   }
+
+  // Audio last, and through the same helper the Vertex client uses. AI Studio
+  // never touches `buildMultimodalMessagesArray` — it overrides generate() and
+  // stream() and assembles its request here — so wiring audio only into the
+  // Vertex client left this front end advertising native audio via
+  // NATIVE_AUDIO_PROVIDERS and then dropping the bytes on the floor.
+  await appendNativeAudioParts(parts, input?.nativeAudioFiles, logPrefix);
 
   return parts;
 }

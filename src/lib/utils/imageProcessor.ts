@@ -4,6 +4,7 @@
  */
 
 import { basename } from "path";
+import { SUPPORTED_INPUT_IMAGE_MIME_TYPES } from "../adapters/imageFormatSupport.js";
 import { logger } from "./logger.js";
 import {
   redactPathFromMessage,
@@ -572,6 +573,42 @@ export class ImageProcessor {
           return isoBmffMimeType;
         }
 
+        // JPEG 2000, in both shapes it ships in. The JP2 container opens with
+        // the 12-byte signature box `00 00 00 0C 6A 50 20 20 0D 0A 87 0A`; a
+        // bare codestream (.j2k/.j2c) opens with the SOC+SIZ markers FF 4F FF
+        // 51. Checked BEFORE ICO because the container's first three bytes are
+        // 00 00 00, which is one byte away from ICO's 00 00 01 00 and shares
+        // its leading zeros — an ordering mistake here would classify every
+        // JPEG 2000 as an icon rather than merely failing to recognise it.
+        // All twelve bytes are checked, not just the length and brand: the
+        // trailing 0D 0A 87 0A is the signature's whole point. It is a
+        // line-ending probe — CR LF, a high byte, LF — that a transfer which
+        // mangles newlines or strips the eighth bit will visibly corrupt, so
+        // skipping it accepts exactly the damaged files it exists to reject.
+        if (
+          input.length >= 12 &&
+          input[0] === 0x00 &&
+          input[1] === 0x00 &&
+          input[2] === 0x00 &&
+          input[3] === 0x0c &&
+          input.subarray(4, 8).toString("latin1") === "jP  " &&
+          input[8] === 0x0d &&
+          input[9] === 0x0a &&
+          input[10] === 0x87 &&
+          input[11] === 0x0a
+        ) {
+          return "image/jp2";
+        }
+        if (
+          input.length >= 4 &&
+          input[0] === 0xff &&
+          input[1] === 0x4f &&
+          input[2] === 0xff &&
+          input[3] === 0x51
+        ) {
+          return "image/jp2";
+        }
+
         // ICO: 00 00 01 00 (icon type=1)
         if (
           input[0] === 0x00 &&
@@ -698,23 +735,19 @@ export class ImageProcessor {
    * Validate image format
    */
   static validateImageFormat(mediaType: string): boolean {
-    const supportedFormats = [
-      "image/jpeg",
-      "image/png",
-      "image/gif",
-      "image/webp",
-      "image/bmp",
-      "image/tiff",
-      "image/svg+xml",
-      "image/avif",
-      // Deliberately excludes "application/octet-stream": that's
-      // detectImageType()'s honest sentinel for bytes matching no known
-      // image signature (#261), not a real image format. Vision providers
-      // (OpenAI/Anthropic/Google) reject it outright with an HTTP 400, so
-      // process() must fail loud instead of packaging it as a valid image
-      // (see the octet-stream guard in process() below).
-    ];
-    return supportedFormats.includes(mediaType.toLowerCase());
+    // Derived from the canonical input set rather than hand-listed. The old
+    // literal omitted HEIC, HEIF, ICO and JPEG 2000, so an iPhone photo
+    // attached by path was rejected here — "Invalid MIME type: image/heic is
+    // not in allowed list" — before the transcode that exists to accept it
+    // could run. Intake has to allow every format we can convert, not just the
+    // ones providers take unchanged.
+    //
+    // Still excludes "application/octet-stream": that is detectImageType()'s
+    // honest sentinel for bytes matching no known image signature (#261), not
+    // a real format. Vision providers reject it with an HTTP 400, so process()
+    // must fail loud rather than package it as a valid image (see the
+    // octet-stream guard in process() below).
+    return SUPPORTED_INPUT_IMAGE_MIME_TYPES.has(mediaType.toLowerCase());
   }
 
   /**

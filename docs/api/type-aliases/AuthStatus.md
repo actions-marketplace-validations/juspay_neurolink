@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **AuthStatus** = `object`
 
-Defined in: [types/subscription.ts:1027](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L1027)
+Defined in: [types/subscription.ts:1110](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1110)
 
 Authentication status result
 
@@ -18,7 +18,7 @@ Authentication status result
 
 > **isAuthenticated**: `boolean`
 
-Defined in: [types/subscription.ts:1029](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L1029)
+Defined in: [types/subscription.ts:1112](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1112)
 
 Whether the user is authenticated
 
@@ -28,7 +28,7 @@ Whether the user is authenticated
 
 > **method**: `"api-key"` \| `"oauth"` \| `"none"`
 
-Defined in: [types/subscription.ts:1031](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L1031)
+Defined in: [types/subscription.ts:1114](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1114)
 
 Authentication method in use
 
@@ -38,7 +38,7 @@ Authentication method in use
 
 > `optional` **expiresAt?**: `Date`
 
-Defined in: [types/subscription.ts:1033](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L1033)
+Defined in: [types/subscription.ts:1116](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1116)
 
 Token expiration time (for OAuth)
 
@@ -48,7 +48,7 @@ Token expiration time (for OAuth)
 
 > `optional` **needsRefresh?**: `boolean`
 
-Defined in: [types/subscription.ts:1035](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L1035)
+Defined in: [types/subscription.ts:1118](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1118)
 
 Whether token refresh is needed (for OAuth)
 
@@ -58,7 +58,7 @@ Whether token refresh is needed (for OAuth)
 
 > `optional` **user?**: `object`
 
-Defined in: [types/subscription.ts:1037](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L1037)
+Defined in: [types/subscription.ts:1120](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1120)
 
 User information (for OAuth)
 

@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ClaudeSnapshot** = `object`
 
-Defined in: [types/proxy.ts:1217](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1217)
+Defined in: [types/proxy.ts:3024](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L3024)
 
 Snapshot of headers and body from a Claude Code request, used for polyfill.
 
@@ -18,7 +18,7 @@ Snapshot of headers and body from a Claude Code request, used for polyfill.
 
 > **accountKey**: `string`
 
-Defined in: [types/proxy.ts:1218](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1218)
+Defined in: [types/proxy.ts:3025](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L3025)
 
 ---
 
@@ -26,7 +26,7 @@ Defined in: [types/proxy.ts:1218](https://github.com/juspay/neurolink/blob/ff50c
 
 > **capturedAt**: `string`
 
-Defined in: [types/proxy.ts:1219](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1219)
+Defined in: [types/proxy.ts:3026](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L3026)
 
 ---
 
@@ -34,7 +34,7 @@ Defined in: [types/proxy.ts:1219](https://github.com/juspay/neurolink/blob/ff50c
 
 > **source**: `"claude-code"`
 
-Defined in: [types/proxy.ts:1220](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1220)
+Defined in: [types/proxy.ts:3027](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L3027)
 
 ---
 
@@ -42,7 +42,7 @@ Defined in: [types/proxy.ts:1220](https://github.com/juspay/neurolink/blob/ff50c
 
 > **headers**: `Record`\<`string`, `string`\>
 
-Defined in: [types/proxy.ts:1221](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1221)
+Defined in: [types/proxy.ts:3028](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L3028)
 
 ---
 
@@ -50,4 +50,4 @@ Defined in: [types/proxy.ts:1221](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **body?**: [`ClaudeSnapshotBody`](ClaudeSnapshotBody.md)
 
-Defined in: [types/proxy.ts:1222](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1222)
+Defined in: [types/proxy.ts:3029](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L3029)

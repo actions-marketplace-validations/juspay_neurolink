@@ -4,6 +4,7 @@ import chalk from "chalk";
 import ora from "ora";
 import type { Argv, CommandModule } from "yargs";
 import { ModelResolver } from "../../lib/models/modelResolver.js";
+import { providerChoicesFor } from "../../lib/factories/mediaHandlerCatalog.js";
 import type {
   ChunkingStrategy,
   JsonValue,
@@ -62,6 +63,22 @@ import {
 import { OllamaCommandFactory } from "./ollamaCommandFactory.js";
 import { SageMakerCommandFactory } from "./sagemakerCommandFactory.js";
 import { AgentCommandFactory } from "../commands/agent.js";
+import { PROVIDER_DESCRIPTORS } from "../../lib/factories/providerDescriptors.js";
+
+/**
+ * Every provider name + alias, derived from PROVIDER_DESCRIPTORS, plus
+ * "auto" and the CLI-only "anthropic-subscription" pseudo-provider (not a
+ * real AIProviderName — special-cased at runtime to rewrite
+ * options.provider to "anthropic").
+ */
+const DERIVED_PROVIDER_CHOICES: string[] = [
+  "auto",
+  ...PROVIDER_DESCRIPTORS.flatMap((d) => [d.name, ...d.aliases]),
+  "anthropic-subscription",
+];
+
+/** Space-separated form for the bash-completion script, kept in sync with DERIVED_PROVIDER_CHOICES by construction. */
+export const BASH_COMPLETION_PROVIDERS = DERIVED_PROVIDER_CHOICES.join(" ");
 
 /**
  * CLI Command Factory for generate commands
@@ -100,61 +117,10 @@ export class CLICommandFactory {
   }
 
   // Common options available on all commands
-  private static readonly commonOptions = {
+  static readonly commonOptions = {
     // Core generation options
     provider: {
-      choices: [
-        "auto",
-        "openai",
-        "openai-compatible",
-        "openrouter",
-        "or",
-        "bedrock",
-        "vertex",
-        "googleVertex",
-        "anthropic",
-        "anthropic-subscription", // Anthropic with subscription tier support
-        "azure",
-        "google-ai",
-        "google-ai-studio",
-        "huggingface",
-        "ollama",
-        "mistral",
-        "litellm",
-        "sagemaker",
-        "deepseek",
-        "ds",
-        "nvidia-nim",
-        "nim",
-        "nvidia",
-        "lm-studio",
-        "lmstudio",
-        "lms",
-        "llamacpp",
-        "llama.cpp",
-        "xai",
-        "grok",
-        "groq",
-        "cohere",
-        "together-ai",
-        "together",
-        "fireworks",
-        "perplexity",
-        "pplx",
-        "cloudflare",
-        "workers-ai",
-        "cf-ai",
-        "replicate",
-        "voyage",
-        "voyage-ai",
-        "jina",
-        "jina-ai",
-        "stability",
-        "stability-ai",
-        "sd",
-        "ideogram",
-        "recraft",
-      ],
+      choices: DERIVED_PROVIDER_CHOICES,
       default: "auto",
       description:
         "AI provider to use (auto-selects best available). Use 'anthropic-subscription' for Claude subscription plans.",
@@ -431,7 +397,7 @@ export class CLICommandFactory {
     },
     ttsProvider: {
       type: "string" as const,
-      choices: ["google-ai", "vertex", "openai-tts", "elevenlabs", "azure-tts"],
+      choices: providerChoicesFor("tts"),
       description: "TTS provider (overrides --provider for speech synthesis)",
     },
     ttsFormat: {
@@ -481,7 +447,7 @@ export class CLICommandFactory {
     },
     sttProvider: {
       type: "string" as const,
-      choices: ["whisper", "deepgram", "google-stt", "azure-stt"],
+      choices: providerChoicesFor("stt"),
       description: "STT provider to use",
     },
     sttLanguage: {
@@ -503,6 +469,7 @@ export class CLICommandFactory {
     },
     videoProvider: {
       type: "string" as const,
+      choices: providerChoicesFor("video"),
       description:
         "Video provider override (e.g., 'vertex' (default), 'kling', 'runway', 'replicate')",
     },
@@ -538,6 +505,7 @@ export class CLICommandFactory {
     // Avatar Generation options (D-ID, HeyGen, MuseTalk via Replicate)
     avatarProvider: {
       type: "string" as const,
+      choices: providerChoicesFor("avatar"),
       description:
         "Avatar provider (e.g., 'd-id' (default), 'heygen', 'replicate', 'musetalk')",
     },
@@ -580,6 +548,7 @@ export class CLICommandFactory {
     // Music Generation options (Beatoven, ElevenLabs, Lyria, MusicGen via Replicate)
     musicProvider: {
       type: "string" as const,
+      choices: providerChoicesFor("music"),
       description:
         "Music provider (e.g., 'beatoven' (default), 'elevenlabs-music', 'lyria', 'replicate', 'musicgen')",
     },
@@ -2704,6 +2673,7 @@ export class CLICommandFactory {
                 "llamacpp",
                 "xai",
                 "groq",
+                "cerebras",
                 "cohere",
                 "together-ai",
                 "fireworks",
@@ -6037,7 +6007,9 @@ export class CLICommandFactory {
         "        generate|gen)\n" +
         '            case "${prev}" in\n' +
         "                --provider|-p)\n" +
-        '                    COMPREPLY=( $(compgen -W "auto openai openai-compatible openrouter or bedrock vertex googleVertex anthropic anthropic-subscription azure google-ai google-ai-studio huggingface ollama mistral litellm sagemaker deepseek ds nvidia-nim nim lm-studio lmstudio llamacpp llama.cpp xai grok groq cohere together-ai together fireworks perplexity pplx cloudflare workers-ai cf-ai replicate voyage voyage-ai jina jina-ai stability stability-ai sd ideogram recraft" -- ${cur}) )\n' +
+        '                    COMPREPLY=( $(compgen -W "' +
+        BASH_COMPLETION_PROVIDERS +
+        '" -- ${cur}) )\n' +
         "                    return 0\n" +
         "                    ;;\n" +
         "                --format|-f|--output-format)\n" +
@@ -6172,3 +6144,6 @@ export class CLICommandFactory {
     }
   }
 }
+
+/** Re-export of CLICommandFactory's static option definitions for direct import by tests/tooling. */
+export const commonOptions = CLICommandFactory.commonOptions;

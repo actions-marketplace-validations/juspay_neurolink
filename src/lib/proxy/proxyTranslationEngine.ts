@@ -18,12 +18,18 @@ import {
   serializeClaudeResponse,
 } from "./claudeFormat.js";
 import {
+  buildGeminiResponse,
+  createGeminiSerializerAdapter,
+} from "./geminiFormat.js";
+import {
   generateOpenAIToolCallId,
   OpenAIStreamSerializer,
   serializeOpenAIResponse,
 } from "./openaiFormat.js";
 import type { ProxyTracer } from "./proxyTracer.js";
+import { DEFAULT_PROXY_MODEL_IDS } from "../constants/proxyModels.js";
 import { logRequest } from "./requestLogger.js";
+import { buildClientAttribution } from "./clientAttribution.js";
 import {
   recordAttempt,
   recordAttemptError,
@@ -33,6 +39,7 @@ import {
 import type {
   InternalResult,
   ParsedClaudeRequest,
+  ParsedGeminiRequest,
   ParsedOpenAIRequest,
   ProxyFormat,
   ProxyTranslationAttempt,
@@ -147,6 +154,19 @@ export function detectProxyFormat(
   if (path.includes("/messages")) {
     return "claude";
   }
+  // Gemini CLI wire format: POST /v1beta/models/<model>:generateContent
+  // (non-streaming) or :streamGenerateContent (streaming, selected via
+  // ?alt=sse on ctx.query — not part of ctx.path, so it plays no role here).
+  // Checked as two explicit suffixes: "streamGenerateContent" capitalizes
+  // the "Generate" it shares with "generateContent", so
+  // "streamGenerateContent".includes("generateContent") is false and a
+  // single check would miss every streaming request.
+  if (
+    path.includes(":generateContent") ||
+    path.includes(":streamGenerateContent")
+  ) {
+    return "gemini";
+  }
 
   // Header-based fallback
   if (headers["anthropic-version"]) {
@@ -201,12 +221,15 @@ function shouldOmitThinkingConfigForTarget(
  * Build options for ctx.neurolink.stream() from a parsed request
  * and an optional provider/model override.
  *
- * Works for both ParsedClaudeRequest and ParsedOpenAIRequest — the
- * only differences are Claude-specific fields (topK, thinkingConfig)
- * which are safely absent on OpenAI parsed requests.
+ * Works for ParsedClaudeRequest, ParsedOpenAIRequest and
+ * ParsedGeminiRequest. The differences are Claude-specific fields (topK,
+ * thinkingConfig), safely absent on OpenAI/Gemini parsed requests, and
+ * toolChoice/toolChoiceName, absent on Gemini parsed requests — Gemini's
+ * parser always emits tools: {} (see geminiFormat.ts's parseGeminiRequest),
+ * so toolNames.length is always 0 below and disableTools is set instead.
  */
 export function buildTranslationOptions(
-  parsed: ParsedClaudeRequest | ParsedOpenAIRequest,
+  parsed: ParsedClaudeRequest | ParsedOpenAIRequest | ParsedGeminiRequest,
   overrides: { provider?: string; model?: string } = {},
 ): Record<string, unknown> {
   const historyMessages = parsed.conversationMessages.slice(0, -1);
@@ -223,9 +246,14 @@ export function buildTranslationOptions(
       ? claudeParsed.thinkingConfig
       : undefined;
 
-  const toolChoice = parsed.toolChoiceName
-    ? { type: "tool" as const, toolName: parsed.toolChoiceName }
-    : parsed.toolChoice;
+  // toolChoice/toolChoiceName exist on ParsedClaudeRequest and
+  // ParsedOpenAIRequest but not on ParsedGeminiRequest — go through the same
+  // Partial-cast pattern as claudeParsed above so a Gemini request just sees
+  // both as undefined instead of failing to compile.
+  const toolChoiceParsed = parsed as Partial<ParsedOpenAIRequest>;
+  const toolChoice = toolChoiceParsed.toolChoiceName
+    ? { type: "tool" as const, toolName: toolChoiceParsed.toolChoiceName }
+    : toolChoiceParsed.toolChoice;
 
   return {
     input: {
@@ -298,7 +326,13 @@ function defaultFinishReason(format: ProxyFormat): string {
 }
 
 function logTag(format: ProxyFormat): string {
-  return format === "claude" ? "[proxy]" : "[proxy:openai]";
+  if (format === "claude") {
+    return "[proxy]";
+  }
+  if (format === "gemini") {
+    return "[proxy:gemini]";
+  }
+  return "[proxy:openai]";
 }
 
 // ---------------------------------------------------------------------------
@@ -316,7 +350,7 @@ export async function handleTranslatedStreamRequest(args: {
   ctx: ServerContext;
   format: ProxyFormat;
   requestModel: string;
-  parsed: ParsedClaudeRequest | ParsedOpenAIRequest;
+  parsed: ParsedClaudeRequest | ParsedOpenAIRequest | ParsedGeminiRequest;
   attempts: ProxyTranslationAttempt[];
   tracer?: ProxyTracer;
   requestStartTime: number;
@@ -334,7 +368,9 @@ export async function handleTranslatedStreamRequest(args: {
   const serializer =
     format === "claude"
       ? createClaudeSerializerAdapter(requestModel)
-      : createOpenAISerializerAdapter(requestModel);
+      : format === "gemini"
+        ? createGeminiSerializerAdapter(requestModel)
+        : createOpenAISerializerAdapter(requestModel);
 
   const KEEPALIVE_INTERVAL_MS = 15_000;
   const encoder = new TextEncoder();
@@ -343,6 +379,19 @@ export async function handleTranslatedStreamRequest(args: {
   let succeeded = false;
   let streamInterruptedAfterOutput = false;
   let translatedModel: string | undefined;
+  /** Provider that actually served the successful attempt, for costing. */
+  let translatedProvider: string | undefined;
+  /**
+   * Whether the substitution has already been reported to the tracer.
+   *
+   * The success path records it before the tracer prices anything, and the
+   * finally block keeps its own call as a net for any future path that sets
+   * translatedModel without reaching that point. Both guards are otherwise
+   * identical and translatedModel is assigned in exactly one place, so without
+   * this flag every substituted stream reports twice and
+   * proxy_model_substitution_total reads exactly double the real count.
+   */
+  let substitutionRecorded = false;
   let finalStreamError = "No translation providers succeeded";
   let upstreamIterator: AsyncIterator<unknown> | undefined;
   let lastAttemptLabel = "translation";
@@ -456,6 +505,28 @@ export async function handleTranslatedStreamRequest(args: {
               }
             }
 
+            translatedModel = streamResult.model;
+            translatedProvider = attempt.provider;
+
+            // Substitution BEFORE usage: setUsage() and recordMetrics() price
+            // the request immediately, against the tracer's current model and
+            // billing provider. Recording first and substituting afterwards
+            // bills the model the client ASKED for — which is exactly what
+            // ProxyTracer.setModelSubstitution() documents as wrong, since a
+            // claude-* alias served by another provider would be charged at
+            // Claude rates. The finally block below keeps its own call as a
+            // net for any future path that sets translatedModel without
+            // reaching here; substitutionRecorded stops the two from
+            // double-counting proxy_model_substitution_total.
+            if (tracer && translatedModel && translatedModel !== requestModel) {
+              tracer.setModelSubstitution(
+                requestModel,
+                translatedModel,
+                translatedProvider,
+              );
+              substitutionRecorded = true;
+            }
+
             // Track usage and metrics
             const resolvedUsageForTracer = extractUsageFromStreamResult(
               streamResult.usage,
@@ -467,8 +538,6 @@ export async function handleTranslatedStreamRequest(args: {
               cacheReadTokens: 0,
             });
             tracer?.recordMetrics();
-
-            translatedModel = streamResult.model;
             succeeded = true;
             return;
           } catch (streamErr) {
@@ -513,8 +582,18 @@ export async function handleTranslatedStreamRequest(args: {
         if (!cancelled) {
           controller.close();
         }
-        if (tracer && translatedModel && translatedModel !== requestModel) {
-          tracer.setModelSubstitution(requestModel, translatedModel);
+        if (
+          !substitutionRecorded &&
+          tracer &&
+          translatedModel &&
+          translatedModel !== requestModel
+        ) {
+          tracer.setModelSubstitution(
+            requestModel,
+            translatedModel,
+            translatedProvider,
+          );
+          substitutionRecorded = true;
         }
         const terminalStatus = cancelled
           ? 499
@@ -562,6 +641,11 @@ export async function handleTranslatedStreamRequest(args: {
           toolCount: Object.keys(parsed.tools).length,
           account: "translation",
           accountType: "translation",
+          // Without this the translated doors record no calling client at all.
+          // The Gemini door serves every request through this engine, so its
+          // rows carried a null clientApp and a null userAgent — not merely
+          // "unknown", but nothing to attribute after the fact either.
+          ...buildClientAttribution(ctx.headers),
           responseStatus: terminalStatus,
           responseTimeMs: Date.now() - requestStartTime,
           ...(terminalErrorType ? { errorType: terminalErrorType } : {}),
@@ -609,7 +693,7 @@ export async function handleTranslatedJsonRequest(args: {
   ctx: ServerContext;
   format: ProxyFormat;
   requestModel: string;
-  parsed: ParsedClaudeRequest | ParsedOpenAIRequest;
+  parsed: ParsedClaudeRequest | ParsedOpenAIRequest | ParsedGeminiRequest;
   attempts: ProxyTranslationAttempt[];
   tracer?: ProxyTracer;
   requestStartTime: number;
@@ -679,6 +763,17 @@ export async function handleTranslatedJsonRequest(args: {
         toolCalls: streamResult.toolCalls as InternalResult["toolCalls"],
       };
 
+      // Substitution BEFORE usage — see the streaming path for why: pricing
+      // happens inside setUsage()/recordMetrics(), so substituting afterwards
+      // bills the requested model instead of the one that served.
+      if (tracer && streamResult.model && streamResult.model !== requestModel) {
+        tracer.setModelSubstitution(
+          requestModel,
+          streamResult.model,
+          attempt.provider,
+        );
+      }
+
       // Track usage and metrics
       const resolvedUsage = extractUsageFromStreamResult(streamResult.usage);
       tracer?.setUsage({
@@ -688,10 +783,6 @@ export async function handleTranslatedJsonRequest(args: {
         cacheReadTokens: 0,
       });
       tracer?.recordMetrics();
-
-      if (tracer && streamResult.model && streamResult.model !== requestModel) {
-        tracer.setModelSubstitution(requestModel, streamResult.model);
-      }
       tracer?.end(200, Date.now() - requestStartTime);
 
       recordFinalSuccess(lastAttemptLabel, "translation");
@@ -707,6 +798,7 @@ export async function handleTranslatedJsonRequest(args: {
         toolCount: Object.keys(parsed.tools).length,
         account: "translation",
         accountType: "translation",
+        ...buildClientAttribution(ctx.headers),
         responseStatus: 200,
         responseTimeMs: Date.now() - requestStartTime,
         inputTokens: resolvedUsage.input,
@@ -715,9 +807,19 @@ export async function handleTranslatedJsonRequest(args: {
         ...(traceCtx?.spanId ? { spanId: traceCtx.spanId } : {}),
       });
 
-      return format === "claude"
-        ? serializeClaudeResponse(internal, requestModel)
-        : serializeOpenAIResponse(internal, requestModel);
+      if (format === "claude") {
+        return serializeClaudeResponse(internal, requestModel);
+      }
+      if (format === "gemini") {
+        return buildGeminiResponse(
+          internal.content,
+          internal.finishReason ?? defaultFinishReason(format),
+          resolvedUsage,
+          internal.model ?? requestModel,
+          internal.toolCalls,
+        );
+      }
+      return serializeOpenAIResponse(internal, requestModel);
     } catch (attemptError) {
       lastAttemptError =
         attemptError instanceof Error
@@ -751,6 +853,7 @@ export async function handleTranslatedJsonRequest(args: {
     toolCount: Object.keys(parsed.tools).length,
     account: "translation",
     accountType: "translation",
+    ...buildClientAttribution(ctx.headers),
     responseStatus: terminalFailureStatus,
     responseTimeMs: Date.now() - requestStartTime,
     errorType: "generation_error",
@@ -820,7 +923,7 @@ export function buildModelsListResponse(modelRouter?: {
 
   // Always include a default entry if nothing else is configured
   if (models.length === 0) {
-    for (const id of DEFAULT_MODEL_IDS) {
+    for (const id of DEFAULT_PROXY_MODEL_IDS) {
       models.push({
         id,
         object: "model",
@@ -835,27 +938,6 @@ export function buildModelsListResponse(modelRouter?: {
     data: models,
   };
 }
-
-/**
- * Canonical default model IDs surfaced when no router is configured. Format
- * matches the IDs used throughout `src/lib/models/` and `src/lib/constants/`
- * (e.g. `claude-3-5-haiku-20241022`, not `claude-haiku-3.5-20241022`).
- */
-const DEFAULT_MODEL_IDS = [
-  // Claude 4-series (current generation, hyphen-suffix family)
-  "claude-opus-4-6",
-  "claude-sonnet-4-6",
-  "claude-haiku-4-5",
-  // Claude 4 dated variant
-  "claude-sonnet-4-20250514",
-  // Claude 3.5-series (canonical Anthropic form: claude-3-5-{variant}-{date})
-  "claude-3-5-sonnet-20241022",
-  "claude-3-5-haiku-20241022",
-  // OpenAI / Google for translated-fallback users
-  "gpt-4o",
-  "gemini-2.5-pro",
-  "gemini-2.5-flash",
-];
 
 /**
  * Build an Anthropic-shaped `/v1/models` list response.
@@ -897,7 +979,7 @@ export function buildAnthropicModelsListResponse(modelRouter?: {
   }
 
   if (ids.length === 0) {
-    ids.push(...DEFAULT_MODEL_IDS);
+    ids.push(...DEFAULT_PROXY_MODEL_IDS);
   }
 
   // Deduplicate while preserving order — multiple router sources can publish

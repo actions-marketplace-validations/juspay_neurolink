@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **AsyncApiResponse**\<`TData`\> = `Promise`\<[`ApiResponse`](ApiResponse.md)\<`TData`\>\>
 
-Defined in: [types/aliases.ts:186](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/aliases.ts#L186)
+Defined in: [types/aliases.ts:200](https://github.com/juspay/neurolink/blob/release/src/lib/types/aliases.ts#L200)
 
 Async API response type
 

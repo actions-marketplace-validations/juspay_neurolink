@@ -17,7 +17,7 @@ import { dirname, join, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import chalk from "chalk";
 import ora from "ora";
-import type { Hono } from "hono";
+import type { Context, Hono, Next } from "hono";
 import {
   buildProxyHealthResponse,
   createProxyReadinessState,
@@ -27,6 +27,10 @@ import {
   waitForProxyReadiness,
 } from "../../lib/proxy/proxyHealth.js";
 import { logger } from "../../lib/utils/logger.js";
+import {
+  applyAllClients,
+  restoreAllClients,
+} from "../proxy-clients/registry.js";
 import {
   redactUrlsInText,
   sanitizeForLog,
@@ -44,11 +48,14 @@ import type {
   ModelRouterInterface,
   PersistedAccountCooldown,
   ProxyGuardArgs,
+  ProxyHealthProbe,
+  ProxyLogCleanupScheduler,
   ProxyNeurolinkRuntime,
   ProxySpinner,
   ProxyStartApp,
   ProxyStartArgs,
   ProxyStartStrategy,
+  ProxyClosableServer,
   ProxyState,
   ProxySupervisorState,
   ProxyStatusArgs,
@@ -58,24 +65,28 @@ import type {
   ProxyRuntimeActivity,
   ProxyRuntimeConfigSnapshot,
   ProxyReadinessState,
+  ProxyResponseTrackingObserver,
   RuntimeRequestMetadata,
   StatusStats,
 } from "../../lib/types/index.js";
 import type { NeuroLink } from "../../lib/neurolink.js";
 import { configureProxyKeepAliveDispatcher } from "../../lib/proxy/proxyDispatcher.js";
 import { ProxyRuntimeConfigStore } from "../../lib/proxy/runtimeConfig.js";
+import { startProxyLogCleanupScheduler } from "../../lib/proxy/logCleanupScheduler.js";
 import {
   anthropicAccountKeysEqual,
   createAccountAllowlist,
-  ENV_ANTHROPIC_ACCOUNT_KEY,
   isAccountAllowed,
   LEGACY_ANTHROPIC_ACCOUNT_KEY,
   normalizeAnthropicAccountKey,
   shouldLoadFallbackCredential,
 } from "../../lib/proxy/accountSelection.js";
+import { resolveProxyStatusAccountIdentity } from "../../lib/proxy/codexAccountUsage.js";
 import {
   beginProxyRequest,
   getProxyActivitySnapshot,
+  observeProxyFinalLog,
+  takeProxyResponseObservers,
   trackProxyResponse,
 } from "../../lib/proxy/proxyActivity.js";
 import {
@@ -124,6 +135,7 @@ import packageJson from "../../../package.json" with { type: "json" };
 const _require = createRequire(import.meta.url);
 const PROXY_VERSION = packageJson.version;
 const PROXY_INTERNAL_ACCOUNT_LABEL = "proxy/internal";
+const PROXY_INTERNAL_ACCOUNT_TYPE = "internal";
 
 const PROXY_TELEMETRY_SCRIPT_PATH = fileURLToPath(
   new URL(
@@ -131,14 +143,29 @@ const PROXY_TELEMETRY_SCRIPT_PATH = fileURLToPath(
     import.meta.url,
   ),
 );
+/**
+ * Requests accepted by the gate-only share listener.
+ *
+ * Both listeners serve the same Hono app, so the only thing separating a gated
+ * request from an ungated one is which socket accepted it. Recovering that from
+ * `c.env.incoming.socket.localPort` worked but failed in two directions: an
+ * unreadable port answered "not gated", which is fail-open on the one listener
+ * that must never fail open, and a share port configured equal to the main port
+ * answered "gated" for the operator's own untokened traffic.
+ *
+ * Stamping the Request as the share listener hands it to the app settles both.
+ * The mark is applied by the accepting listener before any handler runs, it
+ * says nothing about ports, and nothing a client sends can add or remove it. A
+ * `WeakSet` keyed on the Request holds it for exactly as long as the request
+ * object lives and not a moment longer.
+ */
+const gatedShareRequests = new WeakSet<Request>();
+
 const PROXY_LIFECYCLE_SHUTDOWN_TIMEOUT_MS = 5_000;
-const LEGACY_STATUS_ACCOUNT_CACHE_TTL_MS = 5_000;
-const PROXY_STATUS_TOKEN_READ_TIMEOUT_MS = 2_000;
+/** How long shutdown waits on the share listener before moving on. */
+const SHARE_LISTENER_CLOSE_TIMEOUT_MS = 10_000;
 const PROXY_STATUS_RECONCILE_TIMEOUT_MS = 750;
 const PROXY_STATUS_ACCOUNT_INVENTORY_TIMEOUT_MS = 750;
-let legacyStatusAccountCache:
-  | { credentialsPath: string; expiresAt: number; label: string | null }
-  | undefined;
 // Allowed drift between a pid's OS-reported start time and the persisted
 // ProxySupervisorState.startTime before processLooksLikeProxySupervisor
 // treats it as a confident mismatch (recycled pid). Generous on purpose:
@@ -240,8 +267,6 @@ function loadProxySupervisorState(): ProxySupervisorState | null {
 function clearProxySupervisorState(): void {
   proxySupervisorStateManager.clear();
 }
-
-const CLAUDE_SETTINGS_PATH = join(homedir(), ".claude", "settings.json");
 
 const PLIST_LABEL = "com.neurolink.proxy";
 const PLIST_DIR = join(homedir(), "Library", "LaunchAgents");
@@ -516,45 +541,6 @@ async function resolveStatusPrimaryAccount(
   };
 }
 
-async function resolveLegacyStatusAccountLabel(
-  storedAnthropicAccountCount: number,
-): Promise<string | null> {
-  if (storedAnthropicAccountCount !== 0) {
-    return null;
-  }
-  const credentialsPath = join(
-    homedir(),
-    ".neurolink",
-    "anthropic-credentials.json",
-  );
-  const now = Date.now();
-  if (
-    legacyStatusAccountCache?.credentialsPath === credentialsPath &&
-    legacyStatusAccountCache.expiresAt > now
-  ) {
-    return legacyStatusAccountCache.label;
-  }
-  let label: string | null = null;
-  try {
-    const { readFile } = await import("node:fs/promises");
-    const parsed = JSON.parse(await readFile(credentialsPath, "utf8")) as {
-      email?: string;
-      oauth?: { accessToken?: string };
-    };
-    if (parsed.oauth?.accessToken) {
-      label = parsed.email?.trim() || "legacy-default";
-    }
-  } catch {
-    label = null;
-  }
-  legacyStatusAccountCache = {
-    credentialsPath,
-    expiresAt: now + LEGACY_STATUS_ACCOUNT_CACHE_TTL_MS,
-    label,
-  };
-  return label;
-}
-
 function deriveAccountAllowance(
   accountKey: string,
   now: number,
@@ -615,242 +601,60 @@ function isProxyAutoUpdateEnabled(
   return !["0", "off", "false"].includes((value ?? "").trim().toLowerCase());
 }
 
-/** Keys we manage in Claude Code's settings.env */
-const PROXY_MANAGED_KEYS = ["ANTHROPIC_BASE_URL", "ENABLE_TOOL_SEARCH"];
-
-async function setClaudeProxySettings(baseUrl: string): Promise<void> {
-  const fs = await import("fs");
-  let settings: Record<string, unknown> = {};
-  try {
-    settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, "utf8"));
-  } catch {
-    // file missing/invalid — create fresh settings object
-  }
-
-  const env = (settings.env ?? {}) as Record<string, string>;
-
-  // Preserve original values so clearClaudeProxySettings can restore them.
-  // Only snapshot once — subsequent calls should not overwrite the snapshot.
-  const originals = ((settings as Record<string, unknown>)
-    .__proxy_original_env ?? {}) as Record<string, string | null>;
-  for (const key of PROXY_MANAGED_KEYS) {
-    if (!(key in originals)) {
-      originals[key] = key in env ? env[key] : null;
-    }
-  }
-  (settings as Record<string, unknown>).__proxy_original_env = originals;
-
-  env.ANTHROPIC_BASE_URL = baseUrl;
-  env.ENABLE_TOOL_SEARCH = "true";
-  settings.env = env;
-
-  fs.writeFileSync(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2));
-}
-
-async function clearClaudeProxySettings(
-  expectedBaseUrl?: string,
-): Promise<boolean> {
-  const fs = await import("fs");
-  let settings: Record<string, unknown>;
-  try {
-    settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, "utf8"));
-  } catch {
-    return false;
-  }
-
-  const env = settings.env as Record<string, string> | undefined;
-  if (!env) {
-    return false;
-  }
-
-  if (
-    expectedBaseUrl &&
-    typeof env.ANTHROPIC_BASE_URL === "string" &&
-    env.ANTHROPIC_BASE_URL !== expectedBaseUrl
-  ) {
-    // User switched to a different proxy URL; do not clobber.
-    return false;
-  }
-
-  const hadBaseUrl = typeof env.ANTHROPIC_BASE_URL === "string";
-  const hadToolSearch = env.ENABLE_TOOL_SEARCH === "true";
-
-  // Restore original values if they were saved, otherwise delete the keys
-  const originals = ((settings as Record<string, unknown>)
-    .__proxy_original_env ?? {}) as Record<string, string | null>;
-  for (const key of PROXY_MANAGED_KEYS) {
-    const original = originals[key];
-    if (original !== undefined && original !== null) {
-      // Restore the value that existed before the proxy was started
-      env[key] = original;
-    } else {
-      // Key did not exist before — remove it
-      delete env[key];
-    }
-  }
-  delete (settings as Record<string, unknown>).__proxy_original_env;
-
-  if (Object.keys(env).length === 0) {
-    delete settings.env;
-  } else {
-    settings.env = env;
-  }
-
-  fs.writeFileSync(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2));
-  return hadBaseUrl || hadToolSearch;
-}
-
-// =============================================================================
-// OPENCODE AUTO-CONFIGURATION
-// =============================================================================
-
-function getOpenCodeConfigDir(): string {
-  if (process.platform === "darwin") {
-    return join(homedir(), "Library", "Application Support", "opencode");
-  }
-  // Linux/other: XDG_CONFIG_HOME or ~/.config
-  return join(
-    process.env.XDG_CONFIG_HOME || join(homedir(), ".config"),
-    "opencode",
-  );
-}
-
-const OPENCODE_CONFIG_PATH = join(getOpenCodeConfigDir(), "opencode.json");
-
-/**
- * Key under which we persist the snapshot of the user's pre-existing
- * `provider.neurolink` config inside `opencode.json` itself. Persisting (rather
- * than relying on in-process state) means restoration still works even if the
- * proxy crashes or shutdown handlers run in a different process.
- *
- * Mirrors the Claude pattern (`__proxy_original_env` inside Claude's settings).
- */
-const OPENCODE_ORIGINAL_KEY = "__proxy_original_neurolink";
-
-async function setOpenCodeProxySettings(
-  baseUrl: string,
-  proxyKey?: string,
-): Promise<void> {
-  const fs = await import("fs");
-
-  const configDir = getOpenCodeConfigDir();
-  try {
-    fs.accessSync(configDir);
-  } catch {
-    // OpenCode not installed — config directory does not exist, skip silently
-    return;
-  }
-
-  let config: Record<string, unknown>;
-  try {
-    config = JSON.parse(fs.readFileSync(OPENCODE_CONFIG_PATH, "utf8"));
-  } catch {
-    // file missing/invalid — create fresh config object
-    config = { provider: {} };
-  }
-
-  const provider = (config.provider ?? {}) as Record<string, unknown>;
-
-  // Persist a snapshot of the user's pre-existing provider.neurolink — but
-  // only the first time we touch the file. Subsequent set() calls must NOT
-  // overwrite the snapshot (otherwise after the proxy writes its own block,
-  // the next set() would store the proxy's block as the "original" and
-  // permanently lose the user's real config on the next clear()).
-  if (!(OPENCODE_ORIGINAL_KEY in config)) {
-    (config as Record<string, unknown>)[OPENCODE_ORIGINAL_KEY] =
-      "neurolink" in provider
-        ? JSON.parse(JSON.stringify(provider.neurolink))
-        : null;
-  }
-
-  provider.neurolink = {
-    id: "neurolink",
-    name: "NeuroLink Proxy",
-    npm: "@ai-sdk/openai-compatible",
-    env: [],
-    models: {},
-    options: {
-      baseURL: baseUrl,
-      apiKey: proxyKey || "neurolink-proxy",
-    },
-  };
-
-  config.provider = provider;
-  fs.writeFileSync(OPENCODE_CONFIG_PATH, JSON.stringify(config, null, 2));
-}
-
-async function clearOpenCodeProxySettings(
-  expectedBaseUrl?: string,
-): Promise<boolean> {
-  const fs = await import("fs");
-  let config: Record<string, unknown>;
-  try {
-    config = JSON.parse(fs.readFileSync(OPENCODE_CONFIG_PATH, "utf8"));
-  } catch {
-    return false;
-  }
-
-  const provider = config.provider as Record<string, unknown> | undefined;
-  if (!provider || !("neurolink" in provider)) {
-    return false;
-  }
-
-  // Check if our proxy URL matches before removing
-  const existing = provider.neurolink as Record<string, unknown> | undefined;
-  if (expectedBaseUrl && existing) {
-    const options = existing.options as Record<string, unknown> | undefined;
-    if (options && typeof options.baseURL === "string") {
-      if (options.baseURL !== expectedBaseUrl) {
-        // User configured a different URL; do not clobber
-        return false;
-      }
-    }
-  }
-
-  const hadNeurolink = "neurolink" in provider;
-
-  // Restore from the snapshot persisted at first set(), regardless of process
-  // identity. Only delete provider.neurolink when the snapshot says the user
-  // explicitly had no entry before — never on an "undefined" snapshot, since
-  // that would mean the snapshot was lost and we cannot prove the entry is ours.
-  if (OPENCODE_ORIGINAL_KEY in config) {
-    const snapshot = (config as Record<string, unknown>)[OPENCODE_ORIGINAL_KEY];
-    if (snapshot === null) {
-      // User had no provider.neurolink before the proxy started — safe to remove.
-      delete provider.neurolink;
-    } else {
-      provider.neurolink = snapshot;
-    }
-    delete (config as Record<string, unknown>)[OPENCODE_ORIGINAL_KEY];
-  } else {
-    // No snapshot present — refuse to delete to avoid destroying a config
-    // the proxy may not own (e.g. a user wrote their own `neurolink` block
-    // before the snapshot key was introduced, or this is being cleared from
-    // a process that never ran set()).
-    logger.debug(
-      "[proxy] OpenCode clear: no original-provider snapshot found, leaving provider.neurolink intact",
-    );
-    return false;
-  }
-
-  config.provider = provider;
-  fs.writeFileSync(OPENCODE_CONFIG_PATH, JSON.stringify(config, null, 2));
-  return hadNeurolink;
-}
-
-async function isProxyHealthy(
+export async function probeProxyHealth(
   host: string,
   port: number,
   timeoutMs: number,
-): Promise<boolean> {
+): Promise<ProxyHealthProbe> {
+  const startedAt = Date.now();
   try {
     const response = await fetch(`http://${host}:${port}/health`, {
       signal: AbortSignal.timeout(timeoutMs),
     });
-    return response.ok;
-  } catch {
-    return false;
+    return {
+      healthy: response.ok,
+      durationMs: Date.now() - startedAt,
+      failure: response.ok ? null : "http_status",
+      statusCode: response.status,
+      errorCode: null,
+    };
+  } catch (error) {
+    const candidate = error as {
+      cause?: unknown;
+      code?: unknown;
+      name?: unknown;
+    };
+    const cause = candidate?.cause as { code?: unknown } | undefined;
+    const errorCode =
+      typeof candidate?.code === "string"
+        ? candidate.code
+        : typeof cause?.code === "string"
+          ? cause.code
+          : typeof candidate?.name === "string"
+            ? candidate.name
+            : null;
+    const isTimeout =
+      candidate?.name === "TimeoutError" || candidate?.name === "AbortError";
+    return {
+      healthy: false,
+      durationMs: Date.now() - startedAt,
+      failure: isTimeout ? "timeout" : "network",
+      statusCode: null,
+      errorCode,
+    };
   }
+}
+
+function formatProxyHealthProbe(probe: ProxyHealthProbe): string {
+  const details = [
+    `reason=${probe.failure ?? "none"}`,
+    `durationMs=${probe.durationMs}`,
+    probe.statusCode === null ? null : `status=${probe.statusCode}`,
+    probe.errorCode === null
+      ? null
+      : `errorCode=${sanitizeForLog(probe.errorCode)}`,
+  ].filter((detail): detail is string => detail !== null);
+  return details.join(" ");
 }
 
 async function getProxyRuntimeActivity(
@@ -1364,6 +1168,15 @@ function printProxyBanner(url: string, strategy: string): void {
   logger.always(
     `  ${chalk.blue("POST")} /v1/chat/completions — OpenAI-compatible proxy`,
   );
+  // The banner listed two of the four inbound doors, so the Codex and Gemini
+  // CLIs looked unsupported to anyone reading start-up output rather than the
+  // docs. Every door the proxy actually answers on belongs here.
+  logger.always(
+    `  ${chalk.blue("POST")} /backend-api/codex/… — Codex proxy (Responses format)`,
+  );
+  logger.always(
+    `  ${chalk.blue("POST")} /v1beta/models/…     — Gemini proxy (generateContent)`,
+  );
   logger.always(`  ${chalk.green("GET")}  /health              — Health check`);
   logger.always(
     `  ${chalk.green("GET")}  /status              — Detailed status`,
@@ -1529,13 +1342,56 @@ async function createProxyNeurolinkRuntime(logsDir?: string) {
 
   const { NeuroLink } = await import("../../lib/neurolink.js");
   const neurolink = new NeuroLink();
-  const { initRequestLogger, cleanupLogs } =
+  const { initRequestLogger } =
     await import("../../lib/proxy/requestLogger.js");
 
   initRequestLogger(true, logsDir);
-  cleanupLogs(7, 500);
 
-  return { neurolink, cleanupLogs };
+  return {
+    neurolink,
+    logsDir: logsDir ?? join(homedir(), ".neurolink", "logs"),
+  };
+}
+
+/**
+ * Replace account identity in a `/status` payload with a stable placeholder.
+ *
+ * The shape is preserved — same rows, same counters — so status tooling keeps
+ * working and only the names go away. Callers that legitimately need the names
+ * present the update-control token.
+ */
+function redactStatusAccounts(
+  rows: ReadonlyArray<Record<string, unknown>>,
+  allowed: boolean,
+): Array<Record<string, unknown>> {
+  if (allowed) {
+    return rows as Array<Record<string, unknown>>;
+  }
+  return rows.map((row, index) => ({
+    ...row,
+    label: `account-${index + 1}`,
+    ...(row.key !== undefined ? { key: null } : {}),
+    ...(row.email !== undefined ? { email: null } : {}),
+  }));
+}
+
+/**
+ * The same treatment for the configured/effective primary account block.
+ *
+ * Named fields rather than "every non-empty string": `source` is a discriminant
+ * (`configured` | `fallback`), not an identity, and blanking it both left the
+ * value outside its own union and hid the one thing a caller reads this block
+ * for — whether the configured primary is the account actually in use.
+ */
+function redactStatusPrimaryAccount(
+  primary: ProxyStatusPrimaryAccount,
+): ProxyStatusPrimaryAccount {
+  return {
+    configured: primary.configured === null ? null : "redacted",
+    key: primary.key === null ? null : "redacted",
+    label: primary.label === null ? null : "redacted",
+    source: primary.source,
+  };
 }
 
 function registerProxyRequestTracking(
@@ -1543,7 +1399,7 @@ function registerProxyRequestTracking(
   requestMetadata: WeakMap<Request, RuntimeRequestMetadata>,
   readiness: ProxyReadinessState,
 ): void {
-  app.use("/v1/*", async (c, next) => {
+  const trackingHandler = async (c: Context, next: Next): Promise<void> => {
     const startedMonotonicMs = performance.now();
     const contentLengthHeader = c.req.raw.headers.get("content-length");
     const rawContentLength =
@@ -1568,11 +1424,22 @@ function registerProxyRequestTracking(
       rejectForUpdate: readiness.drainingForUpdate,
     };
     requestMetadata.set(c.req.raw, metadata);
+    const stopObservingFinalLog = observeProxyFinalLog(
+      metadata.requestId,
+      (entry) => {
+        metadata.terminalResult = entry;
+      },
+    );
     const finishActivity = metadata.rejectForUpdate
       ? () => undefined
       : beginProxyRequest();
     const finish = () => {
+      stopObservingFinalLog();
       finishActivity();
+      // Borrowed traffic holds a concurrency slot for the lifetime of the
+      // response body, so it is released here rather than when the handler
+      // returns. Idempotent — a request can finish more than one way.
+      metadata.shareRelease?.();
       requestMetadata.delete(c.req.raw);
     };
     // The route adapter populates model/stream/toolCount after parsing. Omit
@@ -1604,6 +1471,36 @@ function registerProxyRequestTracking(
         responseStatus,
         elapsedMs: performance.now() - startedMonotonicMs,
       });
+      const routeResponseObservers = takeProxyResponseObservers(metadata);
+      const notifyRouteFirstChunk = (
+        details: Parameters<
+          NonNullable<ProxyResponseTrackingObserver["onFirstChunk"]>
+        >[0],
+      ): void => {
+        for (const observer of routeResponseObservers) {
+          try {
+            observer.onFirstChunk?.(details);
+          } catch {
+            // Route-level accounting must never interfere with the relay.
+          }
+        }
+      };
+      const notifyRouteTerminal = async (
+        details: Parameters<
+          NonNullable<ProxyResponseTrackingObserver["onTerminal"]>
+        >[0],
+      ): Promise<boolean> => {
+        const results = await withTimeout(
+          Promise.allSettled(
+            routeResponseObservers.map(async (observer) =>
+              observer.onTerminal?.(details),
+            ),
+          ),
+          2_000,
+          "Timed out joining proxy response accounting",
+        );
+        return results.some((result) => result.status === "rejected");
+      };
       c.res = trackProxyResponse(c.res, finish, {
         onFirstChunk: ({ observedBodyBytes, responseChunks }) => {
           logProxyLifecycleEvent({
@@ -1621,10 +1518,49 @@ function registerProxyRequestTracking(
             responseChunks,
             elapsedMs: performance.now() - startedMonotonicMs,
           });
+          notifyRouteFirstChunk({
+            observedBodyBytes,
+            responseChunks,
+          });
         },
-        onTerminal: ({ outcome, observedBodyBytes, responseChunks }) => {
+        onTerminal: async ({
+          outcome,
+          error,
+          observedBodyBytes,
+          responseChunks,
+        }) => {
+          const terminalMonotonicMs = performance.now();
+          const terminalTimestampMs = Date.now();
+          // Route accounting may await SSE parsing/cancellation. Join it before
+          // publishing the semantic terminal record; transport EOF alone is not
+          // evidence of a successful model response.
+          let accountingTimedOut = false;
+          let accountingFailed = false;
+          try {
+            accountingFailed = await notifyRouteTerminal({
+              outcome,
+              error,
+              observedBodyBytes,
+              responseChunks,
+            });
+          } catch {
+            accountingTimedOut = true;
+          }
+          const final = metadata.terminalResult;
+          const terminalOutcome =
+            final?.terminalOutcome ??
+            (outcome === "stream_error" ||
+            metadata.terminalErrorType === "stream_error"
+              ? "stream_error"
+              : outcome === "client_cancelled"
+                ? "client_cancelled"
+                : responseStatus >= 400
+                  ? "handler_error"
+                  : "unknown");
           logProxyLifecycleEvent({
             event: "request_terminal",
+            timestampMs: terminalTimestampMs,
+            monotonicMs: terminalMonotonicMs,
             requestId: metadata.requestId,
             method: metadata.method,
             path: metadata.path,
@@ -1636,17 +1572,40 @@ function registerProxyRequestTracking(
             responseStatus,
             observedBodyBytes,
             responseChunks,
-            elapsedMs: performance.now() - startedMonotonicMs,
-            terminalOutcome: outcome,
-            errorType: metadata.terminalErrorType,
-            errorCode: metadata.terminalErrorCode,
+            elapsedMs: terminalMonotonicMs - startedMonotonicMs,
+            terminalOutcome,
+            finalStatus: final?.responseStatus,
+            transportOutcome: outcome,
+            outcomeSource: final
+              ? "final_request"
+              : responseStatus >= 400
+                ? "http_status"
+                : terminalOutcome === "unknown"
+                  ? "unknown"
+                  : "transport_error",
+            telemetryStatus: accountingTimedOut
+              ? "timeout"
+              : accountingFailed
+                ? "observer_error"
+                : final
+                  ? "complete"
+                  : "missing_final",
+            errorType: final?.errorType ?? metadata.terminalErrorType,
+            errorCode: final?.errorCode ?? metadata.terminalErrorCode,
           });
+          stopObservingFinalLog();
         },
       });
     } catch (error) {
+      stopObservingFinalLog();
       // Keep metadata available to app.onError, which records the client-facing
       // failure with the same request ID before deleting the WeakMap entry.
       finishActivity();
+      // A handler that threw never produced a body for `trackProxyResponse` to
+      // follow, so `finish` will not run and the borrowed-traffic slot (and its
+      // coin hold) would be held until the process restarts. Both releases are
+      // idempotent, so the double call on paths that do reach `finish` is free.
+      metadata.shareRelease?.();
       logProxyLifecycleEvent({
         event: "request_terminal",
         requestId: metadata.requestId,
@@ -1664,7 +1623,19 @@ function registerProxyRequestTracking(
       });
       throw error;
     }
-  });
+  };
+  // Cover every inbound door so drain/reject, lifecycle logging, and
+  // concurrency accounting apply to all of them.
+  //
+  // `/v1beta/*` is listed separately on purpose: Hono matches wildcards a path
+  // segment at a time, so `/v1/*` does NOT cover `/v1beta/models/...` — the
+  // segment is `v1beta`, not `v1`. When the Gemini door landed it inherited
+  // neither tracker, which meant its requests were absent from the request
+  // log, from per-CLI attribution, and from the in-flight count the graceful
+  // drain waits on. An update could therefore cut a live Gemini stream.
+  app.use("/v1/*", trackingHandler);
+  app.use("/v1beta/*", trackingHandler);
+  app.use("/backend-api/*", trackingHandler);
 }
 
 export async function createProxyStartApp(params: {
@@ -1679,17 +1650,43 @@ export async function createProxyStartApp(params: {
   accountAllowlist: AccountAllowlist | undefined;
   runtimeConfigStore?: ProxyRuntimeConfigStore;
   updateControlToken?: string;
+  /** Port of the gate-only share listener, when one is configured. */
+  sharePort?: number;
 }) {
   const { createClaudeProxyRoutes } =
     await import("../../lib/server/routes/claudeProxyRoutes.js");
   const { createOpenAIProxyRoutes } =
     await import("../../lib/server/routes/openaiProxyRoutes.js");
-  const { logBodyCapture, logRequest } =
+  const { createCodexProxyRoutes } =
+    await import("../../lib/server/routes/codexProxyRoutes.js");
+  const { createGeminiProxyRoutes } =
+    await import("../../lib/server/routes/geminiProxyRoutes.js");
+  const { logBodyCapture, logRequest, getRequestLoggerSnapshot } =
     await import("../../lib/proxy/requestLogger.js");
   const { recordFinalError } = await import("../../lib/proxy/usageStats.js");
+  const { admitInboundShareRequest, isGrantRequiredByEnv } =
+    await import("../../lib/proxy/shareGate.js");
+  const { runWithShareContext } =
+    await import("../../lib/proxy/shareContext.js");
   const { Hono } = await import("hono");
 
   const app = new Hono();
+
+  /**
+   * Is this request arriving on the gate-only share listener?
+   *
+   * Decided by the **local port the connection was accepted on**, which no
+   * client can influence. A header or an address check could not do this job:
+   * cloudflared and every reverse proxy connect from 127.0.0.1, so tunnelled
+   * traffic is indistinguishable from the operator's own by origin alone.
+   *
+   * The share port refuses untokened requests by construction; the main port
+   * keeps its existing behaviour unless the operator opts in with
+   * `NEUROLINK_PROXY_REQUIRE_GRANT` — which stays the answer for anyone binding
+   * `0.0.0.0` with nothing in front of it.
+   */
+  const isGatedListener = (c: { req: { raw: Request } }): boolean =>
+    isGrantRequiredByEnv() || gatedShareRequests.has(c.req.raw);
   const readiness = createProxyReadinessState();
   const requestMetadata = new WeakMap<Request, RuntimeRequestMetadata>();
 
@@ -1706,13 +1703,18 @@ export async function createProxyStartApp(params: {
   ): Promise<void> => {
     const clientMessage = options?.clientMessage ?? errorMessage;
     const clientErrorType = options?.clientErrorType ?? errorType;
-    recordFinalError(status, undefined, undefined, {
-      requestId: metadata.requestId,
-      errorType,
-      errorCode: options?.errorCode,
-      terminalOutcome: "handler_error",
-      message: errorMessage,
-    });
+    recordFinalError(
+      status,
+      PROXY_INTERNAL_ACCOUNT_LABEL,
+      PROXY_INTERNAL_ACCOUNT_TYPE,
+      {
+        requestId: metadata.requestId,
+        errorType,
+        errorCode: options?.errorCode,
+        terminalOutcome: "handler_error",
+        message: errorMessage,
+      },
+    );
     await Promise.all([
       logRequest({
         timestamp: new Date().toISOString(),
@@ -1812,6 +1814,20 @@ export async function createProxyStartApp(params: {
 
   registerProxyRequestTracking(app, requestMetadata, readiness);
 
+  // Complete-mode credentials adopted from a lender have to check in, or they
+  // stop when their offline grace runs out. The timer is unref'd so it never
+  // keeps the process alive, and failures are the lender being unreachable —
+  // exactly the case the grace period exists for, not an error.
+  const { heartbeatDueResidentGrants } =
+    await import("../../lib/proxy/residentGrants.js");
+  const residentHeartbeatTimer = setInterval(
+    () => {
+      void heartbeatDueResidentGrants().catch(() => undefined);
+    },
+    5 * 60 * 1000,
+  );
+  residentHeartbeatTimer.unref();
+
   const runtimeConfigStore = params.runtimeConfigStore;
   const runtimeConfigProvider = runtimeConfigStore
     ? () => runtimeConfigStore.getSnapshot()
@@ -1836,7 +1852,19 @@ export async function createProxyStartApp(params: {
     params.port,
     runtimeConfigProvider,
   );
-  const allProxyRoutes = [...routeGroup.routes, ...openaiRouteGroup.routes];
+  const codexRouteGroup = createCodexProxyRoutes("");
+  const geminiRouteGroup = createGeminiProxyRoutes(
+    params.modelRouter,
+    "",
+    params.port,
+    runtimeConfigProvider,
+  );
+  const allProxyRoutes = [
+    ...routeGroup.routes,
+    ...openaiRouteGroup.routes,
+    ...codexRouteGroup.routes,
+    ...geminiRouteGroup.routes,
+  ];
 
   for (const route of allProxyRoutes) {
     const method = route.method.toLowerCase() as "get" | "post";
@@ -1916,6 +1944,64 @@ export async function createProxyStartApp(params: {
         `[proxy] ${c.req.method} ${c.req.path} → model=${logModel} ${stream} tools=${toolCount}`,
       );
 
+      // Peer-sharing gate. Runs here rather than as middleware because the
+      // model is only known after the body is parsed, and the model allowlist
+      // is one of the gates. Requests with no share token take the `local`
+      // branch untouched, which is every request on a node that shares nothing.
+      // `Number()` answers 0 for `null`, `""` and `[]` — all finite, all wrong.
+      // A zero reaches `estimateHoldCoins` and clamps up to its 256 floor
+      // rather than the 4096 an absent value defaults to, so the hold opened
+      // for the request comes out sixteen times too small. Only a real positive
+      // number counts here; anything else is treated as absent, which is the
+      // conservative direction because it holds more, not less.
+      const rawMaxTokens = (body as Record<string, unknown>)?.max_tokens;
+      const requestedMaxTokens =
+        typeof rawMaxTokens === "number" &&
+        Number.isFinite(rawMaxTokens) &&
+        rawMaxTokens > 0
+          ? rawMaxTokens
+          : undefined;
+      // The heartbeat surface authenticates itself against the grant's lease
+      // secret. Running it through the request gate as well would spend the
+      // grant's rate allowance and open a coin hold for a call that consumes no
+      // capacity at all.
+      const shareOutcome = c.req.path.startsWith("/peer/")
+        ? ({ kind: "local" } as const)
+        : await admitInboundShareRequest({
+            headers: Object.fromEntries(c.req.raw.headers.entries()),
+            model: String(model),
+            ...(requestedMaxTokens !== undefined
+              ? { maxTokens: requestedMaxTokens }
+              : {}),
+            requireGrant: isGatedListener(c),
+          });
+      if (shareOutcome.kind === "refused") {
+        const refusal = shareOutcome.response;
+        for (const [key, value] of Object.entries(refusal.headers)) {
+          c.header(key, value);
+        }
+        if (metadata) {
+          metadata.terminalErrorType = `share_${refusal.body.error.type}`;
+        }
+        // Narrow to the literals the gate can actually produce; Hono's json()
+        // wants a status literal and the alternative is a cast.
+        const refusalStatus =
+          refusal.status === 401 ? 401 : refusal.status === 403 ? 403 : 429;
+        return c.json(refusal.body, refusalStatus);
+      }
+      const shareContext =
+        shareOutcome.kind === "admitted" ? shareOutcome.context : undefined;
+      if (shareOutcome.kind === "admitted") {
+        if (metadata) {
+          metadata.shareRelease = shareOutcome.release;
+        } else {
+          // No tracked metadata means nothing will call the completion hook;
+          // release immediately rather than leaking the concurrency slot.
+          shareOutcome.release();
+        }
+      }
+
+      const requestAbortController = new AbortController();
       const ctx = {
         requestId: metadata?.requestId ?? crypto.randomUUID(),
         method: c.req.method,
@@ -1925,12 +2011,19 @@ export async function createProxyStartApp(params: {
         params: c.req.param() as Record<string, string>,
         body,
         rawBody,
+        abortSignal: AbortSignal.any([
+          c.req.raw.signal,
+          requestAbortController.signal,
+        ]),
         // The proxy runtime exposes only the structural slice of NeuroLink the
         // routes use; narrow (overlap-checked) to the full class for ServerContext.
         neurolink: params.neurolink as NeuroLink,
         toolRegistry: params.neurolink.getToolRegistry(),
         timestamp: Date.now(),
-        metadata: {},
+        // Keep route terminal observers on the runtime request metadata so the
+        // outer response tracker can notify them without adding a second body
+        // wrapper to streaming routes.
+        metadata: (metadata ?? {}) as Record<string, unknown>,
         // Route handlers publish limit/quota headers here. Only the streaming
         // paths build their own Response (and set headers directly); every
         // JSON and error path returns a plain object, so without this the
@@ -1945,7 +2038,9 @@ export async function createProxyStartApp(params: {
         }
       };
 
-      const result = await route.handler(ctx);
+      const result = shareContext
+        ? await runWithShareContext(shareContext, () => route.handler(ctx))
+        : await route.handler(ctx);
       if (result instanceof Response) {
         // Streaming responses own their headers; merge in anything the
         // handler published on the context that the Response lacks. A Response
@@ -1972,38 +2067,48 @@ export async function createProxyStartApp(params: {
           Symbol.asyncIterator
         ]();
         let cancelled = false;
-        const responseStream = new ReadableStream({
-          async start(controller) {
+        const encoder = new TextEncoder();
+        const responseStream = new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            if (cancelled) {
+              return;
+            }
             try {
-              while (!cancelled) {
-                const { value, done } = await iterator.next();
-                if (done) {
-                  break;
-                }
-                controller.enqueue(new TextEncoder().encode(value));
-              }
-              controller.close();
-            } catch (streamErr) {
+              const next = await iterator.next();
               if (cancelled) {
-                controller.close();
                 return;
               }
-              const errMsg =
-                streamErr instanceof Error
-                  ? streamErr.message
-                  : String(streamErr);
-              const errorEvent = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: `Stream interrupted: ${errMsg}` } })}\n\n`;
-              try {
-                controller.enqueue(new TextEncoder().encode(errorEvent));
-              } catch {
-                // Controller already errored — ignore
+              if (next.done) {
+                controller.close();
+              } else {
+                controller.enqueue(encoder.encode(next.value));
               }
+            } catch (streamErr) {
+              if (cancelled) {
+                return;
+              }
+              if (metadata) {
+                metadata.terminalErrorType = "stream_error";
+              }
+              logger.debug("[proxy] response stream interrupted", {
+                error: streamErr,
+              });
+              controller.enqueue(
+                encoder.encode(
+                  `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: "Stream interrupted" } })}\n\n`,
+                ),
+              );
               controller.close();
             }
           },
-          async cancel() {
+          async cancel(reason) {
             cancelled = true;
-            await iterator.return?.();
+            requestAbortController.abort(reason);
+            await withTimeout(
+              Promise.resolve(iterator.return?.()),
+              1000,
+              "[proxy] response cancellation timed out",
+            ).catch(() => undefined);
           },
         });
         return new Response(responseStream, {
@@ -2062,6 +2167,20 @@ export async function createProxyStartApp(params: {
   });
 
   app.get("/status", async (c) => {
+    // A gated proxy is, by definition, one that may be exposed. `/status`
+    // enumerates account labels — which for an OAuth account is an email — plus
+    // quota and cooldown state, and it is not behind the request gate, so
+    // without this anyone who reaches the tunnel could read the pool's identity.
+    //
+    // A loopback check would be no defence: cloudflared runs locally and
+    // connects to 127.0.0.1, so tunnelled traffic arrives from loopback too.
+    // Identity is therefore released only to a caller holding the update-control
+    // token, and redacted for everyone else. Counters and health stay visible so
+    // liveness tooling keeps working.
+    const statusIdentityAllowed =
+      !isGatedListener(c) ||
+      c.req.header("x-neurolink-update-token") ===
+        (params.updateControlToken ?? PROXY_UPDATE_CONTROL_TOKEN);
     const runtimeConfig = params.runtimeConfigStore?.getSnapshot();
     const runtimeConfigStatus = params.runtimeConfigStore?.getStatus();
     const activeStrategy = runtimeConfig
@@ -2126,64 +2245,40 @@ export async function createProxyStartApp(params: {
           error instanceof Error ? error.message : String(error)
         }`,
       );
-      return {};
+      return {} as Record<string, PersistedAccountCooldown>;
     });
-    const storedAccountKeys = new Set<string>();
+    const storedAnthropicAccountKeys = new Set<string>();
+    const storedCodexAccountKeys = new Set<string>();
     const storedAccountExpirations = new Map<string, number>();
-    const disabledAccountKeys = new Set<string>();
+    const disabledProviderAccountKeys = new Set<string>();
     let accountInventoryLoaded = false;
     try {
       const { tokenStore } = await import("../../lib/auth/tokenStore.js");
-      const storedKeys = await withTimeout(
-        tokenStore.listByPrefix("anthropic:"),
-        PROXY_STATUS_ACCOUNT_INVENTORY_TIMEOUT_MS,
-        "[proxy] /status account enumeration timed out",
-      );
-      for (const key of storedKeys) {
-        storedAccountKeys.add(normalizeAnthropicAccountKey(key));
-      }
-      // Once account names are known, preserve them even when optional token
-      // metadata is slow. That keeps the status table useful and avoids
-      // incorrectly presenting known accounts as removed.
-      accountInventoryLoaded = true;
       const inventory = await withTimeout(
-        (async () => {
-          const tokenExpirations = await Promise.all(
-            storedKeys.map(async (key) => {
-              try {
-                const tokens = await withTimeout(
-                  tokenStore.peekTokens(key),
-                  PROXY_STATUS_TOKEN_READ_TIMEOUT_MS,
-                  "[proxy] /status token inspection timed out",
-                );
-                return tokens ? ([key, tokens.expiresAt] as const) : undefined;
-              } catch (error) {
-                logger.debug(
-                  `[proxy] /status: failed to inspect token metadata for ${normalizeAnthropicAccountKey(key)}: ${
-                    error instanceof Error ? error.message : String(error)
-                  }`,
-                );
-                return undefined;
-              }
-            }),
-          );
-          const disabledKeys = await tokenStore.listDisabled();
-          return { tokenExpirations, disabledKeys };
-        })(),
+        tokenStore.getProviderSnapshot(),
         PROXY_STATUS_ACCOUNT_INVENTORY_TIMEOUT_MS,
-        "[proxy] /status account metadata timed out",
+        "[proxy] /status account inspection timed out",
       );
-      for (const expiration of inventory.tokenExpirations) {
-        if (expiration) {
-          storedAccountExpirations.set(
-            normalizeAnthropicAccountKey(expiration[0]),
-            expiration[1],
-          );
+      for (const [storedKey, entry] of Object.entries(inventory)) {
+        if (
+          !storedKey.startsWith("anthropic:") &&
+          !storedKey.startsWith("codex:")
+        ) {
+          continue;
+        }
+        const key = storedKey.startsWith("anthropic:")
+          ? normalizeAnthropicAccountKey(storedKey)
+          : storedKey;
+        (key.startsWith("anthropic:")
+          ? storedAnthropicAccountKeys
+          : storedCodexAccountKeys
+        ).add(key);
+        storedAccountExpirations.set(key, entry.tokens.expiresAt);
+        if (entry.disabled) {
+          disabledProviderAccountKeys.add(key);
         }
       }
-      for (const key of inventory.disabledKeys) {
-        disabledAccountKeys.add(normalizeAnthropicAccountKey(key));
-      }
+      accountInventoryLoaded = true;
     } catch (err) {
       logger.debug(
         `[proxy] /status: failed to resolve account cooldown labels: ${
@@ -2191,13 +2286,6 @@ export async function createProxyStartApp(params: {
         }`,
       );
     }
-    const legacyAccountLabel = accountInventoryLoaded
-      ? await withTimeout(
-          resolveLegacyStatusAccountLabel(storedAccountKeys.size),
-          PROXY_STATUS_ACCOUNT_INVENTORY_TIMEOUT_MS,
-          "[proxy] /status legacy account inspection timed out",
-        ).catch(() => null)
-      : null;
     const now = Date.now();
     const health = buildProxyHealthResponse(readiness, {
       strategy: activeStrategy,
@@ -2216,44 +2304,71 @@ export async function createProxyStartApp(params: {
     }));
     const activeUpdaterPid =
       supervisorState?.updaterPid ?? runtimeState?.updaterPid;
-    const accountRows: NonNullable<StatusStats["accounts"]> = Object.values(
+    const accountRows: NonNullable<StatusStats["accounts"]> = Object.entries(
       stats.accounts,
-    ).map((account) => {
-      const normalizedKey = normalizeAnthropicAccountKey(account.label);
-      const isLegacyAccount =
-        account.type === "oauth" && account.label === legacyAccountLabel;
-      const accountKey = storedAccountKeys.has(normalizedKey)
-        ? normalizedKey
-        : isLegacyAccount
-          ? LEGACY_ANTHROPIC_ACCOUNT_KEY
-          : account.label === "env"
-            ? ENV_ANTHROPIC_ACCOUNT_KEY
-            : normalizedKey;
-      const isStored = storedAccountKeys.has(accountKey) || isLegacyAccount;
-      const { allowed, expired, cooling } = deriveAccountAllowance(
-        accountKey,
-        now,
-        activeAccountAllowlist,
-        storedAccountExpirations,
-        cooldowns,
-      );
+    ).map(([persistedMapKey, account]) => {
+      // Legacy snapshots used their bare map key as an inferred identity. Do
+      // not map those old rows to a provider based on an email: the same email
+      // can be present in both pools. New records carry account.key.
+      const persistedKey = account.key ?? null;
+      const identity = persistedKey
+        ? resolveProxyStatusAccountIdentity(
+            account.label,
+            account.type,
+            persistedKey,
+          )
+        : { provider: "other" as const, key: null };
+      const isLegacyUnattributed =
+        persistedKey === null &&
+        (account.type === "oauth" ||
+          account.type === "api_key" ||
+          account.type === "codex-oauth");
+      const isAnthropicAccount = identity.provider === "anthropic";
+      const isCodexAccount = identity.provider === "codex";
+      const accountKey = identity.key ?? (persistedKey || persistedMapKey);
+      const isStored =
+        (isAnthropicAccount && storedAnthropicAccountKeys.has(accountKey)) ||
+        (isCodexAccount && storedCodexAccountKeys.has(accountKey));
+      const providerState = isAnthropicAccount
+        ? deriveAccountAllowance(
+            accountKey,
+            now,
+            activeAccountAllowlist,
+            storedAccountExpirations,
+            cooldowns,
+          )
+        : isCodexAccount
+          ? {
+              allowed: true,
+              expired:
+                (storedAccountExpirations.get(accountKey) ?? 0) > 0 &&
+                (storedAccountExpirations.get(accountKey) ?? 0) <= now,
+              cooling: (cooldowns[accountKey]?.coolingUntil ?? 0) > now,
+            }
+          : { allowed: true, expired: false, cooling: false };
+      const isDisabled =
+        !isLegacyUnattributed && disabledProviderAccountKeys.has(accountKey);
       const accountStatus =
         account.type === "internal"
           ? "internal"
-          : disabledAccountKeys.has(accountKey)
-            ? "disabled"
-            : expired
-              ? "expired"
-              : !allowed
-                ? "excluded"
-                : accountInventoryLoaded &&
-                    account.type === "oauth" &&
-                    !isStored
-                  ? "removed"
-                  : cooling
-                    ? "cooling"
-                    : "active";
+          : isLegacyUnattributed
+            ? "unattributed"
+            : isDisabled
+              ? "disabled"
+              : providerState.expired
+                ? "expired"
+                : isAnthropicAccount && !providerState.allowed
+                  ? "excluded"
+                  : accountInventoryLoaded &&
+                      (isAnthropicAccount || isCodexAccount) &&
+                      !isStored
+                    ? "removed"
+                    : providerState.cooling
+                      ? "cooling"
+                      : "active";
       return {
+        key: isLegacyUnattributed ? null : accountKey,
+        provider: isLegacyUnattributed ? "unknown" : identity.provider,
         label: account.label,
         type: account.type,
         attempts: account.attemptCount,
@@ -2264,18 +2379,25 @@ export async function createProxyStartApp(params: {
         rateLimits: account.rateLimitCount,
         transientRateLimits: account.transientRateLimitCount,
         quotaRateLimits: account.quotaRateLimitCount,
-        cooling,
+        cooling: providerState.cooling,
         status: accountStatus,
-        allowed: account.type === "internal" ? undefined : allowed,
-        expired: account.type === "oauth" ? expired : undefined,
+        allowed:
+          account.type === "internal" ? undefined : providerState.allowed,
+        expired:
+          isAnthropicAccount || isCodexAccount
+            ? providerState.expired
+            : undefined,
       };
     });
     const representedAccountKeys = new Set(
-      accountRows
-        .filter((account) => account.type === "oauth")
-        .map((account) => normalizeAnthropicAccountKey(account.label)),
+      accountRows.flatMap((account) =>
+        account.key &&
+        (account.provider === "anthropic" || account.provider === "codex")
+          ? [account.key]
+          : [],
+      ),
     );
-    for (const accountKey of storedAccountKeys) {
+    for (const accountKey of storedAnthropicAccountKeys) {
       if (representedAccountKeys.has(accountKey)) {
         continue;
       }
@@ -2287,6 +2409,8 @@ export async function createProxyStartApp(params: {
         cooldowns,
       );
       accountRows.push({
+        key: accountKey,
+        provider: "anthropic",
         label: accountKey.slice("anthropic:".length),
         type: "oauth",
         attempts: 0,
@@ -2298,7 +2422,7 @@ export async function createProxyStartApp(params: {
         transientRateLimits: 0,
         quotaRateLimits: 0,
         cooling,
-        status: disabledAccountKeys.has(accountKey)
+        status: disabledProviderAccountKeys.has(accountKey)
           ? "disabled"
           : expired
             ? "expired"
@@ -2308,6 +2432,39 @@ export async function createProxyStartApp(params: {
                 ? "cooling"
                 : "active",
         allowed,
+        expired,
+      });
+    }
+    for (const accountKey of storedCodexAccountKeys) {
+      if (representedAccountKeys.has(accountKey)) {
+        continue;
+      }
+      const expiresAt = storedAccountExpirations.get(accountKey);
+      const expired =
+        expiresAt !== undefined && expiresAt > 0 && expiresAt <= now;
+      const cooling = (cooldowns[accountKey]?.coolingUntil ?? 0) > now;
+      accountRows.push({
+        key: accountKey,
+        provider: "codex",
+        label: accountKey.slice("codex:".length),
+        type: "codex-oauth",
+        attempts: 0,
+        requests: 0,
+        success: 0,
+        errors: 0,
+        attemptErrors: 0,
+        rateLimits: 0,
+        transientRateLimits: 0,
+        quotaRateLimits: 0,
+        cooling,
+        status: disabledProviderAccountKeys.has(accountKey)
+          ? "disabled"
+          : expired
+            ? "expired"
+            : cooling
+              ? "cooling"
+              : "active",
+        allowed: true,
         expired,
       });
     }
@@ -2411,8 +2568,10 @@ export async function createProxyStartApp(params: {
         terminalErrorDetailsMissing,
         terminalErrorDetailsExcess,
         snapshotSource,
-        accounts: accountRows,
-        primaryAccount,
+        accounts: redactStatusAccounts(accountRows, statusIdentityAllowed),
+        primaryAccount: statusIdentityAllowed
+          ? primaryAccount
+          : redactStatusPrimaryAccount(primaryAccount),
         persistence: getUsageStatsPersistenceStatus(),
       },
       activity: (() => {
@@ -2424,6 +2583,7 @@ export async function createProxyStartApp(params: {
       })(),
       observability: {
         lifecycle: getProxyLifecycleLoggerSnapshot(),
+        requestLogs: getRequestLoggerSnapshot(),
       },
       autoUpdate: {
         enabled: isProxyAutoUpdateEnabled(),
@@ -2716,11 +2876,11 @@ async function refreshProxyTokensInBackground(
 }
 
 function startProxyBackgroundMaintenance(
-  cleanupLogs: (days: number, maxMb: number) => void,
+  logsDir: string,
   getAccountAllowlist: () => AccountAllowlist | undefined,
 ): {
   refreshInterval: NodeJS.Timeout;
-  logCleanupInterval: NodeJS.Timeout;
+  logCleanupScheduler: ProxyLogCleanupScheduler;
 } {
   const refreshInterval = setInterval(() => {
     if (backgroundRefreshInProgress) {
@@ -2737,19 +2897,8 @@ function startProxyBackgroundMaintenance(
         backgroundRefreshInProgress = false;
       });
   }, 30_000);
-  const logCleanupInterval = setInterval(
-    () => {
-      try {
-        cleanupLogs(7, 500);
-      } catch (error) {
-        logger.debug(
-          `[proxy] background log cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    },
-    60 * 60 * 1000,
-  );
-  return { refreshInterval, logCleanupInterval };
+  const logCleanupScheduler = startProxyLogCleanupScheduler({ logsDir });
+  return { refreshInterval, logCleanupScheduler };
 }
 
 function registerProxyShutdownHandlers(params: {
@@ -2758,12 +2907,48 @@ function registerProxyShutdownHandlers(params: {
   port: number;
   isDev?: boolean;
   refreshInterval: NodeJS.Timeout;
-  logCleanupInterval: NodeJS.Timeout;
+  logCleanupScheduler: ProxyLogCleanupScheduler;
   updaterSupervisor?: { stop: () => void };
   stopRuntimeConfig?: () => void;
+  shareListener?: { stop: () => Promise<void> };
   registerSignals?: boolean;
 }): (signal: string, options?: { skipServerClose?: boolean }) => Promise<void> {
   let shutdownStarted = false;
+
+  /**
+   * Await one shutdown step, but never for longer than `ms`.
+   *
+   * By the time a signal has arrived every step here is best-effort: the
+   * process is going away either way, and the only thing an unbounded await
+   * buys is the chance that the supervisor's patience runs out first and turns
+   * a clean exit into a SIGKILL.
+   */
+  const withShutdownDeadline = async (
+    step: Promise<unknown> | undefined,
+    ms: number,
+    label: string,
+  ): Promise<void> => {
+    if (!step) {
+      return;
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const timedOut = await Promise.race([
+      step.then(
+        () => false,
+        () => false,
+      ),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(true), ms);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) {
+      clearTimeout(timer);
+    }
+    if (timedOut) {
+      logger.always(`[proxy] ${label} did not close in time; continuing`);
+    }
+  };
 
   const closeServer = async (): Promise<void> => {
     const close = params.server.close?.bind(params.server);
@@ -2806,9 +2991,18 @@ function registerProxyShutdownHandlers(params: {
     }
     shutdownStarted = true;
     clearInterval(params.refreshInterval);
-    clearInterval(params.logCleanupInterval);
+    await params.logCleanupScheduler.stop();
     params.updaterSupervisor?.stop();
     params.stopRuntimeConfig?.();
+    // Bounded like the main server's close below. `stop()` awaits the
+    // listener's own close, and a borrower holding a stream open keeps that
+    // pending for as long as it likes — an unbounded await here is a proxy
+    // that appears to ignore SIGTERM until the borrower hangs up.
+    await withShutdownDeadline(
+      params.shareListener?.stop(),
+      SHARE_LISTENER_CLOSE_TIMEOUT_MS,
+      "share listener",
+    );
     logger.always(`\nShutting down proxy (${signal})...`);
     let exitCode = signal === "SIGINT" || signal === "ROLLING_DRAIN" ? 0 : 1;
 
@@ -2879,22 +3073,11 @@ function registerProxyShutdownHandlers(params: {
     }
 
     if (signal === "SIGINT" && !params.isDev) {
-      try {
-        const shutdownHost =
-          params.host === "0.0.0.0" ? "localhost" : params.host;
-        await clearClaudeProxySettings(`http://${shutdownHost}:${params.port}`);
-      } catch {
-        // non-fatal
-      }
-      try {
-        const shutdownHost =
-          params.host === "0.0.0.0" ? "localhost" : params.host;
-        await clearOpenCodeProxySettings(
-          `http://${shutdownHost}:${params.port}/v1`,
-        );
-      } catch {
-        // non-fatal
-      }
+      const shutdownHost =
+        params.host === "0.0.0.0" ? "localhost" : params.host;
+      // restoreAllClients wraps each client, so one failure cannot stop the
+      // others and none can abort shutdown.
+      await restoreAllClients(`http://${shutdownHost}:${params.port}`);
     }
 
     try {
@@ -2936,12 +3119,13 @@ async function startProxyRuntime(params: {
   readiness: ProxyStartApp["readiness"];
   host: string;
   port: number;
+  sharePort: number;
   strategy: ProxyStartStrategy;
   proxyConfig: LoadedProxyConfig | null;
   accountAllowlist: AccountAllowlist | undefined;
   loadedEnvFile: string | undefined;
   passthrough: boolean;
-  cleanupLogs: ProxyNeurolinkRuntime["cleanupLogs"];
+  logsDir: ProxyNeurolinkRuntime["logsDir"];
   runtimeConfigStore?: ProxyRuntimeConfigStore;
 }): Promise<void> {
   const socketWorker = isProxySocketWorkerProcess();
@@ -2956,6 +3140,74 @@ async function startProxyRuntime(params: {
         port: params.port,
         hostname: params.host,
       });
+  // The gate-only listener. It exists only while this node lends something, and
+  // it is the port an operator exposes: the main port keeps serving the
+  // operator's own untokened client exactly as before.
+  const { isShareListenerDisabled, superviseShareListener } =
+    await import("../../lib/proxy/shareListener.js");
+  // Runs under socket workers too. During a rolling replacement both
+  // generations are briefly live and the incoming one loses the bind; that is
+  // now a logged retry rather than a crash, and the supervisor picks the port up
+  // on its next poll once the outgoing worker drains. Disabling it here instead
+  // would leave launchd installs — the main production shape — with no share
+  // listener at all, which is the thing this exists to remove.
+  const shareListener = isShareListenerDisabled()
+    ? undefined
+    : superviseShareListener({
+        start: async () => {
+          // Bind before reporting success, and take the bind error as a
+          // rejection rather than an unhandled `error` event — a port
+          // collision on the derived `port + 1` must cost the operator a log
+          // line and a `--share-port`, never the whole proxy.
+          const shareServer = await new Promise<ProxyClosableServer>(
+            (resolve, reject) => {
+              let listening = false;
+              const started = serve(
+                {
+                  // Every request this listener accepts is gated, and this is
+                  // the only place that fact is known for certain — see
+                  // `gatedShareRequests`.
+                  fetch: (request, env) => {
+                    gatedShareRequests.add(request);
+                    return params.app.fetch(request, env);
+                  },
+                  port: params.sharePort,
+                  hostname: params.host,
+                },
+                () => {
+                  listening = true;
+                  resolve(started);
+                },
+              );
+              started.on("error", (error: Error) => {
+                if (!listening) {
+                  reject(error);
+                  return;
+                }
+                // Past startup a listener error is a runtime event, not a
+                // reason to take the process down with it.
+                logger.always(`[proxy] share listener error: ${error.message}`);
+              });
+            },
+          );
+          return {
+            port: params.sharePort,
+            close: () =>
+              new Promise<void>((resolve) => {
+                const close = shareServer.close?.bind(shareServer);
+                if (!close) {
+                  resolve();
+                  return;
+                }
+                close(() => resolve());
+              }),
+          };
+        },
+      });
+  // Bring it up now if grants already exist, rather than waiting a poll cycle
+  // for a proxy that restarted with shares already issued.
+  await shareListener?.poll();
+
   const managedByLaunchd = isLaunchdManagedProcess() || socketWorker;
   // launchd already owns restart supervision. A second detached supervisor can
   // outlive its parent and terminate a healthy replacement, so the guard is
@@ -3040,6 +3292,7 @@ async function startProxyRuntime(params: {
       pid: process.pid,
       port: params.port,
       host: params.host,
+      sharePort: shareListener ? params.sharePort : undefined,
       strategy: activeStrategy,
       startTime: new Date().toISOString(),
       ready: true,
@@ -3174,28 +3427,36 @@ async function startProxyRuntime(params: {
   }
 
   if (!isDev) {
-    try {
-      await setClaudeProxySettings(url);
-      logger.always(chalk.green("  ✓ Auto-configured Claude Code settings"));
-      logger.always(
-        chalk.dim("    Restart Claude Code to connect through proxy"),
-      );
-    } catch (error) {
-      logger.debug(
-        "[proxy] Failed to auto-configure Claude Code: " +
-          (error instanceof Error ? error.message : String(error)),
-      );
-    }
-
-    try {
-      await setOpenCodeProxySettings(`${url}/v1`);
-      logger.always(chalk.green("  ✓ Auto-configured OpenCode settings"));
-      logger.always(chalk.dim("    Restart OpenCode to connect through proxy"));
-    } catch (error) {
-      logger.debug(
-        "[proxy] Failed to auto-configure OpenCode: " +
-          (error instanceof Error ? error.message : String(error)),
-      );
+    for (const result of await applyAllClients(url)) {
+      if (result.error) {
+        // Visible, not debug-level. A client whose config could not be written
+        // will keep talking to its own upstream, which looks like the proxy
+        // silently not being used — the failure has to be actionable at the
+        // level the user actually reads. The setup wizard already reported
+        // this failure loudly; these two paths used to disagree.
+        logger.always(
+          chalk.yellow(
+            `  ⚠ Could not auto-configure ${result.displayName}: ${result.error.message}`,
+          ),
+        );
+        continue;
+      }
+      if (result.applied) {
+        logger.always(
+          chalk.green(`  ✓ Auto-configured ${result.displayName} settings`),
+        );
+        if (result.note) {
+          // A written file is not the same as a live configuration. Printing
+          // the check without this reads as "done" for a client that is still
+          // talking to its own upstream.
+          logger.always(chalk.yellow(`    ↳ ${result.note}`));
+        }
+        logger.always(
+          chalk.dim(
+            `    Restart ${result.displayName} to connect through proxy`,
+          ),
+        );
+      }
     }
   } else {
     logger.always(
@@ -3203,7 +3464,7 @@ async function startProxyRuntime(params: {
     );
   }
 
-  const maintenance = startProxyBackgroundMaintenance(params.cleanupLogs, () =>
+  const maintenance = startProxyBackgroundMaintenance(params.logsDir, () =>
     params.runtimeConfigStore
       ? params.runtimeConfigStore.getSnapshot().accountAllowlist
       : params.accountAllowlist,
@@ -3215,6 +3476,7 @@ async function startProxyRuntime(params: {
     isDev,
     updaterSupervisor,
     stopRuntimeConfig,
+    shareListener,
     registerSignals: !socketWorker,
     ...maintenance,
   });
@@ -3387,8 +3649,18 @@ async function startProxyCommandHandler(argv: ProxyStartArgs): Promise<void> {
     }
     // In dev mode: redirect writable state to .neurolink-dev/ and skip singleton check
     let devPaths: import("../../lib/types/index.js").ProxyPaths | undefined;
-    const { resolveProxyPaths, resolveProxyUsageStatsPath } =
-      await import("../../lib/proxy/proxyPaths.js");
+    const {
+      resolveProxyPaths,
+      resolveProxyUsageStatsPath,
+      resolveProxyGrantsPath,
+      resolveProxyLedgerPath,
+      resolveProxyPeersPath,
+      resolveProxyResidentGrantsPath,
+      resolveProxyNotesPath,
+      resolveProxyProvisioningPath,
+      resolveProxyReceiptsPath,
+      resolveProxyShareAuditPath,
+    } = await import("../../lib/proxy/proxyPaths.js");
     const proxyPaths = resolveProxyPaths(isDev);
     if (isDev) {
       devPaths = proxyPaths;
@@ -3400,6 +3672,27 @@ async function startProxyCommandHandler(argv: ProxyStartArgs): Promise<void> {
       const { initAccountCooldown } =
         await import("../../lib/proxy/accountCooldown.js");
       initAccountCooldown(devPaths.cooldownFile);
+      const { initShareGrants } =
+        await import("../../lib/proxy/shareGrants.js");
+      initShareGrants(resolveProxyGrantsPath(devPaths));
+      const { initShareLedger } =
+        await import("../../lib/proxy/shareLedger.js");
+      initShareLedger(resolveProxyLedgerPath(devPaths));
+      const { initPeerStore } = await import("../../lib/proxy/peerStore.js");
+      initPeerStore(resolveProxyPeersPath(devPaths));
+      const { initResidentGrants } =
+        await import("../../lib/proxy/residentGrants.js");
+      initResidentGrants(resolveProxyResidentGrantsPath(devPaths));
+      const { initShareAudit } = await import("../../lib/proxy/shareAudit.js");
+      initShareAudit(resolveProxyShareAuditPath(devPaths));
+      const { initShareProvisioning } =
+        await import("../../lib/proxy/shareProvisioning.js");
+      initShareProvisioning(resolveProxyProvisioningPath(devPaths));
+      const { initShareReceipts } =
+        await import("../../lib/proxy/shareReceipts.js");
+      initShareReceipts(resolveProxyReceiptsPath(devPaths));
+      const { initShareNotes } = await import("../../lib/proxy/shareNotes.js");
+      initShareNotes(resolveProxyNotesPath(devPaths));
 
       // Ensure the dev state directory exists
       const { mkdirSync, existsSync } = await import("fs");
@@ -3447,7 +3740,7 @@ async function startProxyCommandHandler(argv: ProxyStartArgs): Promise<void> {
     // content-filters. Runs once, after env load so it can be tuned via env.
     configureProxyKeepAliveDispatcher();
 
-    const { neurolink, cleanupLogs } = await createProxyNeurolinkRuntime(
+    const { neurolink, logsDir } = await createProxyNeurolinkRuntime(
       devPaths?.logsDir,
     );
     const configPath = argv.config
@@ -3480,6 +3773,12 @@ async function startProxyCommandHandler(argv: ProxyStartArgs): Promise<void> {
     }
 
     const port = argv.port ?? 55669;
+    const { resolveSharePort } =
+      await import("../../lib/proxy/shareListener.js");
+    const sharePort = resolveSharePort({
+      ...(argv.sharePort !== undefined ? { explicit: argv.sharePort } : {}),
+      mainPort: port,
+    });
     const host = argv.host ?? "127.0.0.1";
     const { app, readiness } = await createProxyStartApp({
       neurolink,
@@ -3492,6 +3791,7 @@ async function startProxyCommandHandler(argv: ProxyStartArgs): Promise<void> {
       primaryAccountKey,
       accountAllowlist,
       runtimeConfigStore,
+      sharePort,
     });
 
     await initializeProxyOpenTelemetry();
@@ -3507,12 +3807,13 @@ async function startProxyCommandHandler(argv: ProxyStartArgs): Promise<void> {
       readiness,
       host,
       port,
+      sharePort,
       strategy,
       proxyConfig,
       accountAllowlist,
       loadedEnvFile,
       passthrough,
-      cleanupLogs,
+      logsDir,
       runtimeConfigStore,
     });
   } catch (error) {
@@ -3545,6 +3846,13 @@ export const proxyStartCommand: CommandModule<object, ProxyStartArgs> = {
         alias: "p",
         default: 55669,
         description: "Port to listen on",
+      })
+      .option("share-port", {
+        type: "number",
+        alias: "sharePort",
+        description:
+          "Gate-only listener port for peer sharing (default: port + 1). " +
+          "Runs only while at least one active grant exists; this is the port to expose.",
       })
       .option("host", {
         type: "string",
@@ -3684,7 +3992,8 @@ function printStatusStats(stats: StatusStats): void {
     if (lastError) {
       const cause = lastError.errorType ?? lastError.category;
       const code = lastError.errorCode ? `/${lastError.errorCode}` : "";
-      const account = lastError.account ? ` account=${lastError.account}` : "";
+      const accountIdentity = lastError.accountKey ?? lastError.account;
+      const account = accountIdentity ? ` account=${accountIdentity}` : "";
       console.info(
         `    Last error:  ${new Date(lastError.at).toISOString()} ${cause}${code} status=${lastError.status}${account}`,
       );
@@ -3695,7 +4004,28 @@ function printStatusStats(stats: StatusStats): void {
       }
     }
   }
-  if (stats.accounts?.length) {
+  const historical = (stats.accounts ?? []).filter(
+    (account) => account.status === "unattributed",
+  );
+  const accounts = (stats.accounts ?? []).filter(
+    (account) => account.status !== "unattributed",
+  );
+  if (historical.length > 0) {
+    const sum = (
+      field: "attempts" | "success" | "errors" | "rateLimits",
+    ): number =>
+      historical.reduce((total, account) => total + (account[field] ?? 0), 0);
+    console.info(
+      `\n  Historical usage (provider unknown; included in totals):`,
+    );
+    console.info(
+      `    ${historical.length} legacy records: ${sum("attempts")} attempts, ${sum("success")} success, ${sum("errors")} errors, ${sum("rateLimits")} rate-limited attempts`,
+    );
+    console.info(
+      "    Per-record history remains available with --format json.",
+    );
+  }
+  if (accounts.length > 0) {
     console.info(`\n  Accounts:`);
     const headers = [
       "ACCOUNT",
@@ -3706,8 +4036,8 @@ function printStatusStats(stats: StatusStats): void {
       "RL",
       "STATUS",
     ];
-    const rows = stats.accounts.map((account) => [
-      account.label,
+    const rows = accounts.map((account) => [
+      account.key ?? account.label,
       account.type,
       String(account.attempts ?? account.requests ?? 0),
       String(account.success ?? 0),
@@ -3816,6 +4146,7 @@ export const proxyStatusCommand: CommandModule<object, ProxyStatusArgs> = {
         updaterRunning: false,
         latestVersion: updateState?.lastCheckVersion || null,
         lastDetectedVersion: updateState?.lastCheckVersion || null,
+        lastCheckAt: updateState?.lastCheckAt ?? null,
         installedVersion:
           updateState?.installedVersion ??
           updateState?.lastUpdateVersion ??
@@ -3883,7 +4214,7 @@ export const proxyStatusCommand: CommandModule<object, ProxyStatusArgs> = {
       }
 
       // Fetch live stats before rendering (JSON or text)
-      let liveStats: Record<string, unknown> | null = null;
+      let liveStats: StatusStats | null = null;
       let liveConfig: Record<string, unknown> | null = null;
       if (status.running && status.url) {
         try {
@@ -3895,7 +4226,7 @@ export const proxyStatusCommand: CommandModule<object, ProxyStatusArgs> = {
               string,
               unknown
             >;
-            liveStats = statusData.stats as Record<string, unknown> | null;
+            liveStats = (statusData.stats as StatusStats | null) ?? null;
             liveConfig = statusData.config as Record<string, unknown> | null;
             status.workerVersion =
               typeof statusData.version === "string"
@@ -4010,6 +4341,11 @@ export const proxyStatusCommand: CommandModule<object, ProxyStatusArgs> = {
             `  ${chalk.bold("Handoff:")}    ${chalk.cyan(`${status.rolling.draining.length} previous worker(s) draining`)}`,
           );
         }
+        if (status.rolling) {
+          logger.always(
+            `  ${chalk.bold("Socket handoff:")} ${status.rolling.pendingTransfers ?? "unknown"} pending, ${status.rolling.queuedSockets} queued; ${status.rolling.rejectedSockets} rejected, ${status.rolling.failedTransfers} failed transfers since supervisor start`,
+          );
+        }
         if (status.deferredUpdate) {
           const active =
             status.deferredUpdate.activeRequests === null
@@ -4022,6 +4358,11 @@ export const proxyStatusCommand: CommandModule<object, ProxyStatusArgs> = {
         if (status.latestVersion) {
           logger.always(
             `  ${chalk.bold("Latest:")}     ${chalk.cyan(`v${status.latestVersion}`)}`,
+          );
+        }
+        if (status.latestVersion && status.lastCheckAt) {
+          logger.always(
+            `  ${chalk.bold("Last update check:")} ${chalk.cyan(status.lastCheckAt)}`,
           );
         }
         if (status.installedVersion) {
@@ -4089,22 +4430,8 @@ export const proxyStatusCommand: CommandModule<object, ProxyStatusArgs> = {
           );
         }
 
-        // Try to get detailed stats
-        try {
-          const liveUrl = status.url;
-          const statusResp = await fetch(`${liveUrl}/status`, {
-            signal: AbortSignal.timeout(2_000),
-          });
-          if (statusResp.ok) {
-            const statusData = (await statusResp.json()) as {
-              stats?: StatusStats;
-            };
-            if (statusData.stats) {
-              printStatusStats(statusData.stats);
-            }
-          }
-        } catch {
-          /* non-fatal */
+        if (liveStats) {
+          printStatusStats(liveStats);
         }
       } else {
         logger.always(
@@ -4847,23 +5174,27 @@ export const proxyGuardCommand: CommandModule<object, ProxyGuardArgs> = {
     const startedAt = Date.now();
     let parentStatus = getProcessStatus(parentPid);
     let consecutiveUnhealthy = 0;
+    let lastUnhealthyProbe: ProxyHealthProbe | null = null;
 
     // Keep monitoring for as long as the parent can affect Claude settings.
     while (true) {
-      const healthy = await isProxyHealthy(host, port, 1_500);
+      const healthProbe = await probeProxyHealth(host, port, 1_500);
+      const healthy = healthProbe.healthy;
 
       if (healthy) {
         if (updaterOnly && consecutiveUnhealthy >= failureThreshold) {
           logger.always(
-            `[updater] proxy health recovered after ${consecutiveUnhealthy} failed checks`,
+            `[updater] proxy health recovered after ${consecutiveUnhealthy} failed checks; ${formatProxyHealthProbe(lastUnhealthyProbe ?? healthProbe)}`,
           );
         }
         consecutiveUnhealthy = 0;
+        lastUnhealthyProbe = null;
       } else {
         consecutiveUnhealthy += 1;
+        lastUnhealthyProbe = healthProbe;
         if (updaterOnly && consecutiveUnhealthy === failureThreshold) {
           logger.always(
-            `[updater] proxy health unavailable after ${consecutiveUnhealthy} checks; worker remains active`,
+            `[updater] proxy health unavailable after ${consecutiveUnhealthy} checks; worker remains active; ${formatProxyHealthProbe(healthProbe)}`,
           );
         }
       }
@@ -4920,12 +5251,10 @@ export const proxyGuardCommand: CommandModule<object, ProxyGuardArgs> = {
 
     // The parent is confirmed gone and no replacement is healthy. Foreground
     // guards are cleanup-only; they never restart or signal proxy processes.
-    const cleared = await clearClaudeProxySettings(expectedBaseUrl);
-    try {
-      await clearOpenCodeProxySettings(`${expectedBaseUrl}/v1`);
-    } catch {
-      // non-fatal
-    }
+    const restored = await restoreAllClients(expectedBaseUrl);
+    // Downstream logic keys off whether Claude Code specifically was restored.
+    const cleared =
+      restored.find((r) => r.id === "claude-code")?.restored ?? false;
 
     const state = loadProxyState();
     if (
@@ -5061,26 +5390,28 @@ export const proxySetupCommand: CommandModule = {
         chalk.blue(`\nStep ${nextStep}:`) + " Configuring Claude Code...",
       );
       const url = `http://127.0.0.1:${port}`;
-      try {
-        await setClaudeProxySettings(url);
-        console.info(chalk.green("  ✓ Claude Code configured"));
-      } catch (e) {
-        console.info(
-          chalk.yellow(
-            `  ⚠ Could not auto-configure Claude Code: ${e instanceof Error ? e.message : String(e)}`,
-          ),
-        );
-        console.info(chalk.yellow(`  Set manually: ANTHROPIC_BASE_URL=${url}`));
-      }
-      try {
-        await setOpenCodeProxySettings(`${url}/v1`);
-        console.info(chalk.green("  ✓ OpenCode configured"));
-      } catch (e) {
-        console.info(
-          chalk.yellow(
-            `  ⚠ Could not auto-configure OpenCode: ${e instanceof Error ? e.message : String(e)}`,
-          ),
-        );
+      for (const result of await applyAllClients(url)) {
+        if (result.error) {
+          console.info(
+            chalk.yellow(
+              `  ⚠ Could not auto-configure ${result.displayName}: ${result.error.message}`,
+            ),
+          );
+          // Claude Code is the one client whose manual fallback is a single
+          // env var, so it is worth spelling out.
+          if (result.id === "claude-code") {
+            console.info(
+              chalk.yellow(`  Set manually: ANTHROPIC_BASE_URL=${url}`),
+            );
+          }
+          continue;
+        }
+        if (result.applied) {
+          console.info(chalk.green(`  ✓ ${result.displayName} configured`));
+          if (result.note) {
+            console.info(chalk.yellow(`    ↳ ${result.note}`));
+          }
+        }
       }
 
       // Done!
@@ -5393,6 +5724,50 @@ export const proxyInstallCommand: CommandModule = {
   },
 };
 
+/**
+ * Put every auto-configured CLI back the way it was, using the URL recorded in
+ * the proxy's own state file.
+ *
+ * `proxy uninstall` is the one moment where "the proxy is going away for good"
+ * is unambiguous, and it is the only place this can be done for a
+ * launchd-managed service: the shutdown path restores on SIGINT only, and both
+ * `launchctl unload` and this command stop the supervisor with SIGTERM. Without
+ * this, uninstalling left all five clients pointing at a socket that no longer
+ * answers, with nothing to say why.
+ *
+ * Must run before `clearProxyState()` — the state file is what tells us which
+ * URL the clients were given, and the restore helpers deliberately refuse to
+ * touch a URL they did not write.
+ */
+async function restoreClientsOnUninstall(): Promise<void> {
+  let state: ProxyState | null = null;
+  try {
+    state = loadProxyState();
+  } catch {
+    // An unreadable state file is not a reason to abort an uninstall.
+  }
+  if (!state?.port) {
+    // Nothing recorded, so we cannot prove which URL the configs carry.
+    return;
+  }
+  // 0.0.0.0 is a bind address, never a reachable one; clients were handed
+  // localhost, so that is what restore has to match on.
+  const host =
+    state.host === "0.0.0.0" ? "localhost" : (state.host ?? "localhost");
+  const results = await restoreAllClients(`http://${host}:${state.port}`);
+  for (const result of results) {
+    if (result.restored) {
+      console.info(
+        chalk.green(`\u2713 Restored ${result.displayName} settings`),
+      );
+    } else if (result.error) {
+      logger.debug(
+        `[proxy] ${result.id} restore failed during uninstall: ${result.error.message}`,
+      );
+    }
+  }
+}
+
 export const proxyUninstallCommand: CommandModule = {
   command: "uninstall",
   describe: "Remove proxy background service",
@@ -5414,6 +5789,7 @@ export const proxyUninstallCommand: CommandModule = {
         );
         process.exit(1);
       }
+      await restoreClientsOnUninstall();
       clearProxyState();
       clearProxySupervisorState();
       console.info(chalk.yellow("No proxy service installed."));
@@ -5441,6 +5817,7 @@ export const proxyUninstallCommand: CommandModule = {
     }
 
     unlinkSync(PLIST_PATH);
+    await restoreClientsOnUninstall();
     clearProxyState();
     clearProxySupervisorState();
     console.info(chalk.green(`✓ Plist removed from ${PLIST_PATH}`));

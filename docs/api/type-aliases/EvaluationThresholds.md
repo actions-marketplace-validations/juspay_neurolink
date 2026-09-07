@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **EvaluationThresholds** = `object`
 
-Defined in: [types/guardrails.ts:46](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/guardrails.ts#L46)
+Defined in: [types/guardrails.ts:46](https://github.com/juspay/neurolink/blob/release/src/lib/types/guardrails.ts#L46)
 
 ## Properties
 
@@ -16,7 +16,7 @@ Defined in: [types/guardrails.ts:46](https://github.com/juspay/neurolink/blob/ff
 
 > `optional` **safetyScore?**: `number`
 
-Defined in: [types/guardrails.ts:47](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/guardrails.ts#L47)
+Defined in: [types/guardrails.ts:47](https://github.com/juspay/neurolink/blob/release/src/lib/types/guardrails.ts#L47)
 
 ---
 
@@ -24,7 +24,7 @@ Defined in: [types/guardrails.ts:47](https://github.com/juspay/neurolink/blob/ff
 
 > `optional` **appropriatenessScore?**: `number`
 
-Defined in: [types/guardrails.ts:48](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/guardrails.ts#L48)
+Defined in: [types/guardrails.ts:48](https://github.com/juspay/neurolink/blob/release/src/lib/types/guardrails.ts#L48)
 
 ---
 
@@ -32,4 +32,4 @@ Defined in: [types/guardrails.ts:48](https://github.com/juspay/neurolink/blob/ff
 
 > `optional` **confidenceLevel?**: `number`
 
-Defined in: [types/guardrails.ts:49](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/guardrails.ts#L49)
+Defined in: [types/guardrails.ts:49](https://github.com/juspay/neurolink/blob/release/src/lib/types/guardrails.ts#L49)

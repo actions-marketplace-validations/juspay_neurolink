@@ -8,8 +8,14 @@
  */
 
 import { createRequire } from "node:module";
+import * as zlib from "node:zlib";
 
-import { BaseFileProcessor } from "../base/BaseFileProcessor.js";
+import {
+  BaseFileProcessor,
+  contentTooLargeError,
+  isContentTooLarge,
+} from "../base/BaseFileProcessor.js";
+import { readZipEntryWithinLimit } from "../archive/zipEntryReader.js";
 import type {
   FileInfo,
   ProcessorFileProcessingResult,
@@ -88,7 +94,26 @@ export class OpenDocumentProcessor extends BaseFileProcessor<ProcessedOpenDocume
       // Try to get content.xml
       const contentEntry = zip.getEntry("content.xml");
       if (contentEntry) {
-        const xmlContent = contentEntry.getData().toString("utf-8");
+        // Bounded rather than `getData()`: an ODF file is a ZIP, so its
+        // content.xml can declare any uncompressed size it likes, and
+        // `maxSizeMB` only ever saw the compressed archive on the way in.
+        const read = readZipEntryWithinLimit(
+          contentEntry,
+          SIZE_LIMITS.DOCUMENT_MAX_MB * 1024 * 1024,
+          zlib,
+        );
+        if (read.status === "too-large") {
+          // Coded, so the bound surfaces as FILE_TOO_LARGE (not retryable)
+          // rather than PROCESSING_FAILED (retryable). The file will be
+          // exactly as oversized on the next attempt.
+          throw contentTooLargeError(
+            `content.xml in "${this.getFilename(fileInfo)}" exceeds the ${SIZE_LIMITS.DOCUMENT_MAX_MB}MB limit for OpenDocument content`,
+          );
+        }
+        if (read.status !== "ok") {
+          throw new Error("content.xml could not be read from the archive");
+        }
+        const xmlContent = read.buffer.toString("utf-8");
         const extracted = this.extractTextFromXml(xmlContent);
         textContent = extracted.text;
         paragraphCount = extracted.paragraphCount;
@@ -104,6 +129,13 @@ export class OpenDocumentProcessor extends BaseFileProcessor<ProcessedOpenDocume
         throw new Error("content.xml not found in OpenDocument archive");
       }
     } catch (error) {
+      // A size verdict passes through intact. Re-wrapping it as a plain Error
+      // drops the code, and the base class then reports PROCESSING_FAILED —
+      // which is retryable, so the caller would refetch and decompress a file
+      // guaranteed to be exactly as oversized.
+      if (isContentTooLarge(error)) {
+        throw error;
+      }
       const message = error instanceof Error ? error.message : "Unknown error";
       throw new Error(`Failed to extract OpenDocument content: ${message}`, {
         cause: error,

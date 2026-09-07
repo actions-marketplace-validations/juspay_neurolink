@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **EnhancementResult** = `object`
 
-Defined in: [types/utilities.ts:163](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/utilities.ts#L163)
+Defined in: [types/utilities.ts:163](https://github.com/juspay/neurolink/blob/release/src/lib/types/utilities.ts#L163)
 
 Enhancement result with metadata
 
@@ -18,7 +18,7 @@ Enhancement result with metadata
 
 > **options**: [`UnifiedGenerationOptions`](UnifiedGenerationOptions.md)
 
-Defined in: [types/utilities.ts:164](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/utilities.ts#L164)
+Defined in: [types/utilities.ts:164](https://github.com/juspay/neurolink/blob/release/src/lib/types/utilities.ts#L164)
 
 ---
 
@@ -26,7 +26,7 @@ Defined in: [types/utilities.ts:164](https://github.com/juspay/neurolink/blob/ff
 
 > **metadata**: `object`
 
-Defined in: [types/utilities.ts:165](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/utilities.ts#L165)
+Defined in: [types/utilities.ts:165](https://github.com/juspay/neurolink/blob/release/src/lib/types/utilities.ts#L165)
 
 #### enhancementApplied
 

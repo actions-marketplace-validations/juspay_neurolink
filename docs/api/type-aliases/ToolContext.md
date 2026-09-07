@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ToolContext** = `object`
 
-Defined in: [types/tools.ts:229](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L229)
+Defined in: [types/tools.ts:280](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L280)
 
 Tool execution context
 
@@ -18,7 +18,7 @@ Tool execution context
 
 > `optional` **sessionId?**: `string`
 
-Defined in: [types/tools.ts:230](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L230)
+Defined in: [types/tools.ts:281](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L281)
 
 ---
 
@@ -26,7 +26,7 @@ Defined in: [types/tools.ts:230](https://github.com/juspay/neurolink/blob/ff50c1
 
 > `optional` **userId?**: `string`
 
-Defined in: [types/tools.ts:231](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L231)
+Defined in: [types/tools.ts:282](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L282)
 
 ---
 
@@ -34,7 +34,7 @@ Defined in: [types/tools.ts:231](https://github.com/juspay/neurolink/blob/ff50c1
 
 > `optional` **aiProvider?**: `string`
 
-Defined in: [types/tools.ts:232](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L232)
+Defined in: [types/tools.ts:283](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L283)
 
 ---
 
@@ -42,4 +42,4 @@ Defined in: [types/tools.ts:232](https://github.com/juspay/neurolink/blob/ff50c1
 
 > `optional` **metadata?**: [`ToolExecutionMetadata`](ToolExecutionMetadata.md)
 
-Defined in: [types/tools.ts:233](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L233)
+Defined in: [types/tools.ts:284](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L284)

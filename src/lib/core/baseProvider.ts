@@ -1,13 +1,16 @@
 import { context, SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
 import { directAgentTools } from "../agent/directTools.js";
 import type { AIProviderName } from "../constants/enums.js";
-import { IMAGE_GENERATION_MODELS } from "../core/constants.js";
+import { defaultProviderFor } from "../factories/mediaHandlerCatalog.js";
+import { PROVIDER_DESCRIPTORS_BY_NAME } from "../factories/providerDescriptors.js";
 import type { EvaluationData } from "../index.js";
 import { MiddlewareFactory } from "../middleware/factory.js";
 import { modelSupports } from "../models/modelRegistry.js";
 import type { NeuroLink } from "../neurolink.js";
+import { resolveRequestKind } from "./resolveRequestKind.js";
 import { ATTR, tracers } from "../telemetry/index.js";
 import type {
+  GenerateTextResult,
   JsonValue,
   UnknownRecord,
   LifecycleMiddlewareConfig,
@@ -18,7 +21,9 @@ import type {
   AIProvider,
   AnalyticsData,
   EnhancedGenerateResult,
+  TTSChunk,
   TTSMetadata,
+  TTSResult,
   TextGenerationOptions,
   TextGenerationResult,
   StandardRecord,
@@ -26,7 +31,29 @@ import type {
   ValidationSchema,
   ZodUnknownSchema,
 } from "../types/index.js";
-import { isAbortError, NeuroLinkError } from "../utils/errorHandling.js";
+import {
+  ERROR_CODES,
+  isAbortError,
+  NeuroLinkError,
+} from "../utils/errorHandling.js";
+import { InvalidModelError, ProviderError } from "../types/index.js";
+
+/**
+ * `instanceof` is not reliable here. The published bundle and the source tree
+ * are separate module graphs, so an InvalidModelError built by the error
+ * classifier can fail an `instanceof` against the class this file imported —
+ * silently, with a clean typecheck. The constructor-name check is the same
+ * approach the OTel error-type mapping below already uses.
+ */
+function isInvalidModelError(error: unknown): boolean {
+  return (
+    error instanceof InvalidModelError ||
+    (error instanceof Error && error.constructor.name === "InvalidModelError")
+  );
+}
+import { sanitizeErrorCause } from "../utils/logSanitize.js";
+import { createAnalytics as buildAnalytics } from "./analytics.js";
+import { ErrorCategory, ErrorSeverity } from "../constants/enums.js";
 import {
   duckTypedStatusCode,
   extractRetryAfterMsFromError,
@@ -37,6 +64,12 @@ import {
 } from "../utils/lifecycleCallbacks.js";
 import { resolveLifecycleTimeoutMs } from "../utils/lifecycleTimeout.js";
 import { logger } from "../utils/logger.js";
+import { interleaveTTSStream } from "../utils/ttsStream.js";
+import {
+  attachStreamCancel,
+  cancelStream,
+  releaseIterator,
+} from "../utils/streamCancellation.js";
 import {
   TimeoutError as AsyncTimeoutError,
   withTimeoutFn,
@@ -84,7 +117,7 @@ import type {
   ToolDedupConfig,
   ToolSet,
 } from "../types/index.js";
-import { generateText } from "../utils/generation.js";
+import { generateOnceNative } from "../utils/nativeSingleShot.js";
 import { extractTokenUsage } from "../utils/tokenUtils.js";
 
 /**
@@ -106,6 +139,51 @@ function getLifecycleMiddlewareConfig(
  * Abstract base class for all AI providers
  * Tools are integrated as first-class citizens - always available by default
  */
+/**
+ * Marks an error as already run through `formatProviderError`.
+ *
+ * `handleProviderError` is NOT idempotent — measured: feeding its own output back in
+ * degrades a specific classification into a generic one, because it copies `statusCode`
+ * onto the formatted error, so a second pass re-matches the bare 429 rule while the more
+ * specific rule (which keyed on the raw body) no longer can:
+ *
+ *   pass 1  ProviderError  "[openai] OpenAI quota exhausted — this will not resolve by retrying..."
+ *   pass 2  RateLimitError "[openai] OpenAI rate limit exceeded. Please try again later."
+ *
+ * Since the stream path can now reach a classifier that other paths already reached, that
+ * second pass became possible and had to be made impossible.
+ *
+ * Same `Symbol.for` stamping technique as `utils/lifecycleCallbacks.ts` and for the same
+ * reason: it survives across module copies where a closed-over WeakSet would not, and a
+ * frozen error degrades to one extra classification rather than a throw.
+ */
+const PROVIDER_ERROR_CLASSIFIED = Symbol.for(
+  "neurolink.providerErrorClassified",
+);
+
+function markProviderErrorClassified(error: unknown): void {
+  if (error === null || typeof error !== "object") {
+    return;
+  }
+  try {
+    Object.defineProperty(error, PROVIDER_ERROR_CLASSIFIED, {
+      value: true,
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+  } catch {
+    // Non-extensible error — worst case is one redundant classification.
+  }
+}
+
+function isProviderErrorClassified(error: unknown): boolean {
+  if (error === null || typeof error !== "object") {
+    return false;
+  }
+  return (error as Record<symbol, unknown>)[PROVIDER_ERROR_CLASSIFIED] === true;
+}
+
 export abstract class BaseProvider implements AIProvider {
   // Not `readonly` because providers that auto-discover the model from a
   // /v1/models endpoint (lm-studio, llamacpp) need to update modelName after
@@ -114,7 +192,7 @@ export abstract class BaseProvider implements AIProvider {
   protected modelName: string;
   protected readonly providerName: AIProviderName;
   protected readonly defaultTimeout: number = 30000; // 30 seconds
-  protected middlewareOptions?: MiddlewareFactoryOptions; // TODO(#1179): Implement global level middlewares that can be used
+  protected middlewareOptions?: MiddlewareFactoryOptions; // TODO(#1576): Implement global level middlewares that can be used
 
   // Tools are conditionally included based on centralized configuration
   protected readonly directTools = shouldDisableBuiltinTools()
@@ -352,18 +430,13 @@ export abstract class BaseProvider implements AIProvider {
 
     // CRITICAL: Image generation models don't support real streaming
     // Force fake streaming for image models to ensure image output is yielded.
-    // Skip this path when the caller explicitly requests non-image output (e.g.
-    // JSON analysis) so dual-mode models like gemini-3.1-flash-image-preview
-    // can still perform text/structured generation.
-    const isImageModel = IMAGE_GENERATION_MODELS.some((m) =>
-      this.modelName.includes(m),
-    );
-    const requestsNonImageOutput =
-      options.output?.format === "json" ||
-      options.output?.format === "structured" ||
-      options.output?.format === "text";
+    // resolveRequestKind() skips this path when the caller explicitly requests
+    // non-image output (e.g. JSON analysis) so dual-mode models like
+    // gemini-3.1-flash-image-preview can still perform text/structured
+    // generation — see its doc comment for the full precedence table.
+    const requestKind = resolveRequestKind(options, this.modelName);
 
-    if (isImageModel && !requestsNonImageOutput) {
+    if (requestKind === "image") {
       logger.info(`Image model detected, forcing fake streaming`, {
         provider: this.providerName,
         model: this.modelName,
@@ -417,10 +490,33 @@ export abstract class BaseProvider implements AIProvider {
       // anything that doesn't go through streamText) bypass it. Wrapping
       // here makes the callbacks fire for every provider, regardless of
       // streaming implementation.
-      return this.wrapStreamWithLifecycleCallbacks(realStreamResult, options);
+      return this.wrapStreamWithLifecycleCallbacks(
+        this.withStreamModelFallback(realStreamResult, options, analysisSchema),
+        options,
+      );
     } catch (realStreamError) {
-      // Don't retry on terminal/abort errors — only fall back for
-      // "real streaming with tools is unsupported" style failures.
+      // Retired-model fallback runs FIRST, before any lifecycle callback has
+      // fired and before a single chunk has reached the consumer: onChunk and
+      // onFinish are only wired on the success path above, and onError fires
+      // further down this same catch. That ordering is what makes retrying a
+      // stream safe at all — nothing observable has happened yet.
+      const recovered = await this.retryStreamWithFallbackModel(
+        realStreamError,
+        options,
+        analysisSchema,
+      );
+      if (recovered) {
+        return recovered;
+      }
+
+      // The fallback is BROAD, not narrow: only the terminal errors listed
+      // below (abort, timeout, 401/403, quota, rate limit, authentication)
+      // re-throw. Every other failure — including a genuine configuration or
+      // programming error — is masked as a degraded fake stream whenever
+      // tools are enabled. Narrowing this to "streaming with tools is
+      // unsupported" failures would change behaviour for every provider at
+      // once, so it needs its own characterization PR first; until then this
+      // comment records what the code does, not what a narrower design would.
       const errMsg =
         realStreamError instanceof Error
           ? realStreamError.message
@@ -475,6 +571,225 @@ export abstract class BaseProvider implements AIProvider {
   }
 
   /**
+   * Swap in a fallback model when a stream dies on a retired id before it has
+   * produced anything.
+   *
+   * OpenAI-compatible streaming is lazy: executeStream() returns a
+   * StreamResult without touching the network, and the request only goes out
+   * on the consumer's first pull. A retired model therefore does NOT fail in
+   * stream()'s try/catch — it fails deep inside iteration. This wrapper sits
+   * UNDER wrapStreamWithLifecycleCallbacks precisely so that a failed first
+   * attempt is invisible: onChunk, onFinish and onError all belong to the
+   * layer above and never observe it.
+   *
+   * The `yielded` guards are the safety property. A stream is only retried
+   * while it has emitted nothing; once a single chunk has reached the
+   * consumer the output is committed, and any later failure propagates
+   * untouched rather than replaying a half-delivered response.
+   */
+  private withStreamModelFallback(
+    result: StreamResult,
+    options: StreamOptions,
+    analysisSchema: ValidationSchema | undefined,
+  ): StreamResult {
+    // The caller owns fallback order (the Claude proxy sets this): hand the
+    // stream back untouched so an invalid model surfaces as exactly that.
+    if (options.disableInternalFallback === true) {
+      return result;
+    }
+    const provider = this;
+    const source = result.stream;
+    // Iterate through explicit iterators so a consumer break can be forwarded
+    // to the one that is actually in flight (see the cancel hook below): a
+    // generator's own return() is queued behind a pending next(), and a
+    // source that is waiting on a slow vendor would never see the break.
+    const sourceIterator = source[Symbol.asyncIterator]();
+    let activeStream: unknown = source;
+    let activeIterator: { return?: (value?: unknown) => unknown } =
+      sourceIterator;
+    const iterableOf = <T>(iterator: AsyncIterator<T>): AsyncIterable<T> => ({
+      [Symbol.asyncIterator]: () => iterator,
+    });
+
+    // A failing stream still emits one chunk before it throws: the no-output
+    // sentinel, {content: "", metadata: {noOutput: true, ...}}. That is a
+    // marker, not output, so it must not count as committed — otherwise the
+    // guard below blocks every retry it exists to allow. Only that sentinel
+    // and a bare empty text chunk are withheld; everything else — reasoning
+    // deltas ({content: "", reasoning}), tool-call deltas, audio and image
+    // chunks — IS output, commits the stream, and is yielded immediately so
+    // real-time streaming is untouched. Withheld chunks are released in order
+    // once real output arrives, at end of stream, or before any error that is
+    // not retried; they are dropped only when a fallback model takes over.
+    const isWithheld = (chunk: unknown): boolean => {
+      if (typeof chunk === "string") {
+        return chunk.length === 0;
+      }
+      if (typeof chunk !== "object" || chunk === null) {
+        return false;
+      }
+      const shape = chunk as {
+        content?: unknown;
+        metadata?: { noOutput?: unknown };
+      };
+      if (shape.metadata?.noOutput === true) {
+        return true;
+      }
+      return shape.content === "" && Object.keys(shape).length === 1;
+    };
+
+    async function* withFallback(): AsyncGenerator<unknown, void, unknown> {
+      let committed = false;
+      const held: unknown[] = [];
+      try {
+        for await (const chunk of iterableOf(sourceIterator)) {
+          if (isWithheld(chunk)) {
+            held.push(chunk);
+            continue;
+          }
+          committed = true;
+          while (held.length > 0) {
+            yield held.shift();
+          }
+          yield chunk;
+        }
+        while (held.length > 0) {
+          yield held.shift();
+        }
+        return;
+      } catch (error) {
+        if (
+          committed ||
+          !isInvalidModelError(provider.formatProviderError(error))
+        ) {
+          // Not retrying: release what was withheld — the sentinel included —
+          // so the consumer sees exactly what the unwrapped stream produced
+          // before the error.
+          while (held.length > 0) {
+            yield held.shift();
+          }
+          throw error;
+        }
+        const requestedModel = provider.modelName;
+        const candidates = provider
+          .getModelFallbacks()
+          .filter((model) => model !== requestedModel);
+        for (const candidate of candidates) {
+          logger.warn(
+            `[${provider.providerName}] model "${requestedModel}" was rejected as invalid — retrying stream with fallback "${candidate}". This provider's catalog entry is stale; run "pnpm run check:models".`,
+          );
+          provider.refreshHandlersForModel(candidate);
+          let retryCommitted = false;
+          const retryHeld: unknown[] = [];
+          try {
+            const retry = await provider.executeStream(options, analysisSchema);
+            const retryIterator = retry.stream[Symbol.asyncIterator]();
+            activeStream = retry.stream;
+            activeIterator = retryIterator;
+            for await (const chunk of iterableOf(retryIterator)) {
+              if (isWithheld(chunk)) {
+                retryHeld.push(chunk);
+                continue;
+              }
+              retryCommitted = true;
+              while (retryHeld.length > 0) {
+                yield retryHeld.shift();
+              }
+              yield chunk;
+            }
+            while (retryHeld.length > 0) {
+              yield retryHeld.shift();
+            }
+            return;
+          } catch (retryError) {
+            // Same rule as above: once this candidate has emitted real
+            // content its output is committed, and moving to another model
+            // would splice two different responses together.
+            if (retryCommitted) {
+              throw retryError;
+            }
+          }
+        }
+        provider.refreshHandlersForModel(requestedModel);
+        // Every fallback failed too: release the original attempt's withheld
+        // chunks, then surface the ORIGINAL error — it names the model the
+        // caller asked for.
+        while (held.length > 0) {
+          yield held.shift();
+        }
+        throw error;
+      }
+    }
+
+    const wrapped = withFallback();
+    // Same contract as wrapStreamWithLifecycleCallbacks: a consumer break
+    // (cancelStream on the outer stream) must close the live upstream
+    // iterator directly, not wait for this generator to reach its next
+    // yield. Without this, the TTS early-break path — and any consumer that
+    // stops mid-stream — would leave the vendor request open until the next
+    // chunk arrived.
+    attachStreamCancel(wrapped, () => {
+      cancelStream(activeStream);
+      releaseIterator(activeIterator);
+    });
+    return {
+      ...result,
+      stream: wrapped as StreamResult["stream"],
+    };
+  }
+
+  /**
+   * The eager half of the retired-model stream fallback, for providers whose
+   * executeStream() reaches the network before returning (see
+   * runGenerateWithModelFallback for the generate() half and the reasoning).
+   *
+   * Returns a working StreamResult when a fallback model succeeds, or
+   * undefined to mean "not recoverable — carry on with the original error".
+   * Returning rather than throwing is deliberate: every existing path in the
+   * caller's catch (the broad fake-streaming fallback, the terminal-error
+   * re-throw, the onError firing) is left exactly as it was, so behaviour
+   * changes only when a fallback actually succeeds.
+   */
+  private async retryStreamWithFallbackModel(
+    error: unknown,
+    options: StreamOptions,
+    analysisSchema: ValidationSchema | undefined,
+  ): Promise<StreamResult | undefined> {
+    if (options.disableInternalFallback === true) {
+      return undefined;
+    }
+    // executeStream() surfaces the raw transport error, so classify it the
+    // way this provider would before deciding. formatProviderError is
+    // contractually return-only, never throw.
+    if (!isInvalidModelError(this.formatProviderError(error))) {
+      return undefined;
+    }
+    const requestedModel = this.modelName;
+    const candidates = this.getModelFallbacks().filter(
+      (model) => model !== requestedModel,
+    );
+    for (const candidate of candidates) {
+      logger.warn(
+        `[${this.providerName}] model "${requestedModel}" was rejected as invalid — retrying stream with fallback "${candidate}". This provider's catalog entry is stale; run "pnpm run check:models".`,
+      );
+      this.refreshHandlersForModel(candidate);
+      try {
+        const result = await this.executeStream(options, analysisSchema);
+        return this.wrapStreamWithLifecycleCallbacks(result, options);
+      } catch {
+        // Any failure on a candidate — stale id or otherwise — just moves to
+        // the next one. Nothing is reported from here: if none succeed the
+        // caller still handles the ORIGINAL error, which names the model the
+        // caller actually asked for.
+      }
+    }
+    // Restore the caller's model so a failed request does not leave this
+    // instance silently pointing at the last fallback it tried.
+    this.refreshHandlersForModel(requestedModel);
+    return undefined;
+  }
+
+  /**
    * Wrap a StreamResult with consumer-facing lifecycle callbacks.
    *
    * `options.onChunk`, `options.onFinish`, `options.onError` are translated
@@ -492,11 +807,14 @@ export abstract class BaseProvider implements AIProvider {
   ): StreamResult {
     const lifecycle = getLifecycleMiddlewareConfig(options);
 
-    if (!lifecycle?.onChunk && !lifecycle?.onFinish && !lifecycle?.onError) {
-      return result;
-    }
-
-    const { onChunk, onFinish, onError } = lifecycle;
+    // No early return when there are no callbacks. This wrapper is the only point
+    // every provider's stream passes through unconditionally (the real-streaming path
+    // plus all three fake-streaming paths), and returning `result` untouched here is
+    // exactly why a provider error that surfaces during ITERATION reached the consumer
+    // unclassified: the object handed back was the provider's own generator, by
+    // reference, and every layer below is a proven passthrough. The callbacks below are
+    // each individually guarded, so with none registered this only adds the catch.
+    const { onChunk, onFinish, onError } = lifecycle ?? {};
     const startTime = Date.now();
     const originalStream = result.stream;
     // Lifecycle callbacks are awaited with a bounded deadline so callers
@@ -527,11 +845,26 @@ export abstract class BaseProvider implements AIProvider {
       }
     };
 
+    // Arrow, like `safeFire` above: the generator is a plain function expression, so
+    // `this` is not bound inside it.
+    const classifyStreamError = (e: unknown): Error =>
+      this.classifyStreamError(e);
+
+    // Hold the upstream iterator rather than letting `for await` create one
+    // internally, so the cancel hook below can close it directly. Iterating
+    // `upstreamIterable` is equivalent to iterating `originalStream` — same
+    // iterator, same early-exit `return()` semantics — it just leaves a handle
+    // reachable from outside the generator.
+    const upstreamIterator = originalStream[Symbol.asyncIterator]();
+    const upstreamIterable = {
+      [Symbol.asyncIterator]: () => upstreamIterator,
+    };
+
     const wrappedStream = (async function* () {
       let accumulated = "";
       let seq = 0;
       try {
-        for await (const chunk of originalStream) {
+        for await (const chunk of upstreamIterable) {
           const textPart =
             chunk &&
             typeof chunk === "object" &&
@@ -587,9 +920,19 @@ export abstract class BaseProvider implements AIProvider {
             "onError",
           );
         }
-        throw err;
+        throw classifyStreamError(err);
       }
     })();
+
+    // A consumer that breaks out of the stream cannot reach this generator
+    // through `.return()` while it is parked awaiting the provider — that
+    // request queues behind the in-flight `next()`. The hook closes the
+    // upstream directly and forwards the request to any wrapper below, so
+    // abandoning a stream really does release the provider connection.
+    attachStreamCancel(wrappedStream, () => {
+      cancelStream(originalStream);
+      releaseIterator(upstreamIterator);
+    });
 
     return { ...result, stream: wrappedStream };
   }
@@ -652,6 +995,80 @@ export abstract class BaseProvider implements AIProvider {
   }
 
   /**
+   * Build the fake-stream output and apply the same incremental TTS wrapper
+   * used by the standard NeuroLink stream path.
+   */
+  private createFakeStreamingOutput(
+    result: EnhancedGenerateResult | null,
+    options: StreamOptions,
+    onTTSComplete?: (result: TTSResult | undefined) => void,
+  ): AsyncIterable<
+    | { content: string }
+    | {
+        type: "image";
+        imageOutput: NonNullable<EnhancedGenerateResult["imageOutput"]>;
+      }
+    | { type: "tts_audio"; audio: TTSChunk }
+  > {
+    const incrementalTTS = options.tts?.enabled === true;
+    const source = (async function* () {
+      if (result?.content) {
+        const words = result.content.split(/(\s+)/);
+        let buffer = "";
+
+        for (let i = 0; i < words.length; i++) {
+          buffer += words[i];
+          const shouldYield =
+            i === words.length - 1 ||
+            buffer.length > 50 ||
+            /[.!?;,]\s*$/.test(buffer);
+          if (shouldYield && buffer.trim()) {
+            yield { content: buffer };
+            buffer = "";
+            await new Promise((resolve) => {
+              setTimeout(resolve, Math.random() * 9 + 1);
+            });
+          }
+        }
+
+        if (buffer.trim()) {
+          yield { content: buffer };
+        }
+      }
+
+      if (result?.imageOutput) {
+        yield { type: "image" as const, imageOutput: result.imageOutput };
+      }
+
+      if (result?.audio && !incrementalTTS) {
+        yield {
+          type: "tts_audio" as const,
+          audio: {
+            data: result.audio.buffer,
+            format: result.audio.format,
+            index: 0,
+            isFinal: true,
+            cumulativeSize: result.audio.size,
+            voice: result.audio.voice,
+            sampleRate: result.audio.sampleRate,
+          },
+        };
+      }
+    })();
+
+    if (!incrementalTTS || !options.tts) {
+      return source;
+    }
+
+    return interleaveTTSStream({
+      stream: source,
+      provider: options.tts.provider ?? options.provider ?? this.providerName,
+      options: options.tts,
+      onComplete: onTTSComplete,
+    });
+  }
+
+  /**
    * Execute fake streaming - extracted method for reusability
    */
   private async executeFakeStreaming(
@@ -694,10 +1111,10 @@ export abstract class BaseProvider implements AIProvider {
         skipToolPromptInjection: options.skipToolPromptInjection,
         timeout: options.timeout,
         stt: options.stt,
-        // Forward TTS options too — without this, the fake-streaming fallback
-        // path silently drops `tts` and the resulting StreamResult never
-        // produces a `tts_audio` chunk even when synthesis was requested.
-        tts: options.tts,
+        // Streaming TTS is synthesized incrementally by
+        // createFakeStreamingOutput; do not let generate() perform a duplicate
+        // input- or whole-response synthesis first.
+        tts: options.tts?.enabled ? undefined : options.tts,
       };
 
       logger.debug(`Calling generate for fake streaming`, {
@@ -717,66 +1134,49 @@ export abstract class BaseProvider implements AIProvider {
         timestamp: Date.now(),
       });
 
+      const incrementalTTS = options.tts?.enabled === true;
+      const ttsProvider =
+        options.tts?.provider ?? options.provider ?? this.providerName;
+      const ttsStartedAt = Date.now();
+      let resolveAudio: ((value: TTSResult | undefined) => void) | undefined;
+      let audioSettled = false;
+      const audio = incrementalTTS
+        ? new Promise<TTSResult | undefined>((resolve) => {
+            resolveAudio = resolve;
+          }).catch(() => undefined)
+        : undefined;
+      const ttsMetadata: TTSMetadata | undefined = incrementalTTS
+        ? {
+            attempted: TTSProcessor.supports(ttsProvider),
+            success: false,
+          }
+        : result?.ttsMetadata;
+      const onTTSComplete = incrementalTTS
+        ? (
+            ttsResult: TTSResult | undefined,
+            error?: NonNullable<TTSMetadata["error"]>,
+          ) => {
+            if (audioSettled) {
+              return;
+            }
+            audioSettled = true;
+            if (ttsMetadata) {
+              ttsMetadata.success =
+                error === undefined && ttsResult !== undefined;
+              if (error) {
+                ttsMetadata.error = error;
+              } else {
+                delete ttsMetadata.error;
+              }
+              ttsMetadata.latency = Date.now() - ttsStartedAt;
+            }
+            resolveAudio?.(ttsResult);
+          }
+        : undefined;
+
       // Create a synthetic stream from the generate result that simulates progressive delivery
       return {
-        stream: (async function* () {
-          if (result?.content) {
-            // Split content into words for more natural streaming
-            const words = result.content.split(/(\s+)/); // Keep whitespace
-            let buffer = "";
-
-            for (let i = 0; i < words.length; i++) {
-              buffer += words[i];
-
-              // Yield chunks of roughly 5-10 words or at punctuation
-              const shouldYield =
-                i === words.length - 1 || // Last word
-                buffer.length > 50 || // Buffer getting long
-                /[.!?;,]\s*$/.test(buffer); // End of sentence/clause
-
-              if (shouldYield && buffer.trim()) {
-                yield { content: buffer };
-                buffer = "";
-
-                // Small delay to simulate streaming (1-10ms)
-                await new Promise((resolve) => {
-                  setTimeout(resolve, Math.random() * 9 + 1);
-                });
-              }
-            }
-
-            // Yield all remaining content
-            if (buffer.trim()) {
-              yield { content: buffer };
-            }
-          }
-
-          // 🔧 CRITICAL FIX: Yield image output if present
-          if (result?.imageOutput) {
-            yield {
-              type: "image" as const,
-              imageOutput: result.imageOutput,
-            };
-          }
-
-          // Yield synthesized audio so callers using stream() with tts.enabled
-          // still receive a tts_audio chunk on the fake-streaming fallback
-          // path (matches the discriminator used by the real streaming path).
-          if (result?.audio) {
-            yield {
-              type: "tts_audio" as const,
-              audio: {
-                data: result.audio.buffer,
-                format: result.audio.format,
-                index: 0,
-                isFinal: true,
-                cumulativeSize: result.audio.size,
-                voice: result.audio.voice,
-                sampleRate: result.audio.sampleRate,
-              },
-            };
-          }
-        })(),
+        stream: this.createFakeStreamingOutput(result, options, onTTSComplete),
         usage: result?.usage,
         provider: result?.provider,
         model: result?.model,
@@ -799,6 +1199,8 @@ export abstract class BaseProvider implements AIProvider {
         // 🔧 FIX: Include analytics and evaluation from generate result
         analytics: result?.analytics,
         evaluation: result?.evaluation,
+        audio,
+        ttsMetadata,
       };
     } catch (error) {
       logger.error(
@@ -1208,7 +1610,7 @@ export abstract class BaseProvider implements AIProvider {
     messages: ModelMessage[],
     tools: Record<string, Tool>,
     options: TextGenerationOptions,
-  ): Promise<Awaited<ReturnType<typeof generateText>>> {
+  ): Promise<GenerateTextResult<Record<string, Tool>, unknown>> {
     return this.generationHandler.executeGeneration(
       model,
       messages,
@@ -1221,7 +1623,7 @@ export abstract class BaseProvider implements AIProvider {
    * Log generation completion information - delegated to GenerationHandler
    */
   private logGenerationComplete(
-    generateResult: Awaited<ReturnType<typeof generateText>>,
+    generateResult: GenerateTextResult<Record<string, Tool>, unknown>,
   ): void {
     this.generationHandler.logGenerationComplete(generateResult);
   }
@@ -1229,7 +1631,7 @@ export abstract class BaseProvider implements AIProvider {
   /**
    * Record performance metrics - delegated to TelemetryHandler
    */
-  private async recordPerformanceMetrics(
+  protected async recordPerformanceMetrics(
     usage: RawUsageObject | undefined,
     responseTime: number,
   ): Promise<void> {
@@ -1240,7 +1642,7 @@ export abstract class BaseProvider implements AIProvider {
    * Extract tool information from generation result - delegated to GenerationHandler
    */
   private extractToolInformation(
-    generateResult: Awaited<ReturnType<typeof generateText>>,
+    generateResult: GenerateTextResult<Record<string, Tool>, unknown>,
   ): {
     toolsUsed: string[];
     toolExecutions: Array<{
@@ -1256,7 +1658,7 @@ export abstract class BaseProvider implements AIProvider {
    * Format the enhanced result - delegated to GenerationHandler
    */
   private formatEnhancedResult(
-    generateResult: Awaited<ReturnType<typeof generateText>>,
+    generateResult: GenerateTextResult<Record<string, Tool>, unknown>,
     tools: Record<string, Tool>,
     toolsUsed: string[],
     toolExecutions: ToolExecutionRecord[],
@@ -1323,29 +1725,119 @@ export abstract class BaseProvider implements AIProvider {
     this.validateOptions(options);
     const startTime = Date.now();
 
-    // OTEL span for provider-level generate tracing
-    // Use startActiveSpan pattern via context.with() so child spans become descendants
-    const otelSpan = tracers.provider.startSpan("neurolink.provider.generate", {
-      kind: SpanKind.CLIENT,
-      attributes: {
-        [ATTR.GEN_AI_SYSTEM]: this.providerName || "unknown",
-        [ATTR.GEN_AI_MODEL]: this.modelName || options.model || "unknown",
-        [ATTR.GEN_AI_OPERATION]: "generate",
-        [ATTR.NL_PROVIDER]: this.providerName || "unknown",
-      },
-    });
-    // Set this span as the active context so child spans (GenerationHandler, etc.) become descendants
-    const activeCtx = trace.setSpan(context.active(), otelSpan);
-    const otelSpanState = { ended: false };
+    // One span per attempt. runGenerateInActiveContext ends the span on the
+    // way out (success or failure), so a model-fallback retry must not reuse
+    // it — an ended span would swallow the retry's attributes and report the
+    // model that failed rather than the one that served.
+    const attempt = async (): Promise<EnhancedGenerateResult | null> => {
+      // OTEL span for provider-level generate tracing
+      // Use startActiveSpan pattern via context.with() so child spans become descendants
+      const otelSpan = tracers.provider.startSpan(
+        "neurolink.provider.generate",
+        {
+          kind: SpanKind.CLIENT,
+          attributes: {
+            [ATTR.GEN_AI_SYSTEM]: this.providerName || "unknown",
+            [ATTR.GEN_AI_MODEL]: this.modelName || options.model || "unknown",
+            [ATTR.GEN_AI_OPERATION]: "generate",
+            [ATTR.NL_PROVIDER]: this.providerName || "unknown",
+          },
+        },
+      );
+      // Set this span as the active context so child spans (GenerationHandler, etc.) become descendants
+      const activeCtx = trace.setSpan(context.active(), otelSpan);
+      const otelSpanState = { ended: false };
 
-    return await context.with(activeCtx, async () =>
-      this.runGenerateInActiveContext(
-        options,
-        startTime,
-        otelSpan,
-        otelSpanState,
-      ),
-    );
+      return await context.with(activeCtx, async () =>
+        this.runGenerateInActiveContext(
+          options,
+          startTime,
+          otelSpan,
+          otelSpanState,
+        ),
+      );
+    };
+
+    // Callers that own fallback order (providerFallback / modelChain callers,
+    // or a router that retries on its own) pass the flag on both paths;
+    // TextGenerationOptions declares it, so a plain read is enough here.
+    const callerOwnsFallback = options.disableInternalFallback === true;
+    return await this.runGenerateWithModelFallback(attempt, callerOwnsFallback);
+  }
+
+  /**
+   * Models the catalog names are the models a vendor served when the entry was
+   * last verified. Vendors retire them without warning, and until this existed
+   * the runtime had no answer for that: an InvalidModelError is classified
+   * non-retryable (correctly — another *provider* cannot fix a bad model id),
+   * so the fallback chain stopped dead and the caller got an error even though
+   * the same provider was still serving four other models listed right there
+   * in the catalog's `fallbacks`.
+   *
+   * So on an invalid-model error only, walk this provider's fallbacks. Every
+   * switch is a loud WARN: the caller asked for one model and is getting
+   * another, which they must be able to see in the logs. Any other error type
+   * propagates untouched on the first attempt.
+   *
+   * stream() gets the same treatment via retryStreamWithFallbackModel, which
+   * is safe for the same reason it is cheap: the retry happens before any
+   * lifecycle callback has fired and before a chunk has reached the consumer,
+   * so there is no observable output to replay.
+   */
+  /**
+   * Protected rather than private so a provider with a native generate path can
+   * reuse it. Overriding `generate()` otherwise skips this wrapper silently,
+   * and a retired default model stops degrading to the next live one in the
+   * catalog — which is exactly what the provider contract gate checks.
+   */
+  protected async runGenerateWithModelFallback(
+    attempt: () => Promise<EnhancedGenerateResult | null>,
+    callerOwnsFallback: boolean,
+  ): Promise<EnhancedGenerateResult | null> {
+    const requestedModel = this.modelName;
+    try {
+      return await attempt();
+    } catch (error) {
+      if (callerOwnsFallback || !isInvalidModelError(error)) {
+        throw error;
+      }
+      const candidates = this.getModelFallbacks().filter(
+        (model) => model !== requestedModel,
+      );
+      if (candidates.length === 0) {
+        throw error;
+      }
+      for (const candidate of candidates) {
+        logger.warn(
+          `[${this.providerName}] model "${requestedModel}" was rejected as invalid — retrying with fallback "${candidate}". This provider's catalog entry is stale; run "pnpm run check:models".`,
+        );
+        this.refreshHandlersForModel(candidate);
+        try {
+          return await attempt();
+        } catch (retryError) {
+          if (!isInvalidModelError(retryError)) {
+            // Restore the caller's model: this failure is unrelated to the
+            // model id, so the instance must not be left on a fallback.
+            this.refreshHandlersForModel(requestedModel);
+            throw retryError;
+          }
+          // This fallback is stale too — keep walking the list.
+        }
+      }
+      // Every fallback was rejected as well. Restore the caller's model so a
+      // failed request does not leave this instance silently repointed, and
+      // surface the ORIGINAL error: it names the model the caller asked for.
+      this.refreshHandlersForModel(requestedModel);
+      throw error;
+    }
+  }
+
+  /**
+   * Model ids to try when this provider rejects its current model as invalid.
+   * Empty by default; catalog-driven providers return their `fallbacks`.
+   */
+  protected getModelFallbacks(): string[] {
+    return [];
   }
   /**
    * Alias for generate method - implements AIProvider interface
@@ -1364,18 +1856,15 @@ export abstract class BaseProvider implements AIProvider {
     otelSpanState: { ended: boolean },
   ): Promise<EnhancedGenerateResult | null> {
     try {
-      if (options.output?.mode === "video") {
+      // Single source of truth for "what kind of request is this" — see
+      // resolveRequestKind's doc comment for the full precedence table.
+      const requestKind = resolveRequestKind(options, this.modelName);
+
+      if (requestKind === "video") {
         return await this.handleVideoGeneration(options, startTime);
       }
 
-      const isImageModel = IMAGE_GENERATION_MODELS.some((m) =>
-        this.modelName.includes(m),
-      );
-      const requestsNonImageOutput =
-        options.output?.format === "json" ||
-        options.output?.format === "structured" ||
-        options.output?.format === "text";
-      if (isImageModel && !requestsNonImageOutput) {
+      if (requestKind === "image") {
         logger.info(
           `Image generation model detected, routing to executeImageGeneration`,
           {
@@ -1388,7 +1877,7 @@ export abstract class BaseProvider implements AIProvider {
         return await this.enhanceResult(imageResult, options, startTime);
       }
 
-      if (options.tts?.enabled && !options.tts?.useAiResponse) {
+      if (requestKind === "tts-direct") {
         return this.handleDirectTTSSynthesis(options, startTime);
       }
 
@@ -1547,22 +2036,15 @@ export abstract class BaseProvider implements AIProvider {
           analysisLength: videoAnalysisResult.length,
         });
 
-        const formattedResult = await generateText({
-          model,
-          system: options.systemPrompt,
-          messages: [{ role: "user" as const, content: formattingPrompt }],
+        const formattedResult = await generateOnceNative(model, {
+          ...(options.systemPrompt ? { system: options.systemPrompt } : {}),
+          prompt: formattingPrompt,
           maxOutputTokens: options.maxTokens || 8192,
           temperature: 0.3,
-          abortSignal: options.abortSignal,
-          experimental_telemetry: this.telemetryHandler?.getTelemetryConfig(
-            options,
-            "generate",
-          ),
+          ...(options.abortSignal ? { abortSignal: options.abortSignal } : {}),
         });
         formattedContent = formattedResult.text;
-        usage = extractTokenUsage(
-          formattedResult.totalUsage ?? formattedResult.usage,
-        );
+        usage = extractTokenUsage(formattedResult.usage);
 
         logger.debug("[VideoAnalysis] Claude formatting complete", {
           formattedLength: formattedContent.length,
@@ -1597,38 +2079,36 @@ export abstract class BaseProvider implements AIProvider {
     messages: ModelMessage[],
     tools: Record<string, Tool>,
   ): Promise<EnhancedGenerateResult> {
-    // Apply a defensive default timeout (3 min) when the caller didn't pass
-    // one. Without this guard, AI SDK's generateText() will wait forever on
+    // Apply a defensive default timeout when the caller didn't pass one.
+    // Without this guard, AI SDK's generateText() will wait forever on
     // an upstream that accepts the connection but never produces a response
     // (observed against the litellm gateway when a request triggers the
     // team-access denial path — connection stays open, no response is sent,
     // and the matrix test hangs the entire suite). Callers can still pass
     // a larger value (e.g. video generation passes 10 min).
-    const effectiveTimeout = options.timeout ?? 180_000;
-    const timeoutController = createTimeoutController(
-      effectiveTimeout,
+    //
+    // A provider descriptor may declare a LARGER generate budget than the
+    // 3-min floor (litellm: 300s — slow proxied models routinely need more
+    // than 180s end-to-end even while streaming). The declared value only
+    // ever raises the default, never lowers it: several descriptors carry
+    // aspirational sub-180s numbers (openai 30s, bedrock 45s) that were
+    // never enforced on this path, and enforcing them now would break
+    // long-running generations that have always been allowed.
+    const descriptorGenerateMs = PROVIDER_DESCRIPTORS_BY_NAME.get(
       this.providerName,
-      "generate",
+    )?.timeouts?.generateMs;
+    // An explicit, valid turnTimeoutMs is the caller's whole-turn contract
+    // and owns this hard abort; `timeout` then keeps its per-model-call
+    // meaning (it reaches the model layer via providerOptions.neurolink).
+    // Before this, `timeout` alone bounded the ENTIRE multi-step loop, so a
+    // caller asking for a 40-minute turn of 5-minute calls was killed at 5
+    // minutes flat — mid-loop, dressed as "Request was aborted.".
+    const generateResult = await this.withTurnTimeout(
+      options,
+      descriptorGenerateMs,
+      (timedOptions) =>
+        this.executeGeneration(model, messages, tools, timedOptions),
     );
-    const composedSignal = composeAbortSignals(
-      options.abortSignal,
-      timeoutController?.controller.signal,
-    );
-    const composedOptions = composedSignal
-      ? { ...options, abortSignal: composedSignal }
-      : options;
-
-    let generateResult: Awaited<ReturnType<typeof generateText>>;
-    try {
-      generateResult = await this.executeGeneration(
-        model,
-        messages,
-        tools,
-        composedOptions,
-      );
-    } finally {
-      timeoutController?.cleanup();
-    }
 
     this.analyzeAIResponse(generateResult);
     this.logGenerationComplete(generateResult);
@@ -1669,6 +2149,82 @@ export abstract class BaseProvider implements AIProvider {
       startTime,
     );
     return finalResult;
+  }
+
+  /**
+   * Close out a turn produced by a provider's own native generate loop.
+   *
+   * The native loops bypass `executeGeneration`, and with it every post-call
+   * step the standard path runs. Each one that was missed had to be found
+   * separately — `onFinish` stopped firing, TTS synthesis silently produced no
+   * audio, and OTEL saw no usage for any native provider. Routing all of them
+   * through one method is what stops the next native path from rediscovering
+   * the same list.
+   *
+   * Order matters and mirrors the standard path: metrics are recorded before
+   * synthesis so telemetry sees the model's own usage, and `enhanceResult`
+   * runs last so analytics and evaluation observe the final content.
+   */
+  protected async finalizeNativeGenerate(
+    result: EnhancedGenerateResult,
+    options: TextGenerationOptions,
+    startTime: number,
+  ): Promise<EnhancedGenerateResult> {
+    // onFinish is NOT fired here. `applyGenerateLifecycleMiddleware` folds it
+    // into `options.middleware.middlewareConfig.lifecycle`, and the native
+    // paths now wrap their model, so the lifecycle middleware fires it.
+    // Firing it here too would deliver every callback twice.
+    await this.recordPerformanceMetrics(result.usage, Date.now() - startTime);
+    const synthesized = await this.synthesizeAIResponseIfNeeded(
+      result,
+      options,
+    );
+    return this.enhanceResult(synthesized, options, startTime);
+  }
+
+  /**
+   * Invoke a caller's `onFinish` for a native turn.
+   *
+   * On the standard path `onFinish` is converted into lifecycle middleware and
+   * applied by wrapping the model — a step the native loops skip, so they have
+   * to call it themselves. Failures are logged and swallowed: a caller's
+   * callback must not be able to fail their generation.
+   */
+  protected fireGenerateOnFinish(
+    options: TextGenerationOptions,
+    result: EnhancedGenerateResult | null,
+    startTime: number,
+  ): void {
+    const onFinish = (options as { onFinish?: (payload: unknown) => unknown })
+      .onFinish;
+    if (typeof onFinish !== "function") {
+      return;
+    }
+    try {
+      const usage = result?.usage as
+        | { input?: number; output?: number }
+        | undefined;
+      const cb = onFinish({
+        text: result?.content || "",
+        usage: usage
+          ? {
+              promptTokens: usage.input ?? 0,
+              completionTokens: usage.output ?? 0,
+            }
+          : undefined,
+        duration: Date.now() - startTime,
+        finishReason: result?.finishReason ?? "stop",
+      });
+      Promise.resolve(cb).catch((err) =>
+        logger.warn(
+          `[${this.providerName}] onFinish callback rejected: ${err instanceof Error ? err.message : String(err)}`,
+        ),
+      );
+    } catch (err) {
+      logger.warn(
+        `[${this.providerName}] onFinish callback threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   protected async synthesizeAIResponseIfNeeded(
@@ -1743,13 +2299,26 @@ export abstract class BaseProvider implements AIProvider {
     }
   }
 
+  /**
+   * Build the public TTS failure detail.
+   *
+   * The message is redacted through the shared `sanitizeErrorCause` before it
+   * leaves this method. It used to be an internal value that only reached the
+   * logger; it is now carried on `result.ttsMetadata` and therefore reaches
+   * SDK callers, who may forward it to an end user. Provider errors quote the
+   * request URL often enough that a key in a query string is a real vector —
+   * `redactUrlsInText` strips exactly that while leaving a bare URL readable,
+   * so the diagnosis survives and the credential does not.
+   */
   private getTTSErrorDetails(
     error: unknown,
   ): NonNullable<TTSMetadata["error"]> {
+    const safeMessage = sanitizeErrorCause(error).message;
+
     if (error instanceof AsyncTimeoutError) {
       return {
         code: TTS_ERROR_CODES.SYNTHESIS_FAILED,
-        message: error.message,
+        message: safeMessage,
         retriable: true,
       };
     }
@@ -1757,14 +2326,14 @@ export abstract class BaseProvider implements AIProvider {
     if (error instanceof NeuroLinkError) {
       return {
         code: error.code,
-        message: error.message,
+        message: safeMessage,
         retriable: error.retriable,
       };
     }
 
     return {
       code: TTS_ERROR_CODES.SYNTHESIS_FAILED,
-      message: error instanceof Error ? error.message : String(error),
+      message: safeMessage,
     };
   }
 
@@ -1932,12 +2501,108 @@ export abstract class BaseProvider implements AIProvider {
   // ===================
 
   /**
-   * Provider-specific streaming implementation (only used when tools are disabled)
+   * Opt-in streaming hook. A provider that produces an async iterable of text
+   * chunks plus promises for how the turn ended implements this and gets a
+   * working `executeStream` for free.
+   *
+   * Deliberately optional rather than abstract: every provider that already
+   * overrides `executeStream` directly — the older and still perfectly valid
+   * pattern — never needs it.
+   *
+   * `finishReason` and `usage` are promises because both are only knowable
+   * once the underlying stream has finished. Resolve them when it does; the
+   * default `executeStream` chains off them rather than waiting for a
+   * consumer, so they must settle even if nobody drains the stream.
    */
-  protected abstract executeStream(
+  protected doStream?(options: StreamOptions): Promise<{
+    stream: AsyncIterable<{ content: string }>;
+    finishReason: Promise<string>;
+    usage: Promise<{ inputTokens: number; outputTokens: number }>;
+    warnings?: string[];
+  }>;
+
+  /**
+   * Provider-specific streaming implementation (only used when tools are
+   * disabled).
+   *
+   * This used to be `protected abstract`, which meant a provider had exactly
+   * two options: write the whole adapter by hand, or not stream at all. The
+   * failure mode that produced was SageMaker's — a complete, working
+   * `doStream` sitting one property access away from an `executeStream` that
+   * unconditionally threw "not yet fully implemented". Providers that
+   * implement `doStream` now inherit a correct implementation, and providers
+   * that override this method are unaffected.
+   */
+  protected async executeStream(
     options: StreamOptions,
-    analysisSchema?: ValidationSchema,
-  ): Promise<StreamResult>;
+    _analysisSchema?: ValidationSchema,
+  ): Promise<StreamResult> {
+    if (!this.doStream) {
+      throw new NeuroLinkError({
+        code: ERROR_CODES.INVALID_CONFIGURATION,
+        message: `${this.providerName} cannot stream: it neither implements doStream() nor overrides executeStream()`,
+        category: ErrorCategory.CONFIGURATION,
+        severity: ErrorSeverity.CRITICAL,
+        retriable: false,
+        context: { provider: this.providerName, model: this.modelName },
+      });
+    }
+
+    const startTime = Date.now();
+    const { stream, finishReason, usage, warnings } =
+      await this.doStream(options);
+
+    if (warnings?.length) {
+      logger.warn(`[${this.providerName}] doStream reported warnings`, {
+        provider: this.providerName,
+        count: warnings.length,
+      });
+    }
+
+    // `metadata` is handed back by reference and filled in when the turn
+    // ends — the documented contract for background-loop streams, since a
+    // result-object spread would snapshot a top-level getter before the
+    // stream has produced anything.
+    const metadata: NonNullable<StreamResult["metadata"]> = {
+      startTime,
+      streamId: `${this.providerName}-${startTime}`,
+    };
+
+    // Chained off the provider's own promises rather than off the consumer
+    // draining the stream. Binding analytics to a stream iterator's finally
+    // block means a caller that awaits analytics without iterating waits
+    // forever, because a generator body does not run until it is iterated.
+    const analytics = (async () => {
+      const [resolvedFinishReason, resolvedUsage] = await Promise.all([
+        finishReason,
+        usage,
+      ]);
+      metadata.finishReason = resolvedFinishReason;
+      metadata.rawFinishReason = resolvedFinishReason;
+      return buildAnalytics(
+        this.providerName,
+        this.modelName || this.getDefaultModel(),
+        {
+          usage: {
+            input: resolvedUsage.inputTokens,
+            output: resolvedUsage.outputTokens,
+            total: resolvedUsage.inputTokens + resolvedUsage.outputTokens,
+          },
+          stopReason: resolvedFinishReason,
+        },
+        Date.now() - startTime,
+        { streamingMode: true },
+      );
+    })();
+
+    return {
+      stream,
+      model: this.modelName || this.getDefaultModel(),
+      provider: this.getProviderName(),
+      analytics,
+      metadata,
+    };
+  }
 
   /**
    * Get the provider name
@@ -1953,19 +2618,127 @@ export abstract class BaseProvider implements AIProvider {
    * REQUIRED: Every provider MUST implement this method
    * Returns the Vercel AI SDK model instance for this provider
    */
+  /**
+   * Run one whole turn under the caller's timeout contract.
+   *
+   * Every generate path must go through this, including the native loops that
+   * bypass `executeGeneration`. When the Anthropic native path was first added
+   * it built its own call and never composed a timer, so `timeout: 1000`
+   * against a three-second upstream simply returned the late response — the
+   * turn budget silently stopped existing for that provider.
+   *
+   * An explicit, valid `turnTimeoutMs` is the caller's whole-turn contract and
+   * owns this hard abort; `timeout` then keeps its per-model-call meaning (it
+   * reaches the model layer via `providerOptions.neurolink`). Before that
+   * split, `timeout` alone bounded the ENTIRE multi-step loop, so a caller
+   * asking for a 40-minute turn of 5-minute calls was killed at 5 minutes
+   * flat — mid-loop, dressed as "Request was aborted.".
+   *
+   * `descriptorGenerateMs` only ever RAISES the 3-minute floor, never lowers
+   * it: several descriptors carry aspirational sub-180s numbers (openai 30s,
+   * bedrock 45s) that were never enforced, and enforcing them now would break
+   * long-running generations that have always been allowed.
+   */
+  protected async withTurnTimeout<T>(
+    options: TextGenerationOptions,
+    descriptorGenerateMs: number | undefined,
+    run: (timedOptions: TextGenerationOptions) => Promise<T>,
+  ): Promise<T> {
+    const hasValidTurnTimeout =
+      typeof options.turnTimeoutMs === "number" &&
+      Number.isFinite(options.turnTimeoutMs) &&
+      options.turnTimeoutMs > 0;
+    const effectiveTimeout = hasValidTurnTimeout
+      ? options.turnTimeoutMs
+      : (options.timeout ?? Math.max(descriptorGenerateMs ?? 0, 180_000));
+    const timeoutController = createTimeoutController(
+      effectiveTimeout,
+      this.providerName,
+      "generate",
+    );
+    const composedSignal = composeAbortSignals(
+      options.abortSignal,
+      timeoutController?.controller.signal,
+    );
+    const timedOptions = composedSignal
+      ? { ...options, abortSignal: composedSignal }
+      : options;
+
+    try {
+      return await run(timedOptions);
+    } catch (error) {
+      // When OUR timer fired, provider SDKs typically normalize the abort
+      // into their own generic cancel shape (e.g. Anthropic's
+      // APIUserAbortError, "Request was aborted.") and discard the signal's
+      // reason. The TimeoutError on the signal is the honest identity —
+      // rethrow it so logs and abort classification see a timeout, not a
+      // caller cancel. A genuine caller abort (their signal fired) keeps its
+      // original shape even if our timer also expired in the race window.
+      const reason = timeoutController?.controller.signal.aborted
+        ? timeoutController.controller.signal.reason
+        : undefined;
+      if (
+        reason instanceof TimeoutError &&
+        isAbortError(error) &&
+        options.abortSignal?.aborted !== true
+      ) {
+        throw reason;
+      }
+      throw error;
+    } finally {
+      timeoutController?.cleanup();
+    }
+  }
+
+  /**
+   * The per-provider generate budget from the descriptor, for native paths
+   * that call `withTurnTimeout` directly.
+   */
+  protected getDescriptorGenerateMs(): number | undefined {
+    return PROVIDER_DESCRIPTORS_BY_NAME.get(this.providerName)?.timeouts
+      ?.generateMs;
+  }
+
   protected abstract getAISDKModel(): LanguageModel | Promise<LanguageModel>;
+
+  /**
+   * Public handle on this provider's model object.
+   *
+   * `getAISDKModel()` is protected because only the generation pipeline should
+   * drive it. The browser bundle needs the same handle to back its public
+   * provider factories without reaching into provider internals, so this is the
+   * one sanctioned way out. The union return lets providers that resolve their
+   * model synchronously (Anthropic) and asynchronously (the OpenAI-compatible
+   * family) both satisfy it.
+   */
+  public getModel(): LanguageModel | Promise<LanguageModel> {
+    return this.getAISDKModel();
+  }
 
   /**
    * Get AI SDK model with middleware applied
    * This method wraps the base model with any configured middleware
-   * TODO(#1179): Implement global level middlewares that can be used
+   * TODO(#1576): Implement global level middlewares that can be used
    */
   protected async getAISDKModelWithMiddleware(
     options: TextGenerationOptions | StreamOptions = {},
   ): Promise<LanguageModel> {
-    // Get the base model
-    const baseModel = await this.getAISDKModel();
+    return this.applyMiddlewareToModel(await this.getAISDKModel(), options);
+  }
 
+  /**
+   * Apply the configured middleware chain to a caller-supplied base model.
+   *
+   * `getAISDKModelWithMiddleware()` always wraps `getAISDKModel()`, which is
+   * the model the non-streaming path drives. Streaming paths build a
+   * different base — one whose `doStream` starts the provider's own stream
+   * loop — and need the same chain applied to it, so the wrapping is split
+   * out here rather than duplicated per provider.
+   */
+  protected async applyMiddlewareToModel(
+    baseModel: LanguageModel,
+    options: TextGenerationOptions | StreamOptions = {},
+  ): Promise<LanguageModel> {
     logger.debug(`Retrieved base model for ${this.providerName}`, {
       provider: this.providerName,
       model: this.modelName,
@@ -2112,6 +2885,66 @@ export abstract class BaseProvider implements AIProvider {
    * original identity so that isAbortError() can detect them in
    * retry/fallback loops (directProviderGeneration, performMCPGenerationRetries).
    */
+  /**
+   * Classify an error that escaped while the consumer was ITERATING a stream.
+   *
+   * `stream()` only awaits the CONSTRUCTION of the provider's stream object, and a provider
+   * that discovers its failure lazily throws on first pull instead — so the raw upstream
+   * error reached the consumer with no provider tag and no classification, while the same
+   * failure through `generate()` was classified normally. Measured on OpenAI:
+   *
+   *   streaming      "You have no credits remaining."
+   *   non-streaming  "[openai] OpenAI quota exhausted — this will not resolve by retrying..."
+   *
+   * Three guards. Only the third is load-bearing against today's code; the first two are
+   * deliberate depth against a hazard that is real but not currently reachable. Measured,
+   * rather than assumed — see the note after the list.
+   *
+   * 1. ALREADY STAMPED — everything that went through `handleProviderError` carries the mark,
+   *    including the two formatters whose results escape the ProviderError hierarchy
+   *    (`amazonSagemaker` returns SageMakerError, `replicate` returns NeuroLinkError; both
+   *    extend Error directly). Without this they would be classified a second time and
+   *    degraded.
+   * 2. ALREADY A ProviderError — covers providers that call `formatProviderError` DIRECTLY,
+   *    bypassing `handleProviderError` and therefore the stamp. Anthropic does this in its
+   *    own streaming catch (`anthropic/client.ts`), and its result is a ProviderError.
+   * 3. HAS AN HTTP STATUS — without this, an ordinary bug is relabelled as a provider
+   *    failure. `classifyProviderError` ends in an unconditional catch-all
+   *    (`utils/errorClassifier.ts`: `if (!rule) return new ProviderError(...)`) that is not
+   *    gated on the error having come off the wire. Measured with the guard absent:
+   *      TypeError "Cannot read properties of undefined (reading 'content')"
+   *        became  ProviderError "[openai] openai error: Cannot read properties of undefined..."
+   *    which would hide a real defect behind a plausible provider message.
+   *
+   * WHY 1 AND 2 ARE NOT CURRENTLY REACHABLE, and why they stay anyway. A statusCode is
+   * attached to a formatted error in exactly one place — `handleProviderError` below — and
+   * that same method applies the stamp. So a ProviderError carrying a status is always
+   * stamped (caught by guard 1's own condition), and a ProviderError produced by a direct
+   * `formatProviderError` call carries no status, so guard 3 already returns it untouched.
+   * Verified by disabling guards 1 and 2 together, rebuilding, and re-running: the mocked
+   * provider contract suite stayed 64/64 and a mocked Anthropic streaming 429 was
+   * byte-identical (`RateLimitError`, one `[anthropic]` prefix).
+   *
+   * They remain because the hazard they cover is measured and real: `handleProviderError`
+   * is NOT idempotent — it copies statusCode onto its own output, so a second pass
+   * re-matches the bare 429 rule and DEGRADES the classification:
+   *   pass 1  ProviderError  "...quota exhausted — this will not resolve by retrying..."
+   *   pass 2  RateLimitError "...rate limit exceeded..."
+   * The day any provider attaches a status to an error it formats itself, guard 3 stops
+   * covering that case and this degradation becomes live. Cheap insurance, not dead code —
+   * but do not cite guards 1 and 2 as proven-by-failure the way guard 3 is.
+   */
+  protected classifyStreamError(error: unknown): Error {
+    const err = error instanceof Error ? error : new Error(String(error));
+    if (isProviderErrorClassified(err) || err instanceof ProviderError) {
+      return err;
+    }
+    if (duckTypedStatusCode(err) === undefined) {
+      return err;
+    }
+    return this.handleProviderError(err);
+  }
+
   protected handleProviderError(error: unknown): Error {
     if (isAbortError(error)) {
       // Preserve AbortError identity — never wrap in provider-specific formatting
@@ -2119,6 +2952,24 @@ export abstract class BaseProvider implements AIProvider {
         ? error
         : new DOMException("The operation was aborted", "AbortError");
     }
+
+    // Already formatted by this method — hand it straight back. Formatting is
+    // NOT idempotent: formatProviderError prepends the provider tag every time,
+    // so a second pass produces
+    //   "[vertex] Google Vertex AI error: [vertex] Google Vertex AI error: ..."
+    // and, when a rule matched on statusCode the first time, can also DEGRADE
+    // the classification (a specific "quota exhausted" ProviderError re-matching
+    // the bare 429 rule as a generic RateLimitError) because the block below
+    // copies statusCode onto its own output.
+    //
+    // A single Vertex failure reaches here FIVE times for one logical error;
+    // this makes calls 2..5 cheap pass-throughs. `instanceof Error` rather than
+    // a cast: nothing but an Error is ever stamped, and an unstamped value
+    // simply falls through to formatting, which is the safe direction.
+    if (error instanceof Error && isProviderErrorClassified(error)) {
+      return error;
+    }
+
     const formatted = this.formatProviderError(error);
 
     // Preserve transport retry metadata across formatting. Provider
@@ -2191,6 +3042,10 @@ export abstract class BaseProvider implements AIProvider {
       // Non-blocking — telemetry failures shouldn't mask the original error
     }
 
+    // Stamp AFTER formatting so any later catch site can tell this error has
+    // already been classified. Deliberately not applied to the AbortError
+    // passthrough above — that returns the original error untouched.
+    markProviderErrorClassified(formatted);
     return formatted;
   }
 
@@ -2645,9 +3500,11 @@ export abstract class BaseProvider implements AIProvider {
     // Get prompt text
     const prompt = options.prompt || options.input?.text || "";
 
-    // Honor output.video.provider — when omitted, fall back to "vertex"
-    // for backward compatibility with the original implementation.
-    const requestedProvider = options.output?.video?.provider ?? "vertex";
+    // Honor output.video.provider — when omitted, fall back to the
+    // catalog-derived default (currently "vertex") for backward
+    // compatibility with the original implementation.
+    const requestedProvider =
+      options.output?.video?.provider ?? defaultProviderFor("video");
 
     if (!VideoProcessor.supports(requestedProvider)) {
       throw new VideoError({
@@ -2688,15 +3545,20 @@ export abstract class BaseProvider implements AIProvider {
     // shared timeout helper so standard video gen honors the caller's
     // timeout the same way director mode does (see above ~Line 2062).
     const videoTimeout = options.timeout ?? 600_000; // 10 min default
+    // Thread the caller's cancellation signal into the handler chain —
+    // output.video.abortSignal (video-scoped) wins over the request-level
+    // options.abortSignal, matching the general per-field precedence.
+    const videoAbortSignal =
+      options.output?.video?.abortSignal ?? options.abortSignal;
     const videoResult = await this.executeWithTimeout(
       () =>
-        VideoProcessor.generate(
-          requestedProvider,
-          imageBuffer,
+        VideoProcessor.generate(requestedProvider, {
+          ...(options.output?.video ?? {}),
+          image: imageBuffer,
           prompt,
-          options.output?.video ?? {},
-          options.region,
-        ),
+          region: options.region,
+          abortSignal: videoAbortSignal,
+        }),
       { timeout: videoTimeout, operationType: "generate" },
     );
 

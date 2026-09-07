@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **LiveServerMessage** = `object`
 
-Defined in: [types/providers.ts:818](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L818)
+Defined in: [types/providers.ts:1109](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1109)
 
 Live server message structure
 
@@ -18,4 +18,4 @@ Live server message structure
 
 > `optional` **serverContent?**: [`LiveServerContent`](LiveServerContent.md)
 
-Defined in: [types/providers.ts:819](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L819)
+Defined in: [types/providers.ts:1110](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1110)

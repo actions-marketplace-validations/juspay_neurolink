@@ -20,6 +20,7 @@ import {
 import { logger } from "../utils/logger.js";
 import type {
   CloakingConfig,
+  CodexReasoningEffort,
   FallbackEntry,
   LoadProxyConfigOptions,
   ModelMapping,
@@ -242,6 +243,20 @@ function applyAccountDefaults(
   };
 }
 
+const CODEX_REASONING_EFFORTS: readonly CodexReasoningEffort[] = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
+  return CODEX_REASONING_EFFORTS.some((effort) => effort === value);
+}
+
 /**
  * Validate the shape of a parsed proxy config.
  * Returns an array of human-readable error strings (empty = valid).
@@ -276,6 +291,31 @@ export function validateProxyConfig(config: unknown): string[] {
 
   if (hasRouting) {
     const routing = cfg.routing as Record<string, unknown>;
+    const rawFallback = routing["fallback-chain"] ?? routing.fallbackChain;
+    if (Array.isArray(rawFallback)) {
+      rawFallback.forEach((entry: unknown, index: number) => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+          return;
+        }
+        const fallback = entry as Record<string, unknown>;
+        const effort =
+          fallback["reasoning-effort"] !== undefined
+            ? fallback["reasoning-effort"]
+            : fallback.reasoningEffort;
+        if (effort === undefined) {
+          return;
+        }
+        const field = `routing.fallback-chain[${index}].reasoning-effort`;
+        if (!isCodexReasoningEffort(effort)) {
+          errors.push(
+            `${field} must be one of: ${CODEX_REASONING_EFFORTS.join(", ")}`,
+          );
+        }
+        if (String(fallback.provider ?? "").trim() !== "codex") {
+          errors.push(`${field} is only supported for provider codex`);
+        }
+      });
+    }
     const rawAccountAllowlist =
       routing["account-allowlist"] ?? routing.accountAllowlist;
     if (rawAccountAllowlist !== undefined) {
@@ -306,6 +346,21 @@ export function validateProxyConfig(config: unknown): string[] {
       normalizedQuotaRouting !== "false"
     ) {
       errors.push("routing.quota-routing must be a boolean");
+    }
+
+    // Without this a typo (`use-overage: nevr`) loads cleanly and silently
+    // falls back to "auto" — the operator asked to block paid extra usage and
+    // gets provider-driven overage instead.
+    const rawUseOverage = routing["use-overage"] ?? routing.useOverage;
+    if (
+      rawUseOverage !== undefined &&
+      !["auto", "always", "never"].includes(
+        typeof rawUseOverage === "string"
+          ? rawUseOverage.trim().toLowerCase()
+          : "",
+      )
+    ) {
+      errors.push("routing.use-overage must be auto, always, or never");
     }
 
     const rawAutoFallback = routing["auto-fallback"] ?? routing.autoFallback;
@@ -450,7 +505,7 @@ function warnPlaintextApiKeys(
  * Extracts:
  * - `strategy` ("round-robin" | "fill-first")
  * - `model-mappings` / `modelMappings` — array of {from, to, provider}
- * - `fallback-chain` / `fallbackChain` — array of {provider, model}
+ * - `fallback-chain` / `fallbackChain` — array of {provider, model, reasoningEffort?}
  * - `auto-fallback` / `autoFallback` — opt in to an unspecified provider
  * - `max-inflight-per-account` / `maxInflightPerAccount` — concurrency cap
  * - `passthroughModels` / `passthrough-models` — array of model IDs
@@ -525,7 +580,17 @@ function parseRoutingConfig(
           );
           return null;
         }
-        return { provider, model } satisfies FallbackEntry;
+        const effort =
+          e["reasoning-effort"] !== undefined
+            ? e["reasoning-effort"]
+            : e.reasoningEffort;
+        return {
+          provider,
+          model,
+          ...(isCodexReasoningEffort(effort)
+            ? { reasoningEffort: effort }
+            : {}),
+        } satisfies FallbackEntry;
       })
       .filter((e): e is FallbackEntry => e !== null);
   }
@@ -549,6 +614,25 @@ function parseRoutingConfig(
     } else {
       logger.warn(
         `[proxy-config] Ignoring routing.quotaRouting: expected boolean, got ${typeof rawQuotaRouting}`,
+      );
+    }
+  }
+
+  const rawUseOverage = raw["use-overage"] ?? raw.useOverage;
+  if (rawUseOverage !== undefined) {
+    const normalized =
+      typeof rawUseOverage === "string"
+        ? rawUseOverage.trim().toLowerCase()
+        : "";
+    if (
+      normalized === "auto" ||
+      normalized === "always" ||
+      normalized === "never"
+    ) {
+      result.useOverage = normalized;
+    } else {
+      logger.warn(
+        `[proxy-config] Ignoring routing.useOverage: expected auto|always|never, got ${String(rawUseOverage)}`,
       );
     }
   }

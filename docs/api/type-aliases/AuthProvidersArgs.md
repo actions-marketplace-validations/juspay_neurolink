@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **AuthProvidersArgs** = `object`
 
-Defined in: [types/cli.ts:1247](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1247)
+Defined in: [types/cli.ts:1417](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1417)
 
 Auth command argument types
 
@@ -18,4 +18,4 @@ Auth command argument types
 
 > `optional` **format?**: `"text"` \| `"json"` \| `"table"`
 
-Defined in: [types/cli.ts:1248](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1248)
+Defined in: [types/cli.ts:1418](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1418)

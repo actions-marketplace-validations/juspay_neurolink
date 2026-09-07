@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ApiKeyAuthOptions** = `object`
 
-Defined in: [types/middleware.ts:362](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L362)
+Defined in: [types/middleware.ts:415](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L415)
 
 Options for the API-key auth middleware.
 
@@ -18,7 +18,7 @@ Options for the API-key auth middleware.
 
 > `optional` **headerName?**: `string`
 
-Defined in: [types/middleware.ts:363](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L363)
+Defined in: [types/middleware.ts:416](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L416)
 
 ---
 
@@ -26,4 +26,4 @@ Defined in: [types/middleware.ts:363](https://github.com/juspay/neurolink/blob/f
 
 > `optional` **skipPaths?**: `string`[]
 
-Defined in: [types/middleware.ts:364](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/middleware.ts#L364)
+Defined in: [types/middleware.ts:417](https://github.com/juspay/neurolink/blob/release/src/lib/types/middleware.ts#L417)

@@ -13,10 +13,14 @@ export function skipIfEnvMissing(...vars: string[]): string | null {
  *
  * Implemented as a list of named pattern entries so the test harness
  * can introspect them (see `EXPECTED_PROVIDER_ERROR_PATTERNS` below).
- * Every entry below MUST be exercised by at least one fixture in
- * `test/helpers/envGuard.test.ts` — the `test:envguard` self-check
- * fails if a pattern has zero coverage, which prevents silent
- * regex bit-rot as upstream provider error wording drifts.
+ *
+ * ⚠️ These patterns are no longer covered by an automated self-check.
+ * `envGuard.test.ts` used to assert every entry had at least one fixture,
+ * but it was a unit suite and was removed when the suites became
+ * end-to-end only (CLAUDE.md rule 15). Nothing now catches regex bit-rot
+ * as upstream provider wording drifts — a pattern that stops matching
+ * turns a skip into a hard failure, and one that matches too broadly
+ * turns a real failure into a silent skip. Review changes here by hand.
  *
  * Each pattern below is anchored to a specific framing that real
  * provider SDKs emit. We deliberately avoid loose substrings
@@ -108,7 +112,14 @@ const PROVIDER_ERROR_FRAMINGS: RegExp[] = [
   /\[ollama\][^.]*?(?:not\s+running|cannot\s+connect|service)/i,
   /\[anthropic\][^.]*?(?:credit\s+balance|insufficient|quota|not\s+found|model.*?not\s+available)/i,
   /\[mistral\][^.]*?(?:authentication|invalid\s+api)/i,
-  /\[openai\][^.]*?(?:exceeded\s+your\s+current\s+quota|insufficient_quota|billing\s+details|tier|rate\s+limit)/i,
+  // `quota\s+exhausted` is the framing NeuroLink emits for OpenAI's
+  // `insufficient_quota` (an empty account or a spend cap). It is listed
+  // because the classifier stopped calling that condition a "rate limit":
+  // until then this entry matched it only by accident, through the word the
+  // misclassification happened to use. Keep it anchored to the `[openai]`
+  // prefix — the bare word "quota" must never match here, since Google's
+  // retryable throttle reads "Quota exceeded for quota metric ...".
+  /\[openai\][^.]*?(?:exceeded\s+your\s+current\s+quota|insufficient_quota|billing\s+details|tier|rate\s+limit|quota\s+exhausted)/i,
   // OpenAI's streaming-with-tools wrapper that NeuroLink emits when the
   // upstream chat-completion stream errors out. The underlying cause is
   // usually quota/billing/policy — surfacing as a generic "API error

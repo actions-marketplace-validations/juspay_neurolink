@@ -97,6 +97,30 @@ export function parseClaudeRequest(body: ClaudeRequest): ParsedClaudeRequest {
     const msg = body.messages[msgIdx];
     const isLatestUserMsg = msgIdx === lastUserMsgIdx;
 
+    // The Messages API restricts `messages[].role` to "user"/"assistant" —
+    // system prompts are a separate top-level field — but nothing at the
+    // wire boundary enforces that. A client that inlines a "system" message
+    // here would otherwise flow straight into conversationMessages and land
+    // at a non-leading index once translated to an OpenAI-shaped request for
+    // a fallback provider (e.g. LiteLLM/vLLM), whose chat templates reject
+    // any system message not at index 0. Fold it into systemPrompt instead,
+    // mirroring parseOpenAIRequest's handling of inline system messages.
+    if ((msg.role as string) === "system") {
+      const text =
+        typeof msg.content === "string"
+          ? msg.content
+          : Array.isArray(msg.content)
+            ? msg.content
+                .map((b) => (b.type === "text" ? b.text : ""))
+                .filter((t) => t.length > 0)
+                .join("\n")
+            : "";
+      if (text) {
+        systemPrompt = systemPrompt ? `${systemPrompt}\n\n${text}` : text;
+      }
+      continue;
+    }
+
     if (typeof msg.content === "string") {
       conversationMessages.push({ role: msg.role, content: msg.content });
       if (msg.role === "user") {
@@ -648,7 +672,11 @@ export class ClaudeStreamSerializer {
   /**
    * Finalize the stream: content_block_stop, message_delta, message_stop.
    */
-  *finish(outputTokens?: number, finishReason?: string): Generator<string> {
+  *finish(
+    outputTokens?: number,
+    finishReason?: string,
+    finalUsage?: Partial<SSEMessageDelta["usage"]>,
+  ): Generator<string> {
     // If we never started (empty response), start first
     if (this.state === "idle") {
       yield* this.ensureMessageStarted();
@@ -674,7 +702,7 @@ export class ClaudeStreamSerializer {
         stop_reason: mapStopReason(resolvedFinishReason),
         stop_sequence: null,
       },
-      usage: { output_tokens: this.outputTokens },
+      usage: { ...finalUsage, output_tokens: this.outputTokens },
     };
     yield formatSSE("message_delta", messageDelta);
 

@@ -28,17 +28,97 @@ import type {
   RequestAttemptLogEntry,
   RequestLogEntry,
   StoredBodyArtifact,
+  ProxyRequestLoggerSnapshot,
+  ProxyRequestLogSinkSnapshot,
 } from "../types/index.js";
+import { isBorrowedRequest } from "./shareContext.js";
 import { OtelBridge } from "../observability/otelBridge.js";
 import { SeverityNumber } from "@opentelemetry/api-logs";
 import type { LoggerProvider } from "@opentelemetry/sdk-logs";
 import { configureProxyLifecycleLogger } from "./proxyLifecycle.js";
+import { notifyProxyFinalLog } from "./proxyActivity.js";
 import { withTimeout } from "../utils/async/withTimeout.js";
 
 let logDir: string | null = null;
 let logEnabled = false;
 const pendingLogOperations = new Set<Promise<unknown>>();
 const REQUEST_LOG_IO_TIMEOUT_MS = 5_000;
+const MAX_PENDING_METADATA_RECORDS = 4_096;
+const appendChains = new Map<string, Promise<void>>();
+let appendMetadataFile: typeof writeFile = writeFile;
+const createSinkSnapshot = (): ProxyRequestLogSinkSnapshot => ({
+  attempted: 0,
+  written: 0,
+  inFlight: 0,
+  pending: 0,
+  dropped: 0,
+  writeTimeouts: 0,
+  unconfirmedWrites: 0,
+});
+const metadataSinks = {
+  requests: createSinkSnapshot(),
+  attempts: createSinkSnapshot(),
+  debug: createSinkSnapshot(),
+};
+
+export function getRequestLoggerSnapshot(): ProxyRequestLoggerSnapshot {
+  return {
+    enabled: logEnabled,
+    requests: { ...metadataSinks.requests },
+    attempts: { ...metadataSinks.attempts },
+    debug: { ...metadataSinks.debug },
+  };
+}
+
+async function appendMetadataRecord(
+  file: string,
+  line: string,
+  kind: keyof typeof metadataSinks,
+): Promise<void> {
+  const sink = metadataSinks[kind];
+  sink.attempted += 1;
+  if (sink.pending + sink.inFlight >= MAX_PENDING_METADATA_RECORDS) {
+    sink.dropped += 1;
+    return;
+  }
+  sink.pending += 1;
+  // writeFile may perform multiple append syscalls for a large record. Order
+  // them per destination so concurrent records cannot interleave in this worker.
+  const operation = trackLogOperation(
+    (appendChains.get(file) ?? Promise.resolve()).then(async () => {
+      sink.pending -= 1;
+      sink.inFlight += 1;
+      const timer = setTimeout(() => {
+        sink.writeTimeouts += 1;
+      }, REQUEST_LOG_IO_TIMEOUT_MS);
+      timer.unref?.();
+      try {
+        await appendMetadataFile(file, line, { mode: 0o600, flag: "a" });
+        sink.written += 1;
+      } catch (error) {
+        // A failed append may have written a prefix; never replay it.
+        sink.unconfirmedWrites += 1;
+        sink.lastErrorCode =
+          (error as NodeJS.ErrnoException)?.code ?? "UNKNOWN";
+      } finally {
+        clearTimeout(timer);
+        sink.inFlight -= 1;
+      }
+    }),
+  );
+  appendChains.set(file, operation);
+  void operation.then(() => {
+    if (appendChains.get(file) === operation) {
+      appendChains.delete(file);
+    }
+  });
+  // Bound the caller's wait, not the lifetime/ownership of the underlying write.
+  await withTimeout(
+    operation,
+    REQUEST_LOG_IO_TIMEOUT_MS,
+    "Proxy metadata write remains pending",
+  ).catch(() => undefined);
+}
 
 function trackLogOperation<T>(operation: Promise<T>): Promise<T> {
   pendingLogOperations.add(operation);
@@ -57,18 +137,11 @@ export async function flushRequestLogs(
   while (pendingLogOperations.size > 0) {
     const admitted = [...pendingLogOperations];
     const remainingMs = Math.max(1, deadline - Date.now());
-    try {
-      await withTimeout(
-        Promise.allSettled(admitted),
-        remainingMs,
-        `Timed out flushing ${admitted.length} proxy request log operation(s)`,
-      );
-    } catch (error) {
-      for (const operation of admitted) {
-        pendingLogOperations.delete(operation);
-      }
-      throw error;
-    }
+    await withTimeout(
+      Promise.allSettled(admitted),
+      remainingMs,
+      `Timed out flushing ${admitted.length} proxy request log operation(s)`,
+    );
     if (Date.now() >= deadline && pendingLogOperations.size > 0) {
       const remaining = pendingLogOperations.size;
       throw new Error(
@@ -82,6 +155,12 @@ export async function flushRequestLogs(
 export const __requestLoggerTestHooks = {
   pendingOperationCount: () => pendingLogOperations.size,
   trackLogOperation,
+  setAppendFileForTests: (writer: typeof writeFile) => {
+    appendMetadataFile = writer;
+  },
+  restoreAppendFileForTests: () => {
+    appendMetadataFile = writeFile;
+  },
 };
 
 /**
@@ -148,6 +227,15 @@ export function initRequestLogger(
 }
 
 export async function logRequest(entry: RequestLogEntry): Promise<void> {
+  entry.terminalOutcome ??=
+    entry.errorType === "client_cancelled" || entry.responseStatus === 499
+      ? "client_cancelled"
+      : entry.errorType?.includes("stream")
+        ? "stream_error"
+        : entry.responseStatus >= 400 || entry.errorType
+          ? "handler_error"
+          : "completed";
+  notifyProxyFinalLog(entry);
   if (!logEnabled || !logDir) {
     return;
   }
@@ -171,13 +259,7 @@ export async function logRequest(entry: RequestLogEntry): Promise<void> {
   const line = JSON.stringify(entry) + "\n";
 
   try {
-    await trackLogOperation(
-      writeFile(logFile, line, {
-        mode: 0o600,
-        flag: "a",
-        signal: AbortSignal.timeout(REQUEST_LOG_IO_TIMEOUT_MS),
-      }),
-    );
+    await appendMetadataRecord(logFile, line, "requests");
   } catch {
     // Non-fatal — don't crash proxy for logging failures
   }
@@ -214,13 +296,7 @@ export async function logRequestAttempt(
   const line = JSON.stringify(entry) + "\n";
 
   try {
-    await trackLogOperation(
-      writeFile(logFile, line, {
-        mode: 0o600,
-        flag: "a",
-        signal: AbortSignal.timeout(REQUEST_LOG_IO_TIMEOUT_MS),
-      }),
-    );
+    await appendMetadataRecord(logFile, line, "attempts");
   } catch {
     // Non-fatal — don't crash proxy for logging failures
   }
@@ -708,6 +784,13 @@ export async function logBodyCapture(
   if (!logEnabled || !logDir) {
     return;
   }
+  // Borrowed traffic is somebody else's conversation. Capturing it would leave
+  // a peer's prompts and the model's replies on this machine's disk, which is
+  // not something a share token can be read as consenting to. The request is
+  // still logged; only the bodies are dropped.
+  if (isBorrowedRequest()) {
+    return;
+  }
 
   const bridge = new OtelBridge();
   const traceCtx =
@@ -772,12 +855,10 @@ export async function logBodyCapture(
   }
 
   try {
-    await trackLogOperation(
-      writeFile(logFile, JSON.stringify(indexEntry) + "\n", {
-        mode: 0o600,
-        flag: "a",
-        signal: AbortSignal.timeout(REQUEST_LOG_IO_TIMEOUT_MS),
-      }),
+    await appendMetadataRecord(
+      logFile,
+      JSON.stringify(indexEntry) + "\n",
+      "debug",
     );
   } catch {
     // Non-fatal
@@ -883,12 +964,10 @@ export async function logStreamError(entry: {
   }
 
   try {
-    await trackLogOperation(
-      writeFile(logFile, JSON.stringify(logEntry) + "\n", {
-        mode: 0o600,
-        flag: "a",
-        signal: AbortSignal.timeout(REQUEST_LOG_IO_TIMEOUT_MS),
-      }),
+    await appendMetadataRecord(
+      logFile,
+      JSON.stringify(logEntry) + "\n",
+      "requests",
     );
   } catch {
     // Non-fatal — don't crash proxy for logging failures
@@ -905,75 +984,91 @@ export function cleanupLogs(
   maxAgeDays: number = 7,
   maxSizeMb: number = 500,
 ): void {
-  if (!logDir || !existsSync(logDir)) {
+  if (!logDir) {
     return;
   }
 
   try {
-    const activeLogDir = logDir;
-    const files = collectManagedLogFiles(activeLogDir).sort(
-      (a, b) => a.mtime - b.mtime,
-    ); // oldest first
-    const currentDate = new Date().toISOString().split("T")[0];
-    const currentMetadataLogs = new Set(
-      ["proxy", "proxy-attempts", "proxy-debug", "proxy-lifecycle"].map(
-        (prefix) => join(activeLogDir, `${prefix}-${currentDate}.jsonl`),
-      ),
-    );
-    const canDelete = (file: ManagedLogFile) =>
-      !currentMetadataLogs.has(file.path);
-
-    const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-    let deletedCount = 0;
-    let freedBytes = 0;
-
-    // Pass 1: delete files older than maxAgeDays
-    const remaining = [];
-    for (const file of files) {
-      if (file.mtime < cutoff && canDelete(file)) {
-        unlinkSync(file.path);
-        deletedCount++;
-        freedBytes += file.size;
-      } else {
-        remaining.push(file);
-      }
-    }
-
-    const bodiesDir = join(logDir, "bodies");
-    if (existsSync(bodiesDir)) {
-      pruneEmptyDirectories(bodiesDir, bodiesDir);
-    }
-
-    // Pass 2: if total size exceeds maxSizeMb, delete oldest until under limit
-    const maxBytes = maxSizeMb * 1024 * 1024;
-    let totalSize = remaining.reduce((sum, f) => sum + f.size, 0);
-    const deletionCandidates = remaining.filter(canDelete);
-
-    // Current-day metadata is the only reliable source for final-request,
-    // attempt, lifecycle, and body-index reconciliation. Keep those indexes
-    // intact during size cleanup; body artifacts and older indexes remain
-    // eligible for eviction.
-    while (totalSize > maxBytes && deletionCandidates.length > 0) {
-      const oldest = deletionCandidates.shift();
-      if (!oldest) {
-        break;
-      }
-      unlinkSync(oldest.path);
-      totalSize -= oldest.size;
-      deletedCount++;
-      freedBytes += oldest.size;
-    }
-
-    if (existsSync(bodiesDir)) {
-      pruneEmptyDirectories(bodiesDir, bodiesDir);
-    }
-
-    if (deletedCount > 0) {
-      logger.info(
-        `[proxy] log cleanup: deleted ${deletedCount} file(s), freed ${(freedBytes / 1024 / 1024).toFixed(1)} MB`,
-      );
-    }
+    cleanupLogsAt(logDir, maxAgeDays, maxSizeMb);
   } catch {
-    // Non-fatal
+    // Non-fatal for legacy in-process callers.
+  }
+}
+
+/**
+ * Path-scoped retention implementation used by the proxy cleanup worker.
+ * This function is intentionally synchronous: callers must run it outside the
+ * request-serving process when the directory can contain many artifacts.
+ */
+export function cleanupLogsAt(
+  activeLogDir: string,
+  maxAgeDays: number = 7,
+  maxSizeMb: number = 500,
+): void {
+  if (!existsSync(activeLogDir)) {
+    return;
+  }
+
+  const files = collectManagedLogFiles(activeLogDir).sort(
+    (a, b) => a.mtime - b.mtime,
+  ); // oldest first
+  const currentDate = new Date().toISOString().split("T")[0];
+  const currentMetadataLogs = new Set(
+    ["proxy", "proxy-attempts", "proxy-debug", "proxy-lifecycle"].map(
+      (prefix) => join(activeLogDir, `${prefix}-${currentDate}.jsonl`),
+    ),
+  );
+  const canDelete = (file: ManagedLogFile) =>
+    !currentMetadataLogs.has(file.path);
+
+  const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+  let deletedCount = 0;
+  let freedBytes = 0;
+
+  // Pass 1: delete files older than maxAgeDays
+  const remaining = [];
+  for (const file of files) {
+    if (file.mtime < cutoff && canDelete(file)) {
+      unlinkSync(file.path);
+      deletedCount++;
+      freedBytes += file.size;
+    } else {
+      remaining.push(file);
+    }
+  }
+
+  const bodiesDir = join(activeLogDir, "bodies");
+  if (existsSync(bodiesDir)) {
+    pruneEmptyDirectories(bodiesDir, bodiesDir);
+  }
+
+  // Pass 2: if total size exceeds maxSizeMb, delete oldest until under limit
+  const maxBytes = maxSizeMb * 1024 * 1024;
+  let totalSize = remaining.reduce((sum, f) => sum + f.size, 0);
+  const deletionCandidates = remaining.filter(canDelete);
+
+  // Current-day metadata is the only reliable source for final-request,
+  // attempt, lifecycle, and body-index reconciliation. Keep those indexes
+  // intact during size cleanup; body artifacts and older indexes remain
+  // eligible for eviction.
+  while (totalSize > maxBytes && deletionCandidates.length > 0) {
+    const oldest = deletionCandidates.shift();
+    if (!oldest) {
+      break;
+    }
+    unlinkSync(oldest.path);
+    totalSize -= oldest.size;
+    deletedCount++;
+    freedBytes += oldest.size;
+  }
+
+  if (existsSync(bodiesDir)) {
+    pruneEmptyDirectories(bodiesDir, bodiesDir);
+  }
+
+  if (deletedCount > 0) {
+    logger.info(
+      `[proxy] log cleanup: deleted ${deletedCount} file(s), freed ${(freedBytes / 1024 / 1024).toFixed(1)} MB`,
+    );
   }
 }

@@ -15,8 +15,11 @@ import {
   API_KEY_FORMATS,
   API_KEY_LENGTHS,
   PROJECT_ID_FORMAT,
+  satisfiesFallbacks,
 } from "./providerConfig.js";
 import { DEFAULT_OLLAMA_MODEL } from "../providers/ollama/constants.js";
+import { ProviderFactory } from "../factories/providerFactory.js";
+import { PROVIDER_DESCRIPTORS } from "../factories/providerDescriptors.js";
 
 /**
  * Get the best available provider based on real-time availability checks
@@ -34,30 +37,6 @@ export async function getBestProvider(
     logger.debug(
       `[getBestProvider] Using explicitly requested provider: ${requestedProvider}`,
     );
-
-    // Optional health check for logging purposes only
-    try {
-      const health = await ProviderHealthChecker.checkProviderHealth(
-        requestedProvider as AIProviderName,
-        { includeConnectivityTest: false, cacheResults: true },
-      );
-
-      if (health.isHealthy) {
-        logger.debug(
-          `[getBestProvider] Explicitly requested provider ${requestedProvider} is healthy`,
-        );
-      } else {
-        logger.warn(
-          `[getBestProvider] Explicitly requested provider ${requestedProvider} may have issues, but using anyway`,
-          { error: health.error },
-        );
-      }
-    } catch (error) {
-      logger.warn(
-        `[getBestProvider] Health check failed for explicitly requested provider ${requestedProvider}, using anyway`,
-        { error: error instanceof Error ? error.message : String(error) },
-      );
-    }
 
     // ALWAYS return the explicitly requested provider
     return requestedProvider;
@@ -114,18 +93,11 @@ export async function getBestProvider(
    * - Other providers are ordered based on a combination of reliability, feature set, and historical performance.
    * Please update this comment if the order is changed in the future, and document the rationale for maintainability.
    */
-  const providers = [
-    "litellm", // Prioritize self-hosted proxy deployments first
-    "ollama", // Local models when the configured runtime target is installed
-    "vertex", // Google Cloud AI (enterprise)
-    "google-ai", // Google AI ecosystem support
-    "openai", // Reliable with broad model support
-    "anthropic",
-    "bedrock",
-    "azure",
-    "mistral",
-    "huggingface",
-  ];
+  const providers = PROVIDER_DESCRIPTORS.filter(
+    (d) => d.autoSelectPriority !== undefined,
+  )
+    .sort((a, b) => (a.autoSelectPriority ?? 0) - (b.autoSelectPriority ?? 0))
+    .map((d) => d.name);
 
   for (const provider of providers) {
     if (await isProviderAvailable(provider)) {
@@ -459,73 +431,26 @@ function isValidUrl(url: string): boolean {
  * @returns True if the provider has required environment variables
  */
 export function hasProviderEnvVars(provider: string): boolean {
-  switch (provider.toLowerCase()) {
-    case "bedrock":
-    case "amazon":
-    case "aws":
-      return !!(
-        process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY
-      );
-
-    case "vertex":
-    case "googlevertex":
-    case "google":
-    case "gemini":
-      return !!(
-        (process.env.GOOGLE_CLOUD_PROJECT_ID ||
-          process.env.VERTEX_PROJECT_ID ||
-          process.env.GOOGLE_VERTEX_PROJECT ||
-          process.env.GOOGLE_CLOUD_PROJECT) &&
-        (process.env.GOOGLE_APPLICATION_CREDENTIALS ||
-          process.env.GOOGLE_SERVICE_ACCOUNT_KEY ||
-          (process.env.GOOGLE_AUTH_CLIENT_EMAIL &&
-            process.env.GOOGLE_AUTH_PRIVATE_KEY))
-      );
-
-    case "openai":
-    case "gpt":
-      return !!process.env.OPENAI_API_KEY;
-
-    case "anthropic":
-    case "claude":
-      return !!process.env.ANTHROPIC_API_KEY;
-
-    case "azure":
-    case "azureopenai":
-      return !!process.env.AZURE_OPENAI_API_KEY;
-
-    case "google-ai":
-    case "google-studio":
-      return !!(
-        process.env.GOOGLE_AI_API_KEY ||
-        process.env.GOOGLE_GENERATIVE_AI_API_KEY
-      );
-
-    case "huggingface":
-    case "hugging-face":
-    case "hf":
-      return !!(process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN);
-
-    case "ollama":
-    case "local":
-    case "local-ollama":
-      // For Ollama, we check if the service is potentially available
-      // This is a basic check - actual connectivity will be verified during usage
-      return true; // Ollama doesn't require environment variables, just local service
-
-    case "mistral":
-    case "mistral-ai":
-    case "mistralai":
-      return !!process.env.MISTRAL_API_KEY;
-
-    case "litellm":
-      // LiteLLM requires a proxy server, which can be checked for availability
-      // Default base URL is assumed, or can be configured via environment
-      return true; // LiteLLM proxy availability will be checked during usage
-
-    default:
-      return false;
+  const descriptor = ProviderFactory.getDescriptor(provider);
+  if (!descriptor) {
+    return false;
   }
+  if (descriptor.envVars.optional || descriptor.localRuntime) {
+    // Ollama / LiteLLM / LM Studio / llama.cpp: usable with defaults.
+    return true;
+  }
+  const { apiKey, fallbacks, extraRequired, extraRequiredFallbacks } =
+    descriptor.envVars;
+  const hasPrimary =
+    !!apiKey &&
+    (!!process.env[apiKey] || (fallbacks ?? []).some((v) => !!process.env[v]));
+  if (!hasPrimary) {
+    return false;
+  }
+  return (
+    (extraRequired ?? []).every((v) => !!process.env[v]) ||
+    satisfiesFallbacks(extraRequiredFallbacks, process.env)
+  );
 }
 
 /**
@@ -533,18 +458,7 @@ export function hasProviderEnvVars(provider: string): boolean {
  * @returns Array of available provider names
  */
 export function getAvailableProviders(): string[] {
-  return [
-    "bedrock",
-    "vertex",
-    "openai",
-    "anthropic",
-    "azure",
-    "google-ai",
-    "litellm",
-    "huggingface",
-    "ollama",
-    "mistral",
-  ];
+  return PROVIDER_DESCRIPTORS.map((d) => d.name);
 }
 
 /**

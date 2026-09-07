@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **TierComparisonResult** = `object`
 
-Defined in: [types/subscription.ts:538](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L538)
+Defined in: [types/subscription.ts:621](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L621)
 
 Subscription tier comparison result
 
@@ -22,7 +22,7 @@ Result of comparing two subscription tiers
 
 > **isHigher**: `boolean`
 
-Defined in: [types/subscription.ts:540](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L540)
+Defined in: [types/subscription.ts:623](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L623)
 
 Whether the first tier is higher than the second
 
@@ -32,7 +32,7 @@ Whether the first tier is higher than the second
 
 > **isLower**: `boolean`
 
-Defined in: [types/subscription.ts:542](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L542)
+Defined in: [types/subscription.ts:625](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L625)
 
 Whether the first tier is lower than the second
 
@@ -42,7 +42,7 @@ Whether the first tier is lower than the second
 
 > **isEqual**: `boolean`
 
-Defined in: [types/subscription.ts:544](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L544)
+Defined in: [types/subscription.ts:627](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L627)
 
 Whether the tiers are equal
 
@@ -52,6 +52,6 @@ Whether the tiers are equal
 
 > **levelDifference**: `number`
 
-Defined in: [types/subscription.ts:546](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L546)
+Defined in: [types/subscription.ts:629](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L629)
 
 Numeric difference between tier levels (positive = first is higher)

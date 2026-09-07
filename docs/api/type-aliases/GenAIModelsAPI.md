@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **GenAIModelsAPI** = `object`
 
-Defined in: [types/providers.ts:900](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L900)
+Defined in: [types/providers.ts:1191](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1191)
 
 Google AI models API interface
 
@@ -18,7 +18,7 @@ Google AI models API interface
 
 > **generateContentStream**: (`params`) => `Promise`\<`AsyncIterable`\<[`GenAIStreamChunk`](GenAIStreamChunk.md)\>\>
 
-Defined in: [types/providers.ts:901](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L901)
+Defined in: [types/providers.ts:1192](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1192)
 
 #### Parameters
 
@@ -46,7 +46,7 @@ Defined in: [types/providers.ts:901](https://github.com/juspay/neurolink/blob/ff
 
 > **generateContent**: (`params`) => `Promise`\<[`GenAIGenerateContentResponse`](GenAIGenerateContentResponse.md)\>
 
-Defined in: [types/providers.ts:906](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L906)
+Defined in: [types/providers.ts:1197](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1197)
 
 #### Parameters
 
@@ -67,3 +67,31 @@ Defined in: [types/providers.ts:906](https://github.com/juspay/neurolink/blob/ff
 #### Returns
 
 `Promise`\<[`GenAIGenerateContentResponse`](GenAIGenerateContentResponse.md)\>
+
+---
+
+### embedContent
+
+> **embedContent**: (`params`) => `Promise`\<\{ `embeddings?`: `object`[]; \}\>
+
+Defined in: [types/providers.ts:1202](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1202)
+
+#### Parameters
+
+##### params
+
+###### model
+
+`string`
+
+###### contents
+
+`string` \| `string`[]
+
+###### config?
+
+`Record`\<`string`, `unknown`\>
+
+#### Returns
+
+`Promise`\<\{ `embeddings?`: `object`[]; \}\>

@@ -18,6 +18,7 @@
  * direct HTTP client + multi-step tool-execution loop driven by SSE.
  */
 
+import { trace } from "@opentelemetry/api";
 import type { AIProviderName } from "../constants/enums.js";
 import {
   getAvailableInputTokens,
@@ -39,6 +40,9 @@ import { createProxyFetch } from "../proxy/proxyFetch.js";
 import type {
   DeferredUsage,
   LanguageModel,
+  LanguageModelV3StreamPart,
+  LanguageModelV3,
+  LanguageModelV3CallOptions,
   ModelsResponse,
   OpenAICompatBuildBodyArgs,
   OpenAICompatChatChoice,
@@ -57,6 +61,10 @@ import type {
   OpenAICompatV3CallTools,
   Schema,
   StreamLoopArgs,
+  EnhancedGenerateResult,
+  GenerateStopReason,
+  TextGenerationOptions,
+  ValidationSchema,
   StreamOptions,
   StreamResult,
   Tool,
@@ -64,6 +72,7 @@ import type {
   ZodUnknownSchema,
 } from "../types/index.js";
 import { logger } from "../utils/logger.js";
+import { redactUrlCredentials } from "../utils/logSanitize.js";
 import { NoOutputGeneratedError } from "../utils/generationErrors.js";
 import {
   buildNoOutputSentinel,
@@ -75,15 +84,31 @@ import {
   mergeAbortSignals,
 } from "../utils/timeout.js";
 import { emitToolEndFromStepFinish } from "../utils/toolEndEmitter.js";
+import { resolveRequestKind } from "../core/resolveRequestKind.js";
+import {
+  appendJsonSchemaInstruction,
+  hasNativeDoGenerate,
+  runNativeGenerateLoop,
+} from "../core/nativeGenerateLoop.js";
+import {
+  resolveToolExecutionRecords,
+  toolCallsFromSummaries,
+} from "../core/toolExecutionRecorder.js";
+import { convertZodToJsonSchema } from "../utils/schemaConversion.js";
+import { coerceJsonToSchema, schemaAccepts } from "../utils/json/coerce.js";
 import { resolveToolChoice } from "../utils/toolChoice.js";
 import { transformToolExecutions } from "../utils/transformationUtils.js";
+import { withProviderRetry } from "../utils/providerRetry.js";
+import {
+  isSchemaComplexityError,
+  isToolsSchemaConflictError,
+} from "../core/modules/structuredOutputPolicy.js";
 import { resolveDeferredTool } from "../tools/toolDiscovery.js";
 import {
   buildAPIError,
   buildBody,
   buildToolsForOpenAI,
   buildWireToolNameMaps,
-  createChunkQueue,
   createDeferredAnalytics,
   ensureJsonWordInBody,
   estimateWireTokens,
@@ -97,6 +122,7 @@ import {
   v3ToolChoiceToOpenAI,
   v3ToolsToOpenAI,
 } from "./openaiChatCompletionsClient.js";
+import { createStreamChannel } from "../core/streamChannel.js";
 
 /**
  * Safety margin (tokens) when fitting `max_tokens` to a runtime-discovered
@@ -108,6 +134,94 @@ const WINDOW_FIT_MARGIN_TOKENS = 512;
 /**
  * Abstract HTTP+SSE provider for OpenAI chat-completions-shaped endpoints.
  */
+
+/**
+ * Did the model's text yield an object the caller's schema accepts?
+ *
+ * This is the trigger for the prompt-side structured-output fallback. It asks
+ * the question the ai-package's structured-output parser used to ask by
+ * throwing: did the native `response_format` attempt actually produce the
+ * object. A schema we cannot validate with accepts everything, so an unknown
+ * schema never forces a pointless second request.
+ */
+const yieldsSchemaValidObject = (
+  text: string,
+  schema: ValidationSchema,
+): boolean => {
+  const coerced = coerceJsonToSchema(text, schema);
+  return coerced !== null && schemaAccepts(schema, coerced.structuredData);
+};
+
+// Pull one native chunk at a time and forward cancellation to its iterator.
+const chunksToV3Stream = (
+  source: AsyncIterable<OpenAICompatStreamChunk>,
+  completion: Promise<LanguageModelV3StreamPart>,
+  cancel: () => void,
+): ReadableStream<LanguageModelV3StreamPart> => {
+  const iterator = source[Symbol.asyncIterator]();
+  return new ReadableStream<LanguageModelV3StreamPart>({
+    async pull(controller) {
+      try {
+        const next = await iterator.next();
+        if (next.done) {
+          controller.enqueue(await completion);
+          controller.close();
+        } else if (next.value.reasoning) {
+          controller.enqueue({
+            type: "reasoning-delta",
+            delta: next.value.reasoning,
+          });
+        } else {
+          controller.enqueue({ type: "text-delta", delta: next.value.content });
+        }
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      cancel();
+      await iterator.return?.();
+    },
+  });
+};
+
+async function* v3StreamToChunks(
+  stream: ReadableStream<LanguageModelV3StreamPart>,
+  onFinish: (
+    part: Extract<LanguageModelV3StreamPart, { type: "finish" }>,
+  ) => void,
+): AsyncIterable<OpenAICompatStreamChunk> {
+  const reader = stream.getReader();
+  let done = false;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) {
+        done = true;
+        return;
+      }
+      const part = next.value;
+      if (part.type === "text-delta") {
+        yield { content: part.delta };
+      } else if (part.type === "reasoning-delta") {
+        yield { content: "", reasoning: part.delta };
+      } else if (part.type === "finish") {
+        onFinish(part);
+      } else if (part.type === "error") {
+        throw part.error;
+      }
+    }
+  } finally {
+    try {
+      if (!done) {
+        await reader.cancel();
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+}
+
 export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
   protected config: { baseURL: string; apiKey: string };
   protected resolvedModel?: string;
@@ -146,6 +260,28 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
    * Hardcoded model names returned from `getAvailableModels()` when the
    * remote `/models` endpoint can't be reached. Default empty.
    */
+  /**
+   * Feed the catalog's `fallbacks` to BaseProvider's invalid-model retry, so
+   * a default the vendor has retired degrades to the next live model in the
+   * entry instead of failing the call outright.
+   */
+  protected getModelFallbacks(): string[] {
+    return this.getFallbackModels();
+  }
+
+  /**
+   * `resolvedModel` memoizes the first id this provider resolved, and
+   * getAISDKModel() builds its wire model from that memo rather than from
+   * `modelName`. Leaving it stale here silently defeats the invalid-model
+   * fallback: modelName advances to the next candidate while every request
+   * still carries the retired id, so each retry fails for the same reason
+   * the first attempt did.
+   */
+  protected refreshHandlersForModel(model: string): void {
+    this.resolvedModel = model;
+    super.refreshHandlersForModel(model);
+  }
+
   protected getFallbackModels(): string[] {
     return [];
   }
@@ -194,6 +330,22 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
    */
   protected suppressResponseFormatWithTools(): boolean {
     return true;
+  }
+
+  /**
+   * When true, `doGenerate` puts `stream: true` on the wire and aggregates
+   * the SSE stream into the SAME complete result the JSON wire returns —
+   * callers still get one awaited result with structuredData coercion, tool
+   * calls, finish reason and usage intact. Bytes then flow continuously, so
+   * proxy/tunnel idle limits (e.g. Cloudflare's ~100s 524 on tunneled
+   * gateways) cannot kill a slow completion, and the request timeout is
+   * re-armed on every chunk (idle semantics) instead of capping total
+   * duration. Default false: some OpenAI-compatible backends mishandle
+   * `stream_options` or omit usage on streams, so each provider opts in
+   * deliberately. LiteLLM overrides this to true.
+   */
+  protected useStreamingWireForGenerate(): boolean {
+    return false;
   }
 
   /**
@@ -416,6 +568,44 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
   }
 
   /**
+   * Shared local-runtime reachability probe: GET `${baseURL}/models` with a
+   * short timeout, requiring at least one model entry with a non-empty id.
+   * Local providers (Ollama, LM Studio, llama.cpp) call this from their own
+   * validateConfiguration() override instead of relying on the base class's
+   * "apiKey is a non-empty string" default, which can't detect an
+   * unreachable local server.
+   */
+  protected async probeModelsEndpoint(
+    headers: Record<string, string> = {},
+  ): Promise<boolean> {
+    try {
+      const url = `${stripTrailingSlash(this.config.baseURL)}/models`;
+      const proxyFetch = createProxyFetch();
+      const response = await proxyFetch(url, {
+        headers: { ...headers, "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) {
+        return false;
+      }
+      const data = (await response
+        .json()
+        .catch(() => null)) as ModelsResponse | null;
+      return Boolean(
+        data?.data?.some(
+          (m) => typeof m?.id === "string" && m.id.trim().length > 0,
+        ),
+      );
+    } catch (error) {
+      logger.debug(`[${this.constructor.name}] probeModelsEndpoint failed`, {
+        baseURL: redactUrlCredentials(this.config.baseURL),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  /**
    * Snapshot of the provider's resolved configuration — part of the documented
    * public provider contract (`docs/provider-integration/00-architecture.md`).
    * Subclasses inherit this; override only to expose extra fields.
@@ -500,6 +690,8 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
     const resolveWireMaxTokens = this.resolveWireMaxTokens.bind(this);
     const suppressResponseFormatWithTools =
       this.suppressResponseFormatWithTools.bind(this);
+    const useStreamingWireForGenerate =
+      this.useStreamingWireForGenerate.bind(this);
     const getTimeoutForOptions = (
       opts: Record<string, unknown> | undefined,
     ): number => this.getTimeout((opts ?? {}) as never);
@@ -565,6 +757,10 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
           baseMessages,
           wireTools,
         );
+        // SSE wire for generate (opt-in per provider): stream on the wire,
+        // aggregate below into the same complete response the JSON wire
+        // yields. See useStreamingWireForGenerate.
+        const sseWire = useStreamingWireForGenerate();
         const body = ensureJsonWordInBody(
           adjustRequestBody(
             buildBody({
@@ -588,7 +784,7 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
                     ),
                   }
                 : {}),
-              streaming: false,
+              streaming: sseWire,
               ...(responseFormat ? { responseFormat } : {}),
             }),
             modelId,
@@ -622,6 +818,10 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
             timeoutController?.controller.signal,
           );
         let json: OpenAICompatChatResponse;
+        // Whether the response we end up consuming is SSE. Starts as the
+        // provider's wire preference; the 400 fallback below can flip it
+        // when a backend rejects `stream`/`stream_options` outright.
+        let wireIsStreaming = sseWire;
         try {
           let res = await fetchImpl(url, {
             method: "POST",
@@ -636,29 +836,50 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
             const apiErr = await buildAPIError(url, body, res);
             // One-shot 400 retry. The overflow corrector runs FIRST (it can
             // re-fit max_tokens from the provider's own numbers and also
-            // self-heals the runtime window registry); otherwise a subclass
-            // may strip a rejected field and return a modified body (e.g.
-            // NIM's chat_template / reasoning_budget). The retry runs under
-            // the SAME timeout controller as the first attempt, so the
-            // configured timeout caps the overall call — matching the
-            // streaming path, which reuses its composed signal for the retry.
-            const retryBody =
+            // self-heals the runtime window registry); its output then feeds
+            // a subclass hook that may strip a rejected field (e.g. NIM's
+            // chat_template / reasoning_budget), so a body that needs BOTH
+            // fixes gets both — a plain `??` between the two would let
+            // whichever ran first silently win and drop the other's fix. The
+            // retry runs under the SAME timeout controller as the first
+            // attempt, so the configured timeout caps the overall call —
+            // matching the streaming path, which reuses its composed signal
+            // for the retry.
+            const typedErr = apiErr as Error & {
+              statusCode?: number;
+              responseBody?: string;
+            };
+            let retryBody =
               res.status === 400
-                ? (correctBodyAfterContextOverflow(
-                    body,
-                    apiErr as Error & {
-                      statusCode?: number;
-                      responseBody?: string;
-                    },
-                  ) ??
-                  adjustBodyAfter400(
-                    body,
-                    apiErr as Error & {
-                      statusCode?: number;
-                      responseBody?: string;
-                    },
-                  ))
+                ? (() => {
+                    const overflowCorrected = correctBodyAfterContextOverflow(
+                      body,
+                      typedErr,
+                    );
+                    return (
+                      adjustBodyAfter400(overflowCorrected ?? body, typedErr) ??
+                      overflowCorrected
+                    );
+                  })()
                 : undefined;
+            // SSE-wire net: a backend that rejects streaming itself (the 400
+            // names `stream`/`stream_options`) gets ONE retry on the plain
+            // JSON wire. Gated on the error text so a genuine bad request
+            // isn't replayed just to fail identically a second time.
+            if (
+              !retryBody &&
+              sseWire &&
+              res.status === 400 &&
+              /stream/i.test(typedErr.responseBody ?? "")
+            ) {
+              const {
+                stream: _stream,
+                stream_options: _streamOptions,
+                ...jsonWireBody
+              } = body;
+              retryBody = jsonWireBody;
+              wireIsStreaming = false;
+            }
             if (!retryBody) {
               throw apiErr;
             }
@@ -679,7 +900,62 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
           // after cleanup(), so a response whose headers arrived but whose
           // body stalled mid-transfer was bounded by nothing but the caller's
           // outer wall-clock.
-          json = (await res.json()) as OpenAICompatChatResponse;
+          if (wireIsStreaming) {
+            if (!res.body) {
+              throw new Error(
+                `${providerName}: streaming generate response had no body`,
+              );
+            }
+            // Idle-timeout semantics: every raw chunk re-arms the timeout,
+            // so the configured window bounds silence, not total duration —
+            // the whole point of the SSE wire is that a slow-but-alive
+            // completion keeps the connection (and the timer) fed.
+            const monitored = timeoutController
+              ? res.body.pipeThrough(
+                  new TransformStream<Uint8Array, Uint8Array>({
+                    transform(chunk, controller) {
+                      timeoutController.reset();
+                      controller.enqueue(chunk);
+                    },
+                  }),
+                )
+              : res.body;
+            const sse = await parseSSEStream(monitored, () => {});
+            // Re-shape the aggregate into the JSON-wire response so every
+            // line below this point (content parts, finish-reason mapping,
+            // usage clamping, response metadata) is shared verbatim between
+            // the two wires and cannot drift.
+            json = {
+              ...(sse.id ? { id: sse.id } : {}),
+              ...(sse.model ? { model: sse.model } : {}),
+              choices: [
+                {
+                  index: 0,
+                  message: {
+                    role: "assistant",
+                    content: sse.text.length > 0 ? sse.text : null,
+                    ...(sse.reasoning ? { reasoning: sse.reasoning } : {}),
+                    ...(sse.toolCalls.size > 0
+                      ? {
+                          tool_calls: [...sse.toolCalls.values()].map((tc) => ({
+                            id: tc.id,
+                            type: "function" as const,
+                            function: {
+                              name: tc.name,
+                              arguments: tc.argsBuffered,
+                            },
+                          })),
+                        }
+                      : {}),
+                  },
+                  finish_reason: sse.finishReason ?? "stop",
+                },
+              ],
+              ...(sse.usage ? { usage: sse.usage } : {}),
+            };
+          } else {
+            json = (await res.json()) as OpenAICompatChatResponse;
+          }
         } finally {
           timeoutController?.cleanup();
           disposeComposedSignal();
@@ -795,6 +1071,271 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
    * streamText, no AI SDK orchestrator. Tool calls, multi-step loops,
    * telemetry, abort handling all inline.
    */
+  /**
+   * Native non-streaming generate.
+   *
+   * Drives the SAME `doGenerate` the ai loop drove — `buildDelegatingModel`'s,
+   * reached through `getAISDKModel()` — and supplies only the multi-step tool
+   * iteration around it. That matters: `doGenerate` is where the JSON-versus-SSE
+   * wire choice lives (`useStreamingWireForGenerate()`, false by default), along
+   * with the 400 retry, the context-overflow refit and the invalid-model
+   * fallback. An earlier attempt ran generate through the STREAMING loop
+   * instead and silently began sending `stream: true` on a path that had always
+   * sent plain JSON; ten providers returned empty content against a
+   * non-streaming body and a stream-rejecting backend failed outright. Loop
+   * around doGenerate, never around streamOneStep.
+   *
+   * Tool turns are appended in the message-builder shape, which
+   * `messageBuilderToOpenAI` already round-trips: an assistant message carrying
+   * `tool-call` parts, then one `tool` message of `tool-result` parts.
+   */
+  override async generate(
+    optionsOrPrompt: TextGenerationOptions | string,
+    analysisSchema?: ValidationSchema,
+  ): Promise<EnhancedGenerateResult | null> {
+    await this.ensureModelLimits();
+    const options = this.normalizeTextOptions(optionsOrPrompt);
+    if (resolveRequestKind(options, this.modelName) !== "text") {
+      return super.generate(options, analysisSchema);
+    }
+    this.validateOptions(options);
+    const mergedTools = await this.getToolsForStream(options);
+    // Reuse BaseProvider's invalid-model fallback. Overriding generate() skips
+    // it otherwise, and a retired default stops degrading to the next live
+    // model in the catalog entry.
+    const callerOwnsFallback =
+      "disableInternalFallback" in options &&
+      options.disableInternalFallback === true;
+    // The native loop bypasses BaseProvider.executeGeneration, so the turn
+    // budget has to be composed here or it stops existing for this provider.
+    return this.runGenerateWithModelFallback(
+      () =>
+        this.withTurnTimeout(
+          { ...options, tools: mergedTools },
+          this.getDescriptorGenerateMs(),
+          (timedOptions) => this.executeNativeGenerate(timedOptions),
+        ),
+      callerOwnsFallback,
+    );
+  }
+
+  private async executeNativeGenerate(
+    options: TextGenerationOptions,
+  ): Promise<EnhancedGenerateResult> {
+    const startTime = Date.now();
+    const modelId = await this.resolveModelName();
+    // Middleware must wrap the model here. The native loop bypasses
+    // BaseProvider.executeGeneration, and with it the only place middleware was
+    // ever applied — a probe showed a caller's wrapGenerate running zero times
+    // on every native provider while their onFinish still fired, because
+    // onFinish had been special-cased and nothing else had.
+    const model = await this.getAISDKModelWithMiddleware(options);
+    // Runtime guard rather than an assertion: `LanguageModel` is a union that
+    // includes a bare string id, and a double assertion through unknown is
+    // banned by Critical Rule 14.
+    if (!hasNativeDoGenerate(model)) {
+      throw this.handleProviderError(
+        new Error(`${this.providerName}: model handle exposes no doGenerate()`),
+      );
+    }
+    const doGenerate = model.doGenerate.bind(model);
+
+    const shouldUseTools = !options.disableTools && this.supportsTools();
+    const toolsRecord = shouldUseTools
+      ? (options.tools as Record<string, Tool>) || (await this.getAllTools())
+      : {};
+
+    // v3 tool shape — the same one doGenerate already converts internally.
+    const v3Tools = shouldUseTools
+      ? Object.entries(toolsRecord).map(([name, t]) => {
+          const tool = t as { description?: string; inputSchema?: unknown };
+          return {
+            type: "function" as const,
+            name,
+            description: tool.description ?? "",
+            inputSchema: (tool.inputSchema
+              ? convertZodToJsonSchema(tool.inputSchema as never)
+              : { type: "object", properties: {} }) as Record<string, unknown>,
+          };
+        })
+      : undefined;
+    const hasTools = !!v3Tools && v3Tools.length > 0;
+
+    // Structured output rides response_format, which is what Output.object did
+    // on the ai path. Suppressed where the provider says the combination with
+    // tools is rejected.
+    const responseFormat =
+      options.schema && !(hasTools && this.suppressResponseFormatWithTools())
+        ? {
+            type: "json" as const,
+            schema: convertZodToJsonSchema(
+              options.schema as ZodUnknownSchema,
+            ) as Record<string, unknown>,
+          }
+        : undefined;
+
+    const conversation = (await this.buildMessagesForStream(
+      options as StreamOptions,
+    )) as Array<Record<string, unknown>>;
+
+    const toolExecutionSummaries: ToolExecutionSummaryInternal[] = [];
+    const runLoop = (
+      conv: Array<Record<string, unknown>>,
+      format: typeof responseFormat,
+    ) =>
+      runNativeGenerateLoop(
+        {
+          doGenerate,
+          conversation: conv,
+          ...(v3Tools ? { tools: v3Tools } : {}),
+          toolsRecord,
+          ...(hasTools && options.toolChoice
+            ? { toolChoice: resolveToolChoice(options, toolsRecord, true) }
+            : {}),
+          // The per-call `timeout` keeps its per-MODEL-CALL meaning once
+          // `turnTimeoutMs` owns the whole-turn deadline, and it reaches the
+          // model layer only through this channel. Without it each step fell
+          // back to the provider default, so a caller asking for a short
+          // per-call timeout got the default on every request.
+          ...(typeof options.timeout === "number"
+            ? {
+                providerOptions: {
+                  neurolink: { timeoutMs: options.timeout },
+                },
+              }
+            : {}),
+          ...(format ? { responseFormat: format } : {}),
+          maxSteps: options.maxSteps || DEFAULT_MAX_STEPS,
+          ...(options.maxTokens ? { maxOutputTokens: options.maxTokens } : {}),
+          ...(options.temperature !== undefined
+            ? { temperature: options.temperature }
+            : {}),
+          ...(options.abortSignal ? { abortSignal: options.abortSignal } : {}),
+          ...(options.toolTimeoutMs !== undefined
+            ? { toolTimeoutMs: options.toolTimeoutMs }
+            : {}),
+          // withProviderRetry + handleProviderError are what the ai loop
+          // supplied around each call: without them a 429 surfaces as a raw
+          // upstream string instead of a RateLimitError, and a throttle is
+          // never retried.
+          runStep: (call) =>
+            withProviderRetry<Record<string, unknown>>(
+              call,
+              trace.getActiveSpan() ?? undefined,
+              `${this.providerName} generate`,
+            ).catch((err) => {
+              throw this.handleProviderError(err);
+            }),
+        },
+        toolExecutionSummaries,
+      );
+
+    // Structured output rides `response_format` first. When a vendor rejects
+    // that outright — a tools/JSON-mode conflict, or a schema its constrained
+    // decoder will not accept — the recovery is to ask for the same object in
+    // words instead: drop `response_format` and spell the JSON Schema into the
+    // system prompt, letting coerceJsonToSchema recover the object from text.
+    //
+    // Ported from GenerationHandler's `promptJsonInstruction` fallback, which
+    // runs this on the ai-package path. That path is unreachable for every
+    // provider driven by this loop — GMI Cloud's MiniMax endpoint, the one it
+    // was written for, is a Tier-2 catalog provider on this very base class —
+    // so without this the recovery would simply not happen for it.
+    let loop: Awaited<ReturnType<typeof runNativeGenerateLoop>>;
+    try {
+      loop = await runLoop(conversation, responseFormat);
+    } catch (error) {
+      const recoverable =
+        responseFormat !== undefined &&
+        (isToolsSchemaConflictError(error) || isSchemaComplexityError(error));
+      if (!recoverable) {
+        throw error;
+      }
+      logger.warn(
+        `[${this.providerName}] provider rejected response_format — retrying with the schema in the system prompt`,
+        { provider: this.providerName, model: modelId },
+      );
+      loop = await runLoop(
+        appendJsonSchemaInstruction(conversation, responseFormat.schema),
+        undefined,
+      );
+    }
+
+    // The vendor can also IGNORE `response_format` and answer in prose without
+    // erroring at all — GMI Cloud's MiniMax endpoint does exactly that, and it
+    // is the case the fallback was written for. On the ai-package path the
+    // structured-output parser threw on the unparseable answer, so the catch
+    // above was reached; the native loop has no such parser, so the silent
+    // case sailed through and handed the caller prose. Same recovery, keyed on
+    // the result rather than on an exception.
+    if (
+      responseFormat !== undefined &&
+      options.schema !== undefined &&
+      !yieldsSchemaValidObject(loop.text, options.schema as ValidationSchema)
+    ) {
+      logger.warn(
+        `[${this.providerName}] response_format did not yield a schema-valid object — retrying with the schema in the system prompt`,
+        { provider: this.providerName, model: modelId },
+      );
+      loop = await runLoop(
+        appendJsonSchemaInstruction(conversation, responseFormat.schema),
+        undefined,
+      );
+    }
+    const { text, finishReason, toolsUsed } = loop;
+    const inputTokens = loop.inputTokens;
+    const outputTokens = loop.outputTokens;
+
+    // stopReason / stepsUsed parity with the other native loops (Vertex
+    // Gemini / Claude / Bedrock) and with the ai-package path this replaced.
+    // Without them a consumer cannot tell a completed turn from one the step
+    // cap truncated: the turn that ends on a `tool-calls` finish with the
+    // budget spent is exactly the case the caller configured `maxSteps` to
+    // bound, and reporting it as a plain completion hides that.
+    const stepsUsed = loop.steps;
+    const stopReason: GenerateStopReason =
+      stepsUsed >= (options.maxSteps || DEFAULT_MAX_STEPS) &&
+      finishReason === "tool-calls"
+        ? "step-cap"
+        : finishReason === "error"
+          ? "provider-error"
+          : "completed";
+
+    const enhanced: EnhancedGenerateResult = {
+      content: text,
+      provider: this.providerName,
+      model: modelId,
+      finishReason,
+      stopReason,
+      stepsUsed,
+      usage: {
+        input: inputTokens,
+        output: outputTokens,
+        total: inputTokens + outputTokens,
+        // doGenerate reads prompt_tokens_details.cached_tokens, and the loop
+        // carries the counters out; discarding them here billed cached input
+        // at the full rate in calculateCost and made cache effectiveness
+        // invisible. Anthropic's native path already forwards both.
+        ...(loop.cacheReadTokens
+          ? { cacheReadTokens: loop.cacheReadTokens }
+          : {}),
+        ...(loop.cacheWriteTokens
+          ? { cacheCreationTokens: loop.cacheWriteTokens }
+          : {}),
+      },
+      responseTime: Date.now() - startTime,
+      toolsUsed,
+      toolCalls: toolCallsFromSummaries(toolExecutionSummaries),
+      toolExecutions: resolveToolExecutionRecords(
+        options,
+        transformToolExecutions(toolExecutionSummaries),
+      ),
+      enhancedWithTools: toolsUsed.length > 0,
+    };
+
+    return this.finalizeNativeGenerate(enhanced, options, startTime);
+  }
+
   protected async executeStream(
     options: StreamOptions,
     _analysisSchema?: ZodUnknownSchema | Schema<unknown>,
@@ -823,7 +1364,10 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
     let wireNameMaps: ReturnType<typeof buildWireToolNameMaps>;
     let openAITools: OpenAICompatChatTool[] | undefined;
     let openAIToolChoice: OpenAICompatToolChoiceWire | undefined;
-    let conversation: OpenAICompatChatMessage[];
+    // The prompt is kept in its pre-wire shape. Model middleware transforms
+    // `params.prompt`, and the conversion to the chat-completions wire format
+    // has to happen AFTER that or the transform would be discarded.
+    let promptMessages: OpenAICompatMessage[];
     try {
       modelId = await this.resolveModelName();
       const shouldUseTools = !options.disableTools && this.supportsTools();
@@ -843,11 +1387,9 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
         wireNameMaps?.toWire,
       );
 
-      const initialMessages = await this.buildMessagesForStream(options);
-      conversation = messageBuilderToOpenAI(
-        initialMessages as OpenAICompatMessage[],
-        wireNameMaps?.toWire,
-      );
+      promptMessages = (await this.buildMessagesForStream(
+        options,
+      )) as OpenAICompatMessage[];
     } catch (setupErr) {
       timeoutController?.cleanup();
       throw setupErr;
@@ -864,30 +1406,157 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
 
     const { usagePromise, finishPromise, resolveUsage, resolveFinish } =
       createDeferredAnalytics();
-    const { pushChunk, nextChunk } = createChunkQueue();
+    const channel = createStreamChannel<OpenAICompatStreamChunk>();
 
     // Per-provider lifecycle hook (e.g. OTel span wrap for LiteLLM).
     const lifecycle = this.onStreamStart(modelId);
 
-    const loopPromise = this.runStreamLoop({
-      maxSteps,
+    // Model middleware on the streaming path.
+    //
+    // The base model below is not `buildDelegatingModel()`'s — that one's
+    // `doGenerate` is a single wire call and its `doStream` is a stub. This
+    // one's `doStream` starts the real multi-step stream loop, which is what
+    // "produce the stream for this request" means here. Wrapping it gives the
+    // streaming path the contract the generate path has always had:
+    // `transformParams` can rewrite the prompt before a byte is sent, and
+    // `wrapStream` can observe, filter, or replace the stream outright.
+    //
+    // Honoured on the way back in: `prompt`, `maxOutputTokens`, `temperature`
+    // and `topP`. `tools` is offered read-only — a middleware that rewrites it
+    // gets a WARN rather than a silent drop, because re-deriving the wire tool
+    // list here would diverge from `buildToolsForOpenAI`.
+    const v3Tools = openAITools?.map((t) => ({
+      type: "function" as const,
+      name: t.function.name,
+      description: t.function.description,
+      inputSchema: t.function.parameters,
+    }));
+    const v3Params: LanguageModelV3CallOptions = {
+      prompt: promptMessages as LanguageModelV3CallOptions["prompt"],
+      ...(v3Tools ? { tools: v3Tools } : {}),
+      ...(options.maxTokens !== undefined
+        ? { maxOutputTokens: options.maxTokens }
+        : {}),
+      ...(options.temperature !== undefined
+        ? { temperature: options.temperature }
+        : {}),
+      ...(options.topP !== undefined ? { topP: options.topP } : {}),
+    };
+
+    let loopPromise: Promise<unknown> | undefined;
+    const providerNameForLoop = this.providerName;
+    const streamBaseModel: LanguageModelV3 = {
+      specificationVersion: "v3" as const,
+      provider: providerNameForLoop,
       modelId,
-      url,
-      fetchImpl,
-      abortSignal,
-      options,
-      conversation,
-      openAITools,
-      openAIToolChoice,
-      toolsRecord,
-      toolNameFromWire: wireNameMaps?.fromWire,
-      emitter,
-      toolsUsed,
-      toolExecutionSummaries,
-      pushChunk,
-      resolveUsage,
-      resolveFinish,
-    });
+      supportedUrls: {},
+      doGenerate: async (params) => {
+        const model = await this.getAISDKModel();
+        if (typeof model === "string") {
+          throw new Error("Native model handle required");
+        }
+        return model.doGenerate(params);
+      },
+      doStream: async (params) => {
+        if (params?.tools !== undefined && params.tools !== v3Tools) {
+          logger.warn(
+            `${providerNameForLoop}: middleware rewrote 'tools' on the streaming path; tool rewrites are not applied to the wire request yet — the original tool list was sent.`,
+          );
+        }
+        const transformedPrompt = Array.isArray(params?.prompt)
+          ? (params.prompt as OpenAICompatMessage[])
+          : promptMessages;
+        const conversation = messageBuilderToOpenAI(
+          transformedPrompt,
+          wireNameMaps?.toWire,
+        );
+        const sampled: StreamOptions = {
+          ...options,
+          ...(typeof params?.maxOutputTokens === "number"
+            ? { maxTokens: params.maxOutputTokens }
+            : {}),
+          ...(typeof params?.temperature === "number"
+            ? { temperature: params.temperature }
+            : {}),
+          ...(typeof params?.topP === "number" ? { topP: params.topP } : {}),
+        };
+        loopPromise = this.runStreamLoop({
+          maxSteps,
+          modelId,
+          url,
+          fetchImpl,
+          abortSignal,
+          options: sampled,
+          conversation,
+          openAITools,
+          openAIToolChoice,
+          toolsRecord,
+          toolNameFromWire: wireNameMaps?.fromWire,
+          emitter,
+          toolsUsed,
+          toolExecutionSummaries,
+          pushChunk: channel.push,
+          closeChannel: channel.close,
+          resolveUsage,
+          resolveFinish,
+        });
+        const completion: Promise<LanguageModelV3StreamPart> = loopPromise.then(
+          () =>
+            Promise.all([usagePromise, finishPromise]).then(
+              ([usage, reason]) => ({
+                type: "finish" as const,
+                finishReason: { unified: reason },
+                usage: {
+                  inputTokens: {
+                    total: usage.promptTokens,
+                    cacheRead: usage.cacheReadTokens,
+                  },
+                  outputTokens: { total: usage.completionTokens },
+                },
+              }),
+            ),
+        );
+        // The producer can reject before the consumer pulls its terminal event.
+        void completion.catch(() => undefined);
+        return {
+          stream: chunksToV3Stream(channel.iterable, completion, () =>
+            consumerAbortController.abort(),
+          ),
+        };
+      },
+    };
+
+    // A middleware chain that blocks (guardrails' precall path) returns its own
+    // stream without calling `doStream`, so the loop may never start. Every
+    // later reader of `loopPromise` has to tolerate that.
+    let chunkSource: AsyncIterable<OpenAICompatStreamChunk>;
+    try {
+      const wrappedStreamModel = await this.applyMiddlewareToModel(
+        streamBaseModel,
+        options,
+      );
+      if (typeof wrappedStreamModel === "string") {
+        throw new Error("Native stream model handle required");
+      }
+      const { stream } = await wrappedStreamModel.doStream(v3Params);
+      chunkSource = v3StreamToChunks(stream, (part) => {
+        if (!loopPromise) {
+          const input = part.usage.inputTokens.total ?? 0;
+          const output = part.usage.outputTokens.total ?? 0;
+          resolveUsage({
+            promptTokens: input,
+            completionTokens: output,
+            totalTokens: input + output,
+          });
+          resolveFinish(part.finishReason.unified);
+        }
+      });
+    } catch (error) {
+      consumerAbortController.abort();
+      channel.close();
+      timeoutController?.cleanup();
+      throw error;
+    }
 
     // Closure-scoped capture: the runStreamLoop's catch block stashes the
     // underlying provider error here so we can pass it through to
@@ -917,11 +1586,7 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
     const transformedStream = async function* () {
       let contentYielded = 0;
       try {
-        for (;;) {
-          const chunk = await nextChunk();
-          if ("done" in chunk) {
-            break;
-          }
+        for await (const chunk of chunkSource) {
           if (
             "content" in chunk &&
             typeof chunk.content === "string" &&
@@ -931,7 +1596,9 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
           }
           yield chunk;
         }
-        // Surface any error that the loop threw after we drained the queue.
+        // Surface any error that the loop threw after we drained the channel.
+        // `loopPromise` is undefined when a middleware blocked the request
+        // before `doStream` ran, in which case there is no loop to surface.
         await loopPromise;
         // No-output path: stream completed normally but yielded zero text.
         // Build an enriched sentinel + stamp the active OTel span so
@@ -972,6 +1639,15 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
         yield sentinel as { content: string };
         throw streamError;
       } finally {
+        if (!loopPromise) {
+          resolveUsage({
+            promptTokens: 0,
+            completionTokens: 0,
+            totalTokens: 0,
+          });
+          resolveFinish("stop");
+        }
+        timeoutController?.cleanup();
         if (!consumerAbortController.signal.aborted) {
           consumerAbortController.abort();
         }
@@ -1023,7 +1699,7 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
     });
 
     loopPromise
-      .finally(() => timeoutController?.cleanup())
+      ?.finally(() => timeoutController?.cleanup())
       .catch((error) => {
         captureProviderError(error);
       });
@@ -1051,6 +1727,7 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
       toolsUsed,
       toolExecutionSummaries,
       pushChunk,
+      closeChannel,
       resolveUsage,
       resolveFinish,
     } = args;
@@ -1213,7 +1890,7 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
 
       resolveUsage(toDeferredUsage());
       resolveFinish(stepFinish ?? "stop");
-      pushChunk({ done: true });
+      closeChannel();
       return {
         finishReason: stepFinish ?? "stop",
         usage: stepUsage,
@@ -1226,7 +1903,7 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
       // instead of zeroing the whole turn.
       resolveUsage(toDeferredUsage());
       resolveFinish("error");
-      pushChunk({ done: true });
+      closeChannel();
       throw err;
     }
   }
@@ -1270,31 +1947,64 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
         args.modelId,
       ),
     );
-    let res = await args.fetchImpl(args.url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...this.getAuthHeaders(),
-      },
-      body: JSON.stringify(body),
-      ...(args.abortSignal ? { signal: args.abortSignal } : {}),
-    });
-    if (!res.ok) {
-      const apiErr = await buildAPIError(args.url, body, res);
-      // One-shot 400 retry — overflow corrector first (re-fits max_tokens
-      // from the provider's own numbers + self-heals the window registry),
-      // then the subclass hook (e.g. NIM strips chat_template /
-      // reasoning_budget when a model rejects them).
+    // The initial fetch gets 429/5xx retry-with-backoff via the same
+    // primitive the non-streaming path already uses (withProviderRetry).
+    // `doFetch` throws the classified APIError (buildAPIError attaches
+    // .statusCode + .responseHeaders, which withProviderRetry's duck-typing
+    // reads directly) so a non-ok response is what drives the retry
+    // decision, not a return value.
+    const doFetch = async (): Promise<Response> => {
+      const attemptRes = await args.fetchImpl(args.url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...this.getAuthHeaders(),
+        },
+        body: JSON.stringify(body),
+        ...(args.abortSignal ? { signal: args.abortSignal } : {}),
+      });
+      if (!attemptRes.ok) {
+        throw await buildAPIError(args.url, body, attemptRes);
+      }
+      return attemptRes;
+    };
+
+    let res: Response;
+    try {
+      res = await withProviderRetry(
+        doFetch,
+        trace.getActiveSpan() ?? undefined,
+        `${this.providerName} stream`,
+      );
+    } catch (err) {
+      // The one-shot 400 context-overflow fallback lives outside
+      // withProviderRetry (400 isn't retryable there anyway — see
+      // isRetryableProviderError), so it fires on the classified error's
+      // .statusCode. The raw Response is no longer in scope here: it was
+      // consumed inside doFetch's closure, either returned on success or
+      // discarded after buildAPIError read its body on failure.
+      const apiErr = err as Error & {
+        statusCode?: number;
+        responseBody?: string;
+      };
+      // Overflow corrector first (re-fits max_tokens from the provider's own
+      // numbers + self-heals the window registry); its output then feeds the
+      // subclass hook (e.g. NIM strips chat_template / reasoning_budget when
+      // a model rejects them), so a body needing BOTH fixes gets both — a
+      // plain `??` between the two would let whichever ran first silently
+      // win and drop the other's fix.
       const retryBody =
-        res.status === 400
-          ? (this.correctBodyAfterContextOverflow(
-              body,
-              apiErr as Error & { statusCode?: number; responseBody?: string },
-            ) ??
-            this.adjustBodyAfter400(
-              body,
-              apiErr as Error & { statusCode?: number; responseBody?: string },
-            ))
+        apiErr.statusCode === 400
+          ? (() => {
+              const overflowCorrected = this.correctBodyAfterContextOverflow(
+                body,
+                apiErr,
+              );
+              return (
+                this.adjustBodyAfter400(overflowCorrected ?? body, apiErr) ??
+                overflowCorrected
+              );
+            })()
           : undefined;
       if (!retryBody) {
         throw apiErr;

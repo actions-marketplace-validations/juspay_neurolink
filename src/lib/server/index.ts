@@ -40,8 +40,10 @@ export { KoaServerAdapter } from "./adapters/koaAdapter.js";
 export {
   AlreadyRunningError,
   // Authentication/Authorization errors
-  AuthenticationError,
-  AuthorizationError,
+  // (aliased: the bare names resolve to the provider-error classes of the
+  // same name from types/ on the public @juspay/neurolink surface)
+  AuthenticationError as ServerAuthenticationError,
+  AuthorizationError as ServerAuthorizationError,
   // Configuration errors
   ConfigurationError,
   // Error recovery
@@ -65,7 +67,7 @@ export {
   // Streaming errors
   StreamingError,
   // Timeout errors
-  TimeoutError,
+  ServerTimeoutError,
   // Validation errors
   ValidationError as ServerValidationError,
   WebSocketConnectionError,
@@ -115,7 +117,6 @@ export {
   createRateLimitMiddleware,
   createSlidingWindowRateLimitMiddleware,
   InMemoryRateLimitStore,
-  RateLimitError,
 } from "./middleware/rateLimit.js";
 export {
   CommonSchemas,
@@ -189,6 +190,15 @@ export {
   createOpenApiRoutes,
   createToolRoutes,
   registerAllRoutes,
+  // The proxy doors. All were reachable only from the deep path
+  // ./routes/index.js, which is not a package export — so a consumer of
+  // "@juspay/neurolink/server" could reach them only indirectly through
+  // createAllRoutes' flags, never to mount one on its own. Codex stayed
+  // CLI-only for long enough on exactly that gap to be worth naming.
+  createClaudeProxyRoutes,
+  createOpenAIProxyRoutes,
+  createCodexProxyRoutes,
+  createGeminiProxyRoutes,
 } from "./routes/index.js";
 // ============================================
 // Streaming

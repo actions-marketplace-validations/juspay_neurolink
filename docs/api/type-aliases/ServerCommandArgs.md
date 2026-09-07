@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ServerCommandArgs** = `object`
 
-Defined in: [types/cli.ts:1096](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1096)
+Defined in: [types/cli.ts:1266](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1266)
 
 Server command arguments
 
@@ -18,7 +18,7 @@ Server command arguments
 
 > `optional` **port?**: `number`
 
-Defined in: [types/cli.ts:1097](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1097)
+Defined in: [types/cli.ts:1267](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1267)
 
 ---
 
@@ -26,7 +26,7 @@ Defined in: [types/cli.ts:1097](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > `optional` **host?**: `string`
 
-Defined in: [types/cli.ts:1098](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1098)
+Defined in: [types/cli.ts:1268](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1268)
 
 ---
 
@@ -34,7 +34,7 @@ Defined in: [types/cli.ts:1098](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > `optional` **framework?**: `"hono"` \| `"express"` \| `"fastify"` \| `"koa"`
 
-Defined in: [types/cli.ts:1099](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1099)
+Defined in: [types/cli.ts:1269](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1269)
 
 ---
 
@@ -42,7 +42,7 @@ Defined in: [types/cli.ts:1099](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > `optional` **basePath?**: `string`
 
-Defined in: [types/cli.ts:1100](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1100)
+Defined in: [types/cli.ts:1270](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1270)
 
 ---
 
@@ -50,7 +50,7 @@ Defined in: [types/cli.ts:1100](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > `optional` **cors?**: `boolean`
 
-Defined in: [types/cli.ts:1101](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1101)
+Defined in: [types/cli.ts:1271](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1271)
 
 ---
 
@@ -58,7 +58,7 @@ Defined in: [types/cli.ts:1101](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > `optional` **rateLimit?**: `boolean`
 
-Defined in: [types/cli.ts:1102](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1102)
+Defined in: [types/cli.ts:1272](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1272)
 
 ---
 
@@ -66,7 +66,7 @@ Defined in: [types/cli.ts:1102](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > `optional` **quiet?**: `boolean`
 
-Defined in: [types/cli.ts:1103](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1103)
+Defined in: [types/cli.ts:1273](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1273)
 
 ---
 
@@ -74,7 +74,7 @@ Defined in: [types/cli.ts:1103](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > `optional` **format?**: `"text"` \| `"json"` \| `"yaml"`
 
-Defined in: [types/cli.ts:1104](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1104)
+Defined in: [types/cli.ts:1274](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1274)
 
 ---
 
@@ -82,7 +82,7 @@ Defined in: [types/cli.ts:1104](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > `optional` **output?**: `string`
 
-Defined in: [types/cli.ts:1105](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1105)
+Defined in: [types/cli.ts:1275](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1275)
 
 ---
 
@@ -90,4 +90,4 @@ Defined in: [types/cli.ts:1105](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > `optional` **debug?**: `boolean`
 
-Defined in: [types/cli.ts:1106](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1106)
+Defined in: [types/cli.ts:1276](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1276)

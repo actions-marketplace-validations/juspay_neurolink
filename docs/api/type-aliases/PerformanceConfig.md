@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **PerformanceConfig** = `object`
 
-Defined in: [types/config.ts:224](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L224)
+Defined in: [types/config.ts:321](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L321)
 
 Performance and caching configuration
 
@@ -18,7 +18,7 @@ Performance and caching configuration
 
 > `optional` **cache?**: [`CacheConfig`](CacheConfig.md)
 
-Defined in: [types/config.ts:225](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L225)
+Defined in: [types/config.ts:322](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L322)
 
 ---
 
@@ -26,7 +26,7 @@ Defined in: [types/config.ts:225](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **fallback?**: [`FallbackConfig`](FallbackConfig.md)
 
-Defined in: [types/config.ts:226](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L226)
+Defined in: [types/config.ts:323](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L323)
 
 ---
 
@@ -34,7 +34,7 @@ Defined in: [types/config.ts:226](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **timeoutMs?**: `number`
 
-Defined in: [types/config.ts:227](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L227)
+Defined in: [types/config.ts:324](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L324)
 
 ---
 
@@ -42,7 +42,7 @@ Defined in: [types/config.ts:227](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **maxConcurrency?**: `number`
 
-Defined in: [types/config.ts:228](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L228)
+Defined in: [types/config.ts:325](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L325)
 
 ---
 
@@ -50,4 +50,4 @@ Defined in: [types/config.ts:228](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **retryConfig?**: [`RetryConfig`](RetryConfig.md)
 
-Defined in: [types/config.ts:229](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L229)
+Defined in: [types/config.ts:326](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L326)

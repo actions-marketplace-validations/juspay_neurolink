@@ -60,6 +60,8 @@ import type {
   CompactionConfig,
   CompactionResult,
   ArtifactStore,
+  ArtifactStorageConfig,
+  McpOutputNormalizerConfig,
   SpanData,
   ConfirmationResponseEvent,
   HITLConfig,
@@ -94,6 +96,7 @@ import type {
   AnalyticsData,
   EvaluationData,
   NeurolinkCredentials,
+  OptionalValidationSchema,
   ProviderStatus,
   TextGenerationOptions,
   TextGenerationResult,
@@ -102,7 +105,7 @@ import type {
   MCPServerCategory,
   MCPServerInfo,
   MCPStatus,
-  AudioChunk,
+  ProviderStreamChunk,
   StreamOptions,
   StreamResult,
   StreamToolCall,
@@ -128,6 +131,23 @@ import type {
   KnowledgeEngineStatus,
   KnowledgeGroundingOutcome,
   KnowledgeGroundingCallOptions,
+  ChecklistState,
+  ArtifactPageRequest,
+  BankArtifactOptions,
+  BankedArtifactRef,
+  DelegateCollectRequest,
+  DelegateCollectResult,
+  DelegateHandle,
+  DelegateRegistrationOptions,
+  DelegateSpawnOptions,
+  BackgroundCommandHandle,
+  BackgroundCommandOptions,
+  BackgroundCommandOutputPage,
+  BackgroundCommandPageRequest,
+  BackgroundCommandPolicy,
+  BackgroundCommandStatus,
+  GitToolResult,
+  GitToolsetOptions,
 } from "./types/index.js";
 import { emergencyContentTruncation } from "./context/emergencyTruncation.js";
 import {
@@ -155,7 +175,9 @@ import {
 } from "./knowledge/index.js";
 import { AIProviderFactory } from "./core/factory.js";
 import type { RedisConversationMemoryManager } from "./core/redisConversationMemoryManager.js";
+import { resolveRequestKind } from "./core/resolveRequestKind.js";
 import { createToolEventPayload } from "./core/toolEvents.js";
+import { ProviderFactory } from "./factories/providerFactory.js";
 import { ProviderRegistry } from "./factories/providerRegistry.js";
 import { FileReferenceRegistry } from "./files/fileReferenceRegistry.js";
 import { createFileTools } from "./files/fileTools.js";
@@ -170,7 +192,14 @@ import {
   DEFAULT_MAX_MCP_OUTPUT_BYTES,
   DEFAULT_WARN_MCP_OUTPUT_BYTES,
 } from "./mcp/mcpOutputNormalizer.js";
-import { LocalTempArtifactStore } from "./artifacts/artifactStore.js";
+import {
+  createArtifactStore,
+  resolveArtifactStorageType,
+} from "./artifacts/artifactStoreFactory.js";
+import {
+  bankArtifact as bankArtifactPayload,
+  readArtifact as readBankedArtifact,
+} from "./artifacts/artifactBanking.js";
 import { ToolRouter } from "./mcp/routing/index.js";
 // Import direct tools server for automatic registration
 import { directToolsServer } from "./mcp/servers/agent/directToolsServer.js";
@@ -229,6 +258,34 @@ import {
   shutdownOpenTelemetry,
   stampGuestRescueIdentity,
 } from "./services/server/ai/observability/instrumentation.js";
+import {
+  clearChecklistState,
+  createChecklistTools,
+  getChecklistState,
+  resolveChecklistSessionId,
+} from "./agent/taskChecklist.js";
+import {
+  cancelDelegates as cancelBackgroundDelegates,
+  collectDelegates as collectBackgroundDelegates,
+  configureDelegation,
+  createDelegationTools,
+  spawnDelegate as spawnBackgroundDelegate,
+} from "./agent/backgroundDelegation.js";
+import {
+  awaitBackgroundCommand as awaitCommand,
+  createBackgroundCommandTools,
+  getBackgroundCommandStatus as getCommandStatus,
+  killAllBackgroundCommands as killAllCommands,
+  killBackgroundCommand as killCommand,
+  readBackgroundCommandOutput as readCommandOutput,
+  setBackgroundCommandPolicy as setCommandPolicy,
+  startBackgroundCommand as startCommand,
+} from "./agent/backgroundCommands.js";
+import {
+  configureGitTools,
+  createGitTools,
+  runGitCommand as runGitArgs,
+} from "./agent/gitTools.js";
 import { TaskManager } from "./tasks/taskManager.js";
 import { createTaskTools } from "./tasks/tools/taskTools.js";
 import { ATTR, spanJsonAttribute } from "./telemetry/attributes.js";
@@ -236,8 +293,8 @@ import { tracers } from "./telemetry/tracers.js";
 // Voice integration imports
 import type {
   STTResult,
+  TTSMetadata,
   TTSResult,
-  TTSChunk,
   TTSOptions,
   SessionExport,
   SessionListItem,
@@ -262,9 +319,14 @@ import {
   hasLifecycleErrorFired,
   markLifecycleErrorFired,
 } from "./utils/lifecycleCallbacks.js";
+import { interleaveTTSStream } from "./utils/ttsStream.js";
 import { resolveLifecycleTimeoutMs } from "./utils/lifecycleTimeout.js";
 import { cloneOptionsForCallIsolation } from "./utils/cloneOptions.js";
-import { coerceJsonToSchema } from "./utils/json/coerce.js";
+import {
+  coerceJsonToSchema,
+  recoverScalarRoot,
+  schemaAccepts,
+} from "./utils/json/coerce.js";
 // Factory processing imports
 import {
   createCleanStreamOptions,
@@ -285,6 +347,11 @@ import {
   createCustomToolServerInfo,
   detectCategory,
 } from "./utils/mcpDefaults.js";
+import {
+  ExternalMcpToolNotFoundError,
+  rankToolNameCandidates,
+  resolveToolName,
+} from "./utils/toolCallRepair.js";
 import { resolveModel } from "./utils/modelAliasResolver.js";
 // Import orchestration components
 import { ModelRouter } from "./utils/modelRouter.js";
@@ -317,6 +384,7 @@ import { ModelPool, classifyProviderError } from "./routing/index.js";
 import { ClassifierRouter } from "./routing/classifierRouter.js";
 import {
   looksLikeModelAccessDenied as sharedLooksLikeModelAccessDenied,
+  looksLikeModelNotFound as sharedLooksLikeModelNotFound,
   isNonRetryableProviderError as sharedIsNonRetryableProviderError,
   isNonRetryableForPool as sharedIsNonRetryableForPool,
 } from "./utils/providerErrorClassification.js";
@@ -551,30 +619,24 @@ export const NEUROLINK_BRAND: unique symbol = Symbol.for(
 );
 
 /**
- * Providers whose native tool-calling support is model-dependent or absent —
- * i.e. every provider that overrides `supportsTools()` and can return false
- * (verified against src/lib/providers: ollama and openrouter are
- * model-dependent; huggingface is deployment-dependent; the rest are
- * image/embedding providers). Only these still receive the full tool listing
- * in the system prompt on the generate path, where no provider instance
- * exists yet to ask directly; every other provider gets tool definitions
- * natively via its `tools` parameter, so repeating them in the prompt was
- * pure token duplication. The stream path asks the provider instance
- * (`provider.supportsTools()`) instead of this list. BaseProvider resolves its
- * default through MODEL_REGISTRY's `modelSupports()` facade; keep this list in
- * sync with provider-specific `supportsTools()` overrides when adding providers.
+ * True when a provider needs tools described in the prompt rather than
+ * passed via the API's native tool-calling parameter (ollama/openrouter
+ * are model-dependent; huggingface is deployment-dependent; the
+ * image/embedding providers don't support tool calling at all). Only these
+ * still receive the full tool listing in the system prompt on the generate
+ * path, where no provider instance exists yet to ask directly; every other
+ * provider gets tool definitions natively via its `tools` parameter, so
+ * repeating them in the prompt was pure token duplication. The stream path
+ * asks the provider instance (`provider.supportsTools()`) instead of this
+ * check. Derived from ProviderDescriptor.toolSupport instead of a
+ * hand-maintained Set — see PROVIDER_DESCRIPTORS in
+ * src/lib/factories/providerDescriptors.ts for the underlying data;
+ * BaseProvider resolves its own runtime default through MODEL_REGISTRY's
+ * `modelSupports()` facade.
  */
-const PROMPT_ONLY_TOOL_PROVIDERS = new Set<string>([
-  "ollama",
-  "huggingface",
-  "openrouter",
-  "ideogram",
-  "recraft",
-  "replicate",
-  "stability",
-  "jina",
-  "voyage",
-]);
+function isPromptOnlyToolProvider(providerName: string): boolean {
+  return ProviderFactory.getDescriptor(providerName)?.toolSupport !== "native";
+}
 
 /**
  * Type-guard for opaque values that should be a {@link NeuroLink} instance.
@@ -651,9 +713,37 @@ export class NeuroLink {
   private mcpToolBatcher?: ToolCallBatcher;
   private mcpEnhancedDiscovery?: EnhancedToolDiscovery;
   private mcpToolMiddlewares: ToolMiddleware[] = [];
-  /** Artifact store for externalized MCP tool outputs (set when strategy=externalize). */
+  /** Artifact store for externalized MCP tool outputs and banked payloads. */
   private mcpArtifactStore?: ArtifactStore;
+  /** `artifacts` constructor config — consulted whenever a store is created. */
+  private artifactsConfig?: ArtifactStorageConfig;
+  /**
+   * True when this instance built `mcpArtifactStore` itself (local or Redis
+   * from config / STORAGE_TYPE). NeuroLink closes only stores it built — on
+   * replacement and on shutdown; a store handed in through `artifacts.store`
+   * or `setArtifactStore()` is the caller's to close.
+   */
+  private ownsArtifactStore = false;
+  /** Normalizer settings, kept so `setArtifactStore()` can rebuild it. */
+  private mcpOutputNormalizerConfig?: McpOutputNormalizerConfig;
   private _disableToolCacheForCurrentRequest = false;
+  /**
+   * (toolName + args) keys already served during the CURRENT request.
+   * A repeat occurrence within one request bypasses the tool-result cache:
+   * when the model deliberately re-calls a tool with identical args in the
+   * same turn (a counter, a poll, "check status again"), it wants fresh
+   * state — serving the memoized first result silently freezes stateful
+   * tools (observed live: a 5-round counter loop executed once). Cross-
+   * request dedup — BZ-664's actual goal — is untouched: the first
+   * occurrence in a request may still be served from cache. Request-scoped
+   * like _disableToolCacheForCurrentRequest above (assigned a fresh Set at
+   * request start so the router's save/restore-by-reference pattern works).
+   */
+  private _toolCacheKeysServedThisRequest = new Set<string>();
+  /** True only while a generate()/stream() turn is executing — the
+   *  repeat-call cache bypass applies inside a turn; direct executeTool
+   *  calls keep full BZ-664 cache semantics. */
+  private _generationTurnActive = false;
   private mcpEnhancementsConfig?: MCPEnhancementsConfig;
 
   // Enhanced error handling support
@@ -1187,6 +1277,34 @@ export class NeuroLink {
   private hasAgentTools = false;
 
   /**
+   * Tools registered with `cacheable: false` — their results are never served
+   * from the tool-result cache. A tool whose answer depends on live state (a
+   * checklist, a work queue) would otherwise replay its first answer for the
+   * whole TTL to every caller passing the same arguments.
+   */
+  private readonly uncacheableTools = new Set<string>();
+
+  /** Set once registerTaskTools() has registered the checklist toolset. */
+  private hasTaskChecklistTools = false;
+
+  /** Set once registerDelegationTools() has registered the delegation toolset. */
+  private hasBackgroundDelegationTools = false;
+
+  /** Set once registerBackgroundCommandTools() has registered the command toolset. */
+  private hasBackgroundCommandTools = false;
+
+  /** Set once registerGitTools() has registered the read-only git toolset. */
+  private hasGitTools = false;
+
+  /**
+   * Set once `retrieve_context` has been registered. The constructor skips
+   * registration when neither Redis nor an artifact store exists; banking can
+   * create a store later, and this keeps that second attempt from
+   * re-registering the tool on instances that already have it.
+   */
+  private retrieveContextRegistered = false;
+
+  /**
    * Creates a new NeuroLink instance for AI text generation with MCP tool integration.
    *
    * @param config - Optional configuration object
@@ -1400,7 +1518,7 @@ export class NeuroLink {
     if (this._taskManagerConfig) {
       this._taskManager = new TaskManager(this, this._taskManagerConfig);
       this._taskManager.setEmitter(this.emitter);
-      this.registerTaskTools(this._taskManager);
+      this.registerSchedulerTaskTools(this._taskManager);
     }
   }
 
@@ -1414,7 +1532,7 @@ export class NeuroLink {
     if (!this._taskManager) {
       this._taskManager = new TaskManager(this, this._taskManagerConfig);
       this._taskManager.setEmitter(this.emitter);
-      this.registerTaskTools(this._taskManager);
+      this.registerSchedulerTaskTools(this._taskManager);
     }
     return this._taskManager;
   }
@@ -1687,6 +1805,11 @@ export class NeuroLink {
 
     // ToolRouter — lazy-initialized when 2+ external servers exist (see addExternalMCPServer)
 
+    // Artifact storage — where externalized MCP outputs and banked payloads
+    // live. Kept so both creation sites (externalize here, and
+    // getArtifactStore() on demand) resolve the same backend.
+    this.artifactsConfig = config?.artifacts;
+
     // McpOutputNormalizer — active when mcp.outputLimits is configured
     if (mcpConfig?.outputLimits) {
       const strategy = mcpConfig.outputLimits.strategy ?? "externalize";
@@ -1694,24 +1817,15 @@ export class NeuroLink {
         mcpConfig.outputLimits.maxBytes ?? DEFAULT_MAX_MCP_OUTPUT_BYTES;
       const warnBytes =
         mcpConfig.outputLimits.warnBytes ?? DEFAULT_WARN_MCP_OUTPUT_BYTES;
+      this.mcpOutputNormalizerConfig = { strategy, maxBytes, warnBytes };
 
       let artifactStore: ArtifactStore | undefined;
       if (strategy === "externalize") {
-        artifactStore = new LocalTempArtifactStore();
+        artifactStore = this.createConfiguredArtifactStore();
         this.mcpArtifactStore = artifactStore;
-        logger.debug("[NeuroLink] MCP artifact store initialized (local-temp)");
       }
 
-      const normalizer = new McpOutputNormalizer(
-        { strategy, maxBytes, warnBytes },
-        artifactStore,
-      );
-      this.externalServerManager.setOutputNormalizer(normalizer);
-      logger.debug("[NeuroLink] MCP output normalizer initialized", {
-        strategy,
-        maxBytes,
-        warnBytes,
-      });
+      this.installOutputNormalizer(artifactStore);
     }
   }
 
@@ -1784,20 +1898,40 @@ export class NeuroLink {
     );
 
     // Fire-and-forget: registrations complete before any generate/stream call
-    // because those calls await initializeMCP() which is slower
-    void Promise.all(registrations).then(() => {
-      logger.debug(
-        `[NeuroLink] Registered ${Object.keys(fileTools).length} file reference tools`,
-      );
-    });
+    // because those calls await initializeMCP() which is slower.
+    //
+    // The rejection handler is not decoration. registerTool() throws on a
+    // failed name/description validation (mcp/toolRegistry.ts), and that throw
+    // is not inside a try — so a rejected registration on a `void`-detached
+    // one-argument `.then()` would be an unhandled rejection, which terminates
+    // the process. Today the tool names come from createFileTools(), which are
+    // internal constants that pass validation, so this is latent rather than
+    // live; it stops being latent the moment a name is derived from anything
+    // outside this file. Losing one tool registration is the intended failure
+    // mode here — losing the host process is not.
+    void Promise.all(registrations).then(
+      () => {
+        logger.debug(
+          `[NeuroLink] Registered ${Object.keys(fileTools).length} file reference tools`,
+        );
+      },
+      (error: unknown) => {
+        logger.warn("[NeuroLink] File tool registration failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    );
   }
 
   /**
-   * Register task management tools bound to a TaskManager instance.
+   * Register SCHEDULER task tools bound to a TaskManager instance (task_create,
+   * task_list, … — scheduled/self-running jobs). Distinct from the agent task
+   * CHECKLIST (registerTaskTools() / tasks_create): different tools, different
+   * state, different purpose.
    * Follows the same factory + registry pattern as registerFileTools().
    * Called when TaskManager is created (eagerly or lazily via the `tasks` getter).
    */
-  private registerTaskTools(manager: TaskManager): void {
+  private registerSchedulerTaskTools(manager: TaskManager): void {
     const taskTools = createTaskTools(manager);
 
     for (const [toolName, toolDef] of Object.entries(taskTools)) {
@@ -1813,34 +1947,48 @@ export class NeuroLink {
       // registerTool is async but its core logic is synchronous (Map.set).
       // We fire-and-forget here but tools are available immediately after
       // the synchronous validation + map insertion completes.
-      void this.toolRegistry.registerTool(toolId, toolInfo, {
-        execute: async (params: unknown) => {
-          try {
-            const result = await (
-              toolDef.execute as (
-                params: unknown,
-                ctx: unknown,
-              ) => Promise<unknown>
-            )(params, {
-              toolCallId: "task-tool",
-              messages: [],
-            });
-            return {
-              success: true,
-              data: result,
-              metadata: { toolName, serverId: "direct", executionTime: 0 },
-            };
-          } catch (error) {
-            return {
-              success: false,
-              error: error instanceof Error ? error.message : String(error),
-              metadata: { toolName, serverId: "direct", executionTime: 0 },
-            };
-          }
-        },
-        description: toolDef.description,
-        inputSchema: {},
-      });
+      //
+      // The .catch() at the end of this call is required for the same reason
+      // as in registerFileTools() above: registerTool() throws on failed
+      // validation, and an unhandled rejection off a `void`-detached call
+      // terminates the process rather than failing this one registration.
+      // Latent today (createTaskTools() supplies internal, valid names), and
+      // cheap to keep correct.
+      void this.toolRegistry
+        .registerTool(toolId, toolInfo, {
+          execute: async (params: unknown) => {
+            try {
+              const result = await (
+                toolDef.execute as (
+                  params: unknown,
+                  ctx: unknown,
+                ) => Promise<unknown>
+              )(params, {
+                toolCallId: "task-tool",
+                messages: [],
+              });
+              return {
+                success: true,
+                data: result,
+                metadata: { toolName, serverId: "direct", executionTime: 0 },
+              };
+            } catch (error) {
+              return {
+                success: false,
+                error: error instanceof Error ? error.message : String(error),
+                metadata: { toolName, serverId: "direct", executionTime: 0 },
+              };
+            }
+          },
+          description: toolDef.description,
+          inputSchema: {},
+        })
+        .catch((error: unknown) => {
+          logger.warn("[NeuroLink] Task tool registration failed", {
+            toolId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
     }
 
     logger.debug(
@@ -1854,6 +2002,9 @@ export class NeuroLink {
    * Only registered when Redis conversation memory is active.
    */
   private registerMemoryRetrievalTools(): void {
+    if (this.retrieveContextRegistered) {
+      return;
+    }
     // Check if conversation memory is configured
     // Memory retrieval tool requires Redis (getSessionRaw) but registration
     // is deferred — the execute handler checks at runtime whether the actual
@@ -1901,13 +2052,12 @@ export class NeuroLink {
       inputSchema: retrieveContextDef.inputSchema,
       execute: async (params: unknown) => {
         // Lazy: conversationMemory is initialized on the first generate() call.
-        // When only an artifact store is present (no Redis), memoryManager is
-        // undefined — createMemoryRetrievalTools handles that via an explicit guard.
-        const memoryManager = this.conversationMemory as
-          | import("./core/redisConversationMemoryManager.js").RedisConversationMemoryManager
-          | undefined;
+        // It may be undefined (artifact-store-only), the Redis manager, or the
+        // in-memory manager (no Redis config, or Redis init fell back) —
+        // createMemoryRetrievalTools guards session retrieval on getSessionRaw
+        // capability and returns a descriptive error otherwise.
         const tools = createMemoryRetrievalTools(
-          memoryManager,
+          this.conversationMemory ?? undefined,
           this.mcpArtifactStore,
         );
         // Return the result directly so the LLM receives clean output instead
@@ -1930,6 +2080,7 @@ export class NeuroLink {
       },
     });
 
+    this.retrieveContextRegistered = true;
     logger.info("[NeuroLink] Memory retrieval tools registered");
   }
 
@@ -3671,6 +3822,17 @@ Current user's request: ${currentInput}`;
     try {
       logger.debug("[NeuroLink] Starting graceful shutdown");
 
+      // Kill host-owned background work first: a shutdown must not leave
+      // child processes or delegate workers running with nobody to collect
+      // them.
+      try {
+        await killAllCommands(this);
+        await cancelBackgroundDelegates(this);
+        logger.debug("[NeuroLink] Background commands and delegates stopped");
+      } catch (error) {
+        logger.warn("[NeuroLink] Background work cleanup failed:", error);
+      }
+
       try {
         await flushOpenTelemetry();
         await shutdownOpenTelemetry();
@@ -3700,6 +3862,17 @@ Current user's request: ${currentInput}`;
           logger.warn("[NeuroLink] TaskManager shutdown error:", error);
         } finally {
           this._taskManager = undefined;
+        }
+      }
+
+      // Release the artifact store this instance built (a pooled Redis
+      // connection, for one). An injected store is the caller's to close.
+      if (this.ownsArtifactStore && this.mcpArtifactStore?.close) {
+        try {
+          await this.mcpArtifactStore.close();
+          logger.debug("[NeuroLink] Artifact store closed");
+        } catch (error) {
+          logger.warn("[NeuroLink] Artifact store close failed:", error);
         }
       }
 
@@ -4269,6 +4442,23 @@ Current user's request: ${currentInput}`;
     // String prompts are immutable, so they pass through.
     if (typeof optionsOrPrompt !== "string") {
       optionsOrPrompt = cloneOptionsForCallIsolation(optionsOrPrompt);
+      // The deprecated `conversationHistory` field is not wired into message
+      // building — messages passed there never reach the model, which reads
+      // as "the SDK forgot my context" rather than a caller bug. Warn loudly
+      // instead of failing silently; `conversationMessages` is the wired path.
+      const legacyOpts = optionsOrPrompt as {
+        conversationHistory?: unknown[];
+        conversationMessages?: unknown[];
+      };
+      if (
+        Array.isArray(legacyOpts.conversationHistory) &&
+        legacyOpts.conversationHistory.length > 0 &&
+        !legacyOpts.conversationMessages
+      ) {
+        logger.warn(
+          "[NeuroLink.generate] `conversationHistory` is deprecated and NOT passed to the model — use `conversationMessages` (ChatMessage[]) instead.",
+        );
+      }
     }
     // Retrieve once at the public call boundary so fallback attempts reuse the
     // same grounding block and internal preparation cannot inject it twice.
@@ -4468,10 +4658,15 @@ Current user's request: ${currentInput}`;
     // by-reference, so the retried options observe the same signal.
     const callerAborted = (): boolean =>
       (callOpts.abortSignal as AbortSignal | undefined)?.aborted === true;
+    // modelChain-only orchestration advances on two error shapes the next
+    // member can actually fix: access-denied (the original gate) and
+    // model-not-found ("Invalid model name" from a gateway that doesn't
+    // serve that member — a chain written for one LiteLLM deployment must
+    // not hard-fail on another just because a member is absent there).
     const shouldOrchestrateFallback = (err: unknown): boolean =>
       effectiveCallback
         ? !(isAbortError(err) && callerAborted())
-        : looksLikeModelAccessDenied(err);
+        : looksLikeModelAccessDenied(err) || sharedLooksLikeModelNotFound(err);
 
     if (!shouldOrchestrateFallback(lastError)) {
       throw lastError;
@@ -4672,6 +4867,8 @@ Current user's request: ${currentInput}`;
       throw error;
     } finally {
       this._disableToolCacheForCurrentRequest = false;
+      this._toolCacheKeysServedThisRequest = new Set();
+      this._generationTurnActive = false;
       generateSpan.end();
     }
   }
@@ -4703,6 +4900,8 @@ Current user's request: ${currentInput}`;
 
     options.model = resolveModel(options.model, this.modelAliasConfig);
     this._disableToolCacheForCurrentRequest = !!options.disableToolCache;
+    this._toolCacheKeysServedThisRequest = new Set();
+    this._generationTurnActive = true;
 
     generateSpan.setAttribute(
       "neurolink.provider",
@@ -4838,15 +5037,19 @@ Current user's request: ${currentInput}`;
       }
       return this.generateWithWorkflow(options);
     }
-    if (options.output?.mode === "music") {
+
+    // Single source of truth for "what kind of request is this" — see
+    // resolveRequestKind's doc comment for the full precedence table.
+    const requestKind = resolveRequestKind(options, options.model);
+    if (requestKind === "music") {
       return this.generateWithMusic(options, generateSpan);
     }
 
-    if (options.output?.mode === "avatar") {
+    if (requestKind === "avatar") {
       return this.generateWithAvatar(options, generateSpan);
     }
 
-    if (options.output?.mode !== "ppt") {
+    if (requestKind !== "ppt") {
       return null;
     }
 
@@ -5374,6 +5577,11 @@ Current user's request: ${currentInput}`;
       disableTools: options.disableTools,
       toolFilter: options.toolFilter,
       excludeTools: options.excludeTools,
+      // This explicit field list is the only road into the provider, so a
+      // flag left out here never reaches BaseProvider — which is exactly how
+      // disableInternalFallback was dropped on generate() while stream()
+      // (which spreads its options) honoured it.
+      disableInternalFallback: options.disableInternalFallback,
       maxSteps: options.maxSteps,
       toolChoice: options.toolChoice,
       prepareStep: options.prepareStep,
@@ -5453,6 +5661,98 @@ Current user's request: ${currentInput}`;
     return textOptions;
   }
 
+  /**
+   * Provider-agnostic JSON recovery for schema requests. Structured-output
+   * enforcement makes valid JSON the overwhelming case; for every other
+   * provider path — including generate() overrides (Vertex, Anthropic,
+   * Bedrock, Google AI Studio) — object/array roots are recovered here via
+   * balanced-scan + jsonrepair and scalar JSON roots via plain JSON.parse,
+   * with the parsed value exposed as `structuredData`. If nothing JSON-shaped
+   * is recoverable (pure prose), the raw text is returned, `structuredData`
+   * stays undefined, and a WARN makes the case observable.
+   *
+   * Mutates `textResult` in place, and must run BEFORE the end-of-generation
+   * emits so event consumers see the same content/structuredData the caller
+   * receives.
+   */
+  private recoverStructuredData(
+    textResult: TextGenerationResult,
+    schema: OptionalValidationSchema,
+  ): void {
+    // A provider path that produced its own `structuredData` normally owns it.
+    // The one exception is a STRING the caller's schema rejects: that is the
+    // raw completion leaking through as structured output (the shape a
+    // truncated response degrades to), so re-run recovery over the text rather
+    // than handing back a value the declared schema forbids.
+    const structuredIsRejectedString =
+      typeof textResult.structuredData === "string" &&
+      !schemaAccepts(schema, textResult.structuredData);
+    if (
+      !schema ||
+      (textResult.structuredData !== undefined &&
+        !structuredIsRejectedString) ||
+      typeof textResult.content !== "string"
+    ) {
+      return;
+    }
+    if (structuredIsRejectedString) {
+      textResult.structuredData = undefined;
+    }
+    const coerced = coerceJsonToSchema(textResult.content, schema);
+    if (coerced) {
+      textResult.content = coerced.content;
+      textResult.structuredData = coerced.structuredData;
+      if (coerced.repaired) {
+        textResult.jsonRepaired = true;
+      }
+      if (coerced.truncated) {
+        textResult.jsonTruncated = true;
+      }
+      return;
+    }
+    const scalar = recoverScalarRoot(textResult.content, schema);
+    switch (scalar.kind) {
+      case "empty":
+        // A JSON-encoded empty string is an EMPTY completion, not a recovered
+        // scalar — normalize to a true empty so callers' empty-response
+        // handling fires instead of a literal '""' reaching the user.
+        // `structuredData` stays undefined.
+        textResult.content = "";
+        logger.warn(
+          "[NeuroLink] schema requested but the model returned an empty JSON string; normalizing to empty content",
+          { provider: textResult.provider, model: textResult.model },
+        );
+        break;
+      case "accepted":
+        // Only publish a scalar root the caller's schema actually accepts.
+        // Under an OBJECT schema a recovered string is the raw completion in
+        // disguise — the shape a truncated response degrades to — and exposing
+        // it hands the caller a `structuredData` that violates the schema they
+        // passed.
+        textResult.structuredData = scalar.value;
+        break;
+      case "rejected":
+        logger.warn(
+          "[NeuroLink] recovered a JSON scalar the requested schema rejects; leaving structuredData unset",
+          {
+            provider: textResult.provider,
+            model: textResult.model,
+            scalarType: typeof scalar.value,
+          },
+        );
+        break;
+      case "nullish":
+        // JSON null/undefined — no structured value to publish.
+        break;
+      case "not-json":
+        logger.warn(
+          "[NeuroLink] schema requested but no JSON could be recovered from model output; returning raw text",
+          { provider: textResult.provider, model: textResult.model },
+        );
+        break;
+    }
+  }
+
   private finalizeGenerateRequestResult(params: {
     generateSpan: ReturnType<typeof tracers.sdk.startSpan>;
     options: GenerateOptions;
@@ -5472,58 +5772,7 @@ Current user's request: ${currentInput}`;
       startTime,
     } = params;
 
-    // Provider-agnostic JSON coercion for schema requests. Structured-output
-    // enforcement makes valid JSON the overwhelming case; for every other
-    // provider path — including generate() overrides (Vertex, Anthropic,
-    // Bedrock, Google AI Studio) — object/array roots are recovered here via
-    // balanced-scan + jsonrepair and scalar JSON roots via plain JSON.parse,
-    // with the parsed value exposed as `structuredData`. If nothing
-    // JSON-shaped is recoverable (pure prose), the raw text is returned,
-    // `structuredData` stays undefined, and a WARN makes the case observable.
-    // Runs BEFORE the end-of-generation emits below so event consumers see
-    // the same coerced content/structuredData the caller receives.
-    if (
-      textOptions.schema &&
-      textResult.structuredData === undefined &&
-      typeof textResult.content === "string"
-    ) {
-      const coerced = coerceJsonToSchema(
-        textResult.content,
-        textOptions.schema,
-      );
-      if (coerced) {
-        textResult.content = coerced.content;
-        textResult.structuredData = coerced.structuredData;
-        if (coerced.repaired) {
-          textResult.jsonRepaired = true;
-        }
-        if (coerced.truncated) {
-          textResult.jsonTruncated = true;
-        }
-      } else {
-        try {
-          const scalar: unknown = JSON.parse(textResult.content);
-          if (scalar === "") {
-            // A JSON-encoded empty string is an EMPTY completion, not a
-            // recovered scalar — normalize to a true empty so callers'
-            // empty-response handling fires instead of a literal '""'
-            // reaching the user. `structuredData` stays undefined.
-            textResult.content = "";
-            logger.warn(
-              "[NeuroLink] schema requested but the model returned an empty JSON string; normalizing to empty content",
-              { provider: textResult.provider, model: textResult.model },
-            );
-          } else if (scalar !== null && scalar !== undefined) {
-            textResult.structuredData = scalar;
-          }
-        } catch {
-          logger.warn(
-            "[NeuroLink] schema requested but no JSON could be recovered from model output; returning raw text",
-            { provider: textResult.provider, model: textResult.model },
-          );
-        }
-      }
-    }
+    this.recoverStructuredData(textResult, textOptions.schema);
 
     // Surface truncation when a schema was requested: either the provider
     // reported finishReason="length" or the recovered JSON came from an
@@ -5622,6 +5871,7 @@ Current user's request: ${currentInput}`;
         : undefined,
       responseTime: textResult.responseTime,
       toolsUsed: textResult.toolsUsed,
+      toolCalls: textResult.toolCalls ?? [],
       toolExecutions: toToolExecutionRecords(textResult.toolExecutions),
       enhancedWithTools: textResult.enhancedWithTools,
       availableTools: transformAvailableTools(textResult.availableTools),
@@ -5644,6 +5894,7 @@ Current user's request: ${currentInput}`;
           }
         : undefined,
       audio: textResult.audio,
+      ttsMetadata: textResult.ttsMetadata,
       transcription: textResult.transcription,
       video: textResult.video,
       avatar: textResult.avatar,
@@ -5876,6 +6127,13 @@ Current user's request: ${currentInput}`;
         'output.music.provider is required (e.g. "beatoven", "elevenlabs-music", "lyria", "replicate").',
       );
     }
+    // This early-dispatch path never creates an AI provider, so
+    // ProviderRegistry.registerAllProviders() has NOT necessarily run —
+    // with the module-scope auto-registration retired, the handlers must
+    // be registered here explicitly. registerDefaultMusicHandlers() is
+    // idempotent (skip-if-registered), so the repeat call is free.
+    const { registerDefaultMusicHandlers } = await import("./music/index.js");
+    registerDefaultMusicHandlers();
     const { MusicProcessor } = await import("./utils/musicProcessor.js");
     const musicResult = await MusicProcessor.generate(providerName, {
       ...musicOptions,
@@ -5916,6 +6174,11 @@ Current user's request: ${currentInput}`;
         'output.avatar.provider is required (e.g. "d-id", "heygen", "replicate").',
       );
     }
+    // Same early-dispatch registration as generateWithMusic above: no AI
+    // provider is created on this path, so the retired module-scope
+    // auto-run must be replaced by an explicit (idempotent) call here.
+    const { registerDefaultAvatarHandlers } = await import("./avatar/index.js");
+    registerDefaultAvatarHandlers();
     const { AvatarProcessor } = await import("./utils/avatarProcessor.js");
     const avatarResult = await AvatarProcessor.generate(
       providerName,
@@ -7397,7 +7660,7 @@ Current user's request: ${currentInput}`;
     }
     // Providers with native tool calling receive full definitions via their
     // `tools` parameter; only prompt-based providers still get the listing.
-    const nativeToolSupport = !PROMPT_ONLY_TOOL_PROVIDERS.has(
+    const nativeToolSupport = !isPromptOnlyToolProvider(
       String(providerName).toLowerCase(),
     );
     const enhancedSystemPrompt = options.skipToolPromptInjection
@@ -7425,10 +7688,17 @@ Current user's request: ${currentInput}`;
       hasCustomSystemPrompt: !!options.systemPrompt,
     });
 
-    const conversationMessages = (await getConversationMessages(
-      this.conversationMemory,
-      options,
-    )) as ChatMessage[];
+    // Caller-supplied conversationMessages win — mirroring
+    // directProviderGeneration. getConversationMessages() returns [] whenever
+    // no memory manager / session context is configured, which silently
+    // dropped an inline history on the MCP-first path (the default path for
+    // any bare `new NeuroLink()` with tools enabled) while the direct path
+    // honored it.
+    const conversationMessages = (
+      (options as TextGenerationOptions).conversationMessages?.length
+        ? (options as TextGenerationOptions).conversationMessages
+        : await getConversationMessages(this.conversationMemory, options)
+    ) as ChatMessage[];
     this.logMCPConversationSummary(requestId, conversationMessages);
 
     logger.debug("[Observability] Available tools for LLM", {
@@ -7816,12 +8086,14 @@ Current user's request: ${currentInput}`;
       rawFinishReason: result.rawFinishReason,
       stepsUsed: result.stepsUsed,
       toolsUsed: result.toolsUsed || [],
+      toolCalls: result.toolCalls ?? [],
       toolExecutions: transformedToolExecutions,
       enhancedWithTools: Boolean(hasToolExecutions),
       availableTools: transformToolsForMCP(
         transformToolsToExpectedFormat(availableTools),
       ),
       audio: result.audio,
+      ttsMetadata: result.ttsMetadata,
       video: result.video,
       avatar: result.avatar,
       music: result.music,
@@ -7884,12 +8156,25 @@ Current user's request: ${currentInput}`;
       : requestedProvider
         ? [requestedProvider]
         : providerPriority;
+    // The caller owns fallback order (a providerFallback / modelChain caller,
+    // or a router that retries on its own): bound the walk to its first
+    // candidate so an unavailable provider surfaces as its own error instead
+    // of a silent switch. An explicit provider is already a one-element
+    // list; this only changes the "auto" and orchestrated-preference walks.
+    const providersToTry =
+      options.disableInternalFallback === true
+        ? tryProviders.slice(0, 1)
+        : tryProviders;
+    // Caller-owned fallback never enters tryProviders: providerFallback and
+    // modelChain are walked by runWithFallbackOrchestration around the public
+    // generate() call, and a configured ModelPool is consumed by the block
+    // above. Slicing here therefore never clips a caller's own list.
 
     logger.debug(`[${functionTag}] Starting direct generation`, {
       requestedProvider: requestedProvider || "auto",
       preferredOrchestrated: preferredOrchestrated || "none",
-      tryProviders,
-      allowFallback: !requestedProvider || !!preferredOrchestrated,
+      tryProviders: providersToTry,
+      allowFallback: providersToTry.length > 1,
     });
 
     // ─── ModelPool path ──────────────────────────────────────────────────────
@@ -7994,6 +8279,7 @@ Current user's request: ${currentInput}`;
             rawFinishReason: poolResult.rawFinishReason,
             stepsUsed: poolResult.stepsUsed,
             toolsUsed: poolResult.toolsUsed || [],
+            toolCalls: poolResult.toolCalls ?? [],
             // Lossless pass-through: keep the full ToolExecutionRecord
             // fields (params/resultText/isError/timing) alongside the
             // legacy {toolName,executionTime,success} shape this internal
@@ -8008,6 +8294,7 @@ Current user's request: ${currentInput}`;
             analytics: poolResult.analytics,
             evaluation: poolResult.evaluation,
             audio: poolResult.audio,
+            ttsMetadata: poolResult.ttsMetadata,
             video: poolResult.video,
             avatar: poolResult.avatar,
             music: poolResult.music,
@@ -8077,7 +8364,7 @@ Current user's request: ${currentInput}`;
     let lastError: Error | null = null;
 
     // Try each provider in order
-    for (const providerName of tryProviders) {
+    for (const providerName of providersToTry) {
       if (options.abortSignal?.aborted) {
         throw new DOMException("The operation was aborted", "AbortError");
       }
@@ -8152,34 +8439,134 @@ Current user's request: ${currentInput}`;
         // oversized case. When the budget check shows the request is
         // over budget but there's nothing to compact (no memory + no
         // inline messages — e.g. a huge prompt or huge tool definitions
-        // alone), throw before dispatch instead of wasting a roundtrip.
+        // alone), recover by WINDOWING the prompt when the prompt is what
+        // blew the budget: keep its head and tail around an elision marker
+        // and dispatch. Agentic callers (Yama's session loop) carry their
+        // whole tool transcript in the prompt; the previous
+        // unconditional throw dead-ended every such turn — observed live
+        // as an unbounded retry loop (93K→299K tokens, no verdict, ever).
+        // The throw remains for the truly unrecoverable case: system
+        // prompt + tool definitions alone exceed the budget.
+        let promptWindowRecovered = false;
         if (!budgetCheck.withinBudget && !dpgHasCompactableMessages) {
-          try {
-            this.emitter.emit("compaction.insufficient", {
-              stagesAttempted: ["pre-dispatch hard cap"],
-              finalTokens: budgetCheck.estimatedInputTokens,
-              budget: budgetCheck.availableInputTokens,
-              provider: providerName,
-              model: options.model,
-              phase: "pre-dispatch-no-recovery",
-              timestamp: Date.now(),
-            });
-          } catch {
-            /* listener errors are non-fatal */
-          }
-          throw new ContextBudgetExceededError(
-            `Context exceeds model budget and no compaction is possible ` +
-              `(no conversationMemory, no inline conversationMessages — only ` +
-              `prompt + tools). Estimated: ${budgetCheck.estimatedInputTokens} ` +
-              `tokens, budget: ${budgetCheck.availableInputTokens} tokens. ` +
-              `Reduce prompt or tool-definition size, or trim the request.`,
-            {
-              estimatedTokens: budgetCheck.estimatedInputTokens,
-              availableTokens: budgetCheck.availableInputTokens,
-              stagesUsed: [],
-              breakdown: budgetCheck.breakdown,
-            },
+          const fixedOverhead =
+            (budgetCheck.breakdown?.systemPrompt ?? 0) +
+            (budgetCheck.breakdown?.toolDefinitions ?? 0) +
+            (budgetCheck.breakdown?.fileAttachments ?? 0);
+          // 3% margin against estimator drift; 1024-token floor — below
+          // that, a windowed prompt carries too little to answer from.
+          const promptBudget = Math.floor(
+            (budgetCheck.availableInputTokens - fixedOverhead) * 0.97,
           );
+          const promptText =
+            typeof options.prompt === "string" ? options.prompt : undefined;
+          if (
+            promptText &&
+            promptBudget >= 1024 &&
+            (budgetCheck.breakdown?.currentPrompt ?? 0) > promptBudget
+          ) {
+            const marker =
+              "\n\n[... middle of this prompt elided by NeuroLink to fit the model's context window ...]\n\n";
+            // Proportional char budget from the observed chars-per-token of
+            // THIS text, re-checked and shrunk until the estimator agrees.
+            let charBudget = Math.floor(
+              promptText.length *
+                (promptBudget /
+                  Math.max(budgetCheck.breakdown?.currentPrompt ?? 1, 1)),
+            );
+            let windowed = promptText;
+            for (let attempt = 0; attempt < 4; attempt++) {
+              const headChars = Math.floor(charBudget * 0.6);
+              const tailChars = Math.max(
+                charBudget - headChars - marker.length,
+                0,
+              );
+              windowed =
+                promptText.slice(0, headChars) +
+                marker +
+                (tailChars > 0 ? promptText.slice(-tailChars) : "");
+              const recheck = checkContextBudget({
+                provider: providerName,
+                model: options.model,
+                maxTokens: options.maxTokens,
+                systemPrompt: options.systemPrompt,
+                conversationMessages: [],
+                currentPrompt: windowed,
+                toolDefinitions: options.tools
+                  ? Object.values(options.tools)
+                  : undefined,
+              });
+              if (recheck.withinBudget) {
+                break;
+              }
+              charBudget = Math.floor(charBudget * 0.8);
+              if (attempt === 3) {
+                windowed = promptText; // give up — fall through to the throw
+              }
+            }
+            if (windowed !== promptText) {
+              logger.warn(
+                "[NeuroLink] Prompt exceeded the model's context budget with nothing to compact — " +
+                  "windowed the prompt (head+tail kept, middle elided) to fit.",
+                {
+                  provider: providerName,
+                  model: options.model,
+                  estimatedTokens: budgetCheck.estimatedInputTokens,
+                  budget: budgetCheck.availableInputTokens,
+                  originalPromptChars: promptText.length,
+                  windowedPromptChars: windowed.length,
+                },
+              );
+              try {
+                this.emitter.emit("compaction.applied", {
+                  stagesAttempted: ["pre-dispatch prompt window"],
+                  finalTokens: budgetCheck.availableInputTokens,
+                  budget: budgetCheck.availableInputTokens,
+                  provider: providerName,
+                  model: options.model,
+                  phase: "pre-dispatch-prompt-window",
+                  timestamp: Date.now(),
+                });
+              } catch {
+                /* listener errors are non-fatal */
+              }
+              options.prompt = windowed;
+              const inputHolder = (options as { input?: { text?: string } })
+                .input;
+              if (inputHolder && typeof inputHolder.text === "string") {
+                inputHolder.text = windowed;
+              }
+              promptWindowRecovered = true;
+            }
+          }
+          if (!promptWindowRecovered) {
+            try {
+              this.emitter.emit("compaction.insufficient", {
+                stagesAttempted: ["pre-dispatch hard cap"],
+                finalTokens: budgetCheck.estimatedInputTokens,
+                budget: budgetCheck.availableInputTokens,
+                provider: providerName,
+                model: options.model,
+                phase: "pre-dispatch-no-recovery",
+                timestamp: Date.now(),
+              });
+            } catch {
+              /* listener errors are non-fatal */
+            }
+            throw new ContextBudgetExceededError(
+              `Context exceeds model budget and no compaction is possible ` +
+                `(no conversationMemory, no inline conversationMessages — only ` +
+                `prompt + tools). Estimated: ${budgetCheck.estimatedInputTokens} ` +
+                `tokens, budget: ${budgetCheck.availableInputTokens} tokens. ` +
+                `Reduce prompt or tool-definition size, or trim the request.`,
+              {
+                estimatedTokens: budgetCheck.estimatedInputTokens,
+                availableTokens: budgetCheck.availableInputTokens,
+                stagesUsed: [],
+                breakdown: budgetCheck.breakdown,
+              },
+            );
+          }
         }
 
         if (
@@ -8365,6 +8752,9 @@ Current user's request: ${currentInput}`;
           rawFinishReason: result.rawFinishReason,
           stepsUsed: result.stepsUsed,
           toolsUsed: result.toolsUsed || [],
+          // The providers record executed calls; without this line the public
+          // result never carried them, whatever the provider returned.
+          toolCalls: result.toolCalls ?? [],
           // Lossless pass-through: keep the full ToolExecutionRecord fields
           // alongside the legacy {toolName,executionTime,success} shape this
           // internal result declares, so the final GenerateResult mapping
@@ -8378,6 +8768,7 @@ Current user's request: ${currentInput}`;
           analytics: result.analytics,
           evaluation: result.evaluation,
           audio: result.audio,
+          ttsMetadata: result.ttsMetadata,
           video: result.video,
           avatar: result.avatar,
           music: result.music,
@@ -8428,7 +8819,7 @@ Current user's request: ${currentInput}`;
     // All providers failed
     const responseTime = Date.now() - startTime;
     logger.error(`[${functionTag}] All providers failed`, {
-      triedProviders: tryProviders,
+      triedProviders: providersToTry,
       lastError: lastError?.message,
       responseTime,
     });
@@ -8669,7 +9060,9 @@ Current user's request: ${currentInput}`;
    *
    * // Consume the stream
    * for await (const chunk of result.stream) {
-   *   process.stdout.write(chunk.content);
+   *   if ("content" in chunk) {
+   *     process.stdout.write(chunk.content);
+   *   }
    * }
    *
    * // Advanced streaming with options
@@ -8941,6 +9334,8 @@ Current user's request: ${currentInput}`;
     const streamIsRoot = !trace.getSpan(context.active());
     const spanStartTime = Date.now();
     this._disableToolCacheForCurrentRequest = !!options.disableToolCache;
+    this._toolCacheKeysServedThisRequest = new Set();
+    this._generationTurnActive = true;
 
     try {
       options.model = resolveModel(options.model, this.modelAliasConfig);
@@ -9048,19 +9443,19 @@ Current user's request: ${currentInput}`;
           .thinking?.thinkingLevel,
       );
 
-      // TTS Mode 2 deferred: stream() emits text first, then synthesizes the
-      // accumulated response into a single audio chunk at end-of-stream and
-      // resolves `streamResult.audio` with the same TTSResult. The resolver is
+      // Streaming TTS deferred: stream() always synthesizes the streamed AI
+      // response when TTS is enabled, regardless of generate()'s
+      // input-vs-response `useAiResponse` switch. It resolves
+      // `streamResult.audio` with the aggregate TTSResult. The resolver is
       // plumbed explicitly through the params bag (M11: previously a
       // `_streamTtsResolve` cast on the caller's options object — fragile if
       // the same options object was reused across concurrent stream() calls).
       const ttsOptions = options.tts;
-      const wantsStreamTtsMode2 = !!(
-        ttsOptions?.enabled && ttsOptions?.useAiResponse
-      );
+      const wantsStreamTtsMode2 = ttsOptions?.enabled === true;
       let resolveStreamTtsAudio:
         | ((value: TTSResult | undefined) => void)
         | undefined;
+      let streamTtsMetadata: TTSMetadata | undefined;
       const streamTtsAudioPromise = wantsStreamTtsMode2
         ? new Promise<TTSResult | undefined>((resolve) => {
             resolveStreamTtsAudio = resolve;
@@ -9078,6 +9473,9 @@ Current user's request: ${currentInput}`;
             streamId,
             originalPrompt,
             ttsResolver: resolveStreamTtsAudio,
+            ttsMetadataSink: (metadata) => {
+              streamTtsMetadata = metadata;
+            },
           }),
         ),
       );
@@ -9086,6 +9484,7 @@ Current user's request: ${currentInput}`;
       }
       if (streamTtsAudioPromise) {
         streamResult.audio = streamTtsAudioPromise;
+        streamResult.ttsMetadata = streamTtsMetadata;
       }
       return streamResult;
     } catch (error) {
@@ -9753,6 +10152,8 @@ Current user's request: ${currentInput}`;
         throw error;
       } finally {
         self._disableToolCacheForCurrentRequest = false;
+        self._toolCacheKeysServedThisRequest = new Set();
+        self._generationTurnActive = false;
         params.streamSpan.setAttribute(
           "neurolink.response_time_ms",
           Date.now() - params.spanStartTime,
@@ -9773,14 +10174,16 @@ Current user's request: ${currentInput}`;
     streamId: string;
     originalPrompt: string;
     /**
-     * Resolver for `streamResult.audio` Promise (TTS Mode 2). Set when the
-     * caller requested `tts.enabled && tts.useAiResponse`. Always resolved
+     * Resolver for the streaming `streamResult.audio` Promise. Set when the
+     * caller requested `tts.enabled`. Always resolved
      * exactly once: with the synthesised TTSResult on success, or `undefined`
      * on synthesis failure / non-Mode-2 path / stream error. Plumbed
      * explicitly via this params bag (M11) instead of via a side-channel
      * cast on the caller's options object.
      */
     ttsResolver?: (value: TTSResult | undefined) => void;
+    /** Receives the mutable streaming-TTS metadata reference before return. */
+    ttsMetadataSink?: (value: TTSMetadata | undefined) => void;
   }): Promise<StreamResult> {
     const {
       options,
@@ -9791,6 +10194,7 @@ Current user's request: ${currentInput}`;
       streamId,
       originalPrompt,
       ttsResolver,
+      ttsMetadataSink,
     } = params;
 
     logger.debug("[NeuroLink] Running standard stream request", {
@@ -9831,6 +10235,18 @@ Current user's request: ${currentInput}`;
         analytics: streamAnalytics,
         metadata: providerStreamMetadata,
       } = await this.createMCPStream(enhancedOptions);
+      let streamedTTSResult: TTSResult | undefined;
+      const { stream: incrementalStream, ttsMetadata: streamTtsMetadata } =
+        await this.createIncrementalTTSStream({
+          stream: mcpStream,
+          ttsOptions: enhancedOptions.tts,
+          providerName,
+          fallbackProvider: enhancedOptions.provider,
+          onComplete: (result) => {
+            streamedTTSResult = result;
+          },
+        });
+      ttsMetadataSink?.(streamTtsMetadata);
       const streamState = {
         finishReason: streamFinishReason ?? "stop",
         toolCalls: streamToolCalls,
@@ -9887,7 +10303,7 @@ Current user's request: ${currentInput}`;
         // NoOutputGeneratedError, and we want fallback to fire there.
         let realOutputChunks = 0;
         try {
-          for await (const chunk of mcpStream) {
+          for await (const chunk of incrementalStream) {
             chunkCount++;
             const isNoOutputSentinel =
               chunk !== null &&
@@ -9934,14 +10350,25 @@ Current user's request: ${currentInput}`;
           // Reviewer follow-up: fire fallback when no *non-sentinel*
           // output was produced — sentinel-only and truly empty streams
           // both qualify, but media-only streams (audio/image) do not.
+          //
+          // fallbackOnMaxSteps: false exempts one no-output shape — a turn
+          // the provider reports as ended at the caller's own maxSteps bound
+          // (metadata.stopReason "step-cap", a mutable reference the native
+          // loops fill by drain time). That bound is the caller's budget,
+          // not a provider failure, and retrying it on another provider
+          // spends that provider's tokens to exceed a budget the caller set.
+          const cappedByCallerBudget =
+            enhancedOptions.fallbackOnMaxSteps === false &&
+            providerStreamMetadata?.stopReason === "step-cap";
           if (
             realOutputChunks === 0 &&
+            !cappedByCallerBudget &&
             !metadata.fallbackAttempted &&
             !enhancedOptions.disableInternalFallback &&
             streamState.toolCalls.length === 0 &&
             streamState.toolResults.length === 0
           ) {
-            yield* self.handleStreamFallback(
+            const fallbackStream = self.handleStreamFallback(
               metadata,
               streamState,
               originalPrompt,
@@ -9951,24 +10378,21 @@ Current user's request: ${currentInput}`;
                 accumulatedContent += content;
               },
             );
+            const { stream: incrementalFallback } =
+              await self.createIncrementalTTSStream({
+                stream: fallbackStream,
+                ttsOptions: enhancedOptions.tts,
+                providerName,
+                fallbackProvider: enhancedOptions.provider,
+                ttsMetadata: streamTtsMetadata,
+                onComplete: (result) => {
+                  streamedTTSResult = result;
+                },
+              });
+            yield* incrementalFallback;
           }
 
-          // TTS Mode 2 for stream(): synthesize the accumulated response
-          // and yield ONE final audio chunk so callers iterating the stream
-          // get the audio inline; also resolve `streamResult.audio` so the
-          // ergonomic `await result.audio` pattern works post-iteration.
-          // m5: synthesis logic lives in a dedicated helper to keep this
-          // generator under the max-lines-per-function lint budget.
-          const ttsModeResult = await self.synthesizeStreamModeTwo({
-            ttsOptions: enhancedOptions.tts,
-            providerName,
-            fallbackProvider: enhancedOptions.provider,
-            accumulatedContent,
-            ttsResolver,
-          });
-          if (ttsModeResult.audioChunk) {
-            yield ttsModeResult.audioChunk;
-          }
+          ttsResolver?.(streamedTTSResult);
 
           resolvedUsage = streamUsage;
           if (!resolvedUsage && streamAnalytics) {
@@ -10121,6 +10545,8 @@ Current user's request: ${currentInput}`;
           }
 
           self._disableToolCacheForCurrentRequest = false;
+          self._toolCacheKeysServedThisRequest = new Set();
+          self._generationTurnActive = false;
           cleanupListeners();
 
           streamSpan.setAttribute(
@@ -10239,6 +10665,7 @@ Current user's request: ${currentInput}`;
         providerMetadata: providerStreamMetadata,
       });
     } catch (error) {
+      ttsResolver?.(undefined);
       if (options.disableInternalFallback) {
         throw error;
       }
@@ -10253,92 +10680,84 @@ Current user's request: ${currentInput}`;
     }
   }
 
-  /**
-   * TTS Mode 2 synthesis helper for the stream() pipeline.
-   *
-   * m5 — extracted from runStandardStreamRequest so the surrounding generator
-   * stays under the max-lines-per-function lint budget. Behaviour preserved
-   * exactly:
-   * - When Mode 2 is enabled (`tts.enabled && tts.useAiResponse`) AND the
-   *   model produced non-empty content: synthesises one final audio buffer
-   *   and returns it as an `audioChunk` for the caller to `yield`. Resolves
-   *   `ttsResolver` with the `TTSResult`.
-   * - When Mode 2 is enabled but synthesis fails: logs a warning and resolves
-   *   `ttsResolver` with `undefined`.
-   * - When Mode 2 is requested but skipped (empty content / wrong mode):
-   *   resolves `ttsResolver` with `undefined` early so callers awaiting
-   *   `result.audio` unblock before the surrounding `finally` cleanup
-   *   completes (Issue 7 latency micro-opt — the finally block also resolves
-   *   defensively, so this is a redundant early signal, not a coverage fix).
-   */
-  private async synthesizeStreamModeTwo(params: {
+  /** Wrap one provider stream with incremental TTS synthesis. */
+  private async createIncrementalTTSStream(params: {
+    stream: AsyncIterable<ProviderStreamChunk>;
     ttsOptions: TTSOptions | undefined;
     providerName: string;
     fallbackProvider?: string;
-    accumulatedContent: string;
-    ttsResolver?: (value: TTSResult | undefined) => void;
-  }): Promise<{ audioChunk?: { type: "tts_audio"; audio: TTSChunk } }> {
-    const {
-      ttsOptions,
-      providerName,
-      fallbackProvider,
-      accumulatedContent,
-      ttsResolver,
-    } = params;
+    ttsMetadata?: TTSMetadata;
+    onComplete: (value: TTSResult | undefined) => void;
+  }): Promise<{
+    stream: AsyncIterable<ProviderStreamChunk>;
+    ttsMetadata?: TTSMetadata;
+  }> {
+    const { stream, ttsOptions, providerName, fallbackProvider, onComplete } =
+      params;
 
-    if (
-      !ttsOptions?.enabled ||
-      !ttsOptions.useAiResponse ||
-      accumulatedContent.trim().length === 0
-    ) {
-      ttsResolver?.(undefined);
-      return {};
+    if (!ttsOptions?.enabled) {
+      onComplete(undefined);
+      return { stream };
     }
 
-    try {
-      const { TTSProcessor } = await import("./utils/ttsProcessor.js");
-      // ttsOptions.provider takes precedence; otherwise fall back to the
-      // chat provider ID ONLY when it happens to be a registered TTS handler
-      // (e.g. "google-ai" works for both LLM and TTS). For LLM-only IDs like
-      // "anthropic", we'd otherwise complete generation and then fail synth —
-      // surface that mismatch up front instead.
-      const candidate = ttsOptions.provider ?? fallbackProvider ?? providerName;
-      const ttsProvider =
-        candidate && TTSProcessor.supports(candidate) ? candidate : undefined;
-      if (!ttsProvider) {
-        throw new Error(
-          `No TTS provider resolved for stream Mode 2 (set tts.provider explicitly — chat provider "${candidate ?? "<unset>"}" is not a registered TTS handler)`,
-        );
+    const { TTSProcessor } = await import("./utils/ttsProcessor.js");
+    const concreteFallback =
+      fallbackProvider === "auto" ? undefined : fallbackProvider;
+    const candidate = ttsOptions.provider ?? concreteFallback ?? providerName;
+    const ttsProvider =
+      candidate && TTSProcessor.supports(candidate) ? candidate : undefined;
+    const ttsMetadata = params.ttsMetadata ?? {
+      attempted: ttsProvider !== undefined,
+      success: false,
+    };
+    ttsMetadata.attempted = ttsProvider !== undefined;
+    ttsMetadata.success = false;
+    delete ttsMetadata.error;
+    delete ttsMetadata.latency;
+    const ttsStartedAt = Date.now();
+    let completionRecorded = false;
+    const recordCompletion = (
+      result: TTSResult | undefined,
+      error?: NonNullable<TTSMetadata["error"]>,
+    ) => {
+      if (completionRecorded) {
+        return;
       }
-      const ttsResult = await TTSProcessor.synthesize(
-        accumulatedContent,
-        ttsProvider,
-        ttsOptions,
-      );
-      ttsResolver?.(ttsResult);
-      return {
-        audioChunk: {
-          type: "tts_audio" as const,
-          audio: {
-            data: ttsResult.buffer,
-            format: ttsResult.format,
-            index: 0,
-            isFinal: true,
-            cumulativeSize: ttsResult.size,
-            voice: ttsResult.voice,
-            sampleRate: ttsResult.sampleRate,
-          },
-        },
-      };
-    } catch (ttsError) {
+      completionRecorded = true;
+      ttsMetadata.success = error === undefined && result !== undefined;
+      if (error) {
+        ttsMetadata.error = error;
+      } else {
+        delete ttsMetadata.error;
+      }
+      ttsMetadata.latency = Date.now() - ttsStartedAt;
+      onComplete(result);
+    };
+    if (!ttsProvider) {
       logger.warn(
-        `[NeuroLink.stream] Stream TTS Mode 2 synthesis failed: ${
-          ttsError instanceof Error ? ttsError.message : String(ttsError)
-        }`,
+        `[NeuroLink.stream] No TTS provider resolved for incremental streaming (set tts.provider explicitly — chat provider "${candidate ?? "<unset>"}" is not a registered TTS handler)`,
       );
-      ttsResolver?.(undefined);
-      return {};
+      recordCompletion(undefined);
+      return { stream, ttsMetadata };
     }
+
+    return {
+      stream: interleaveTTSStream({
+        stream,
+        provider: ttsProvider,
+        options: ttsOptions,
+        onComplete: recordCompletion,
+      }),
+      ttsMetadata,
+    };
+  }
+
+  /** Prevent provider fallback streams from duplicating outer streaming TTS. */
+  private deferProviderStreamTTS(options: StreamOptions): StreamOptions {
+    if (options.tts?.enabled) {
+      return { ...options, tts: undefined };
+    }
+    return options;
   }
 
   /**
@@ -10655,12 +11074,7 @@ Current user's request: ${currentInput}`;
     enhancedOptions: StreamOptions,
     providerName: string,
     appendContent: (content: string) => void,
-  ): AsyncGenerator<
-    | { content: string }
-    | { type: "audio"; audio: AudioChunk }
-    | { type: "tts_audio"; audio: TTSChunk }
-    | { type: "image"; imageOutput: { base64: string } }
-  > {
+  ): AsyncGenerator<ProviderStreamChunk> {
     metadata.fallbackAttempted = true;
     const errorMsg =
       "Stream completed with 0 chunks (possible guardrails block)";
@@ -10759,7 +11173,7 @@ Current user's request: ${currentInput}`;
             } as TextGenerationOptions);
 
       const fallbackResult = await fallbackProvider.stream({
-        ...enhancedOptions,
+        ...this.deferProviderStreamTTS(enhancedOptions),
         model: fallbackRoute.model,
         conversationMessages,
       });
@@ -11044,12 +11458,7 @@ Current user's request: ${currentInput}`;
    * Create MCP stream
    */
   private async createMCPStream(options: StreamOptions): Promise<{
-    stream: AsyncIterable<
-      | { content: string }
-      | { type: "audio"; audio: AudioChunk }
-      | { type: "tts_audio"; audio: TTSChunk }
-      | { type: "image"; imageOutput: { base64: string } }
-    >;
+    stream: AsyncIterable<ProviderStreamChunk>;
     provider: string;
     usage?: { input: number; output: number; total: number };
     model?: string;
@@ -11386,7 +11795,7 @@ Current user's request: ${currentInput}`;
           );
 
           const poolStreamResult = await poolStreamProvider.stream({
-            ...options,
+            ...this.deferProviderStreamTTS(options),
             provider: poolStreamProviderName as AIProviderName,
             model: poolStreamModel,
             region: poolStreamRegion,
@@ -11476,7 +11885,7 @@ Current user's request: ${currentInput}`;
     // 🔧 FIX: Pass enhanced system prompt to real streaming
     // Tools will be accessed through the streamText call in executeStream
     const streamResult = await provider.stream({
-      ...options,
+      ...this.deferProviderStreamTTS(options),
       systemPrompt: enhancedSystemPrompt, // Use enhanced prompt with tool descriptions
       conversationMessages,
     });
@@ -11508,12 +11917,7 @@ Current user's request: ${currentInput}`;
    * Process stream result
    */
   private async processStreamResult(
-    _stream: AsyncIterable<
-      | { content: string }
-      | { type: "audio"; audio: AudioChunk }
-      | { type: "tts_audio"; audio: TTSChunk }
-      | { type: "image"; imageOutput: { base64: string } }
-    >,
+    _stream: AsyncIterable<ProviderStreamChunk>,
     _options: StreamOptions,
     _factoryResult: unknown,
   ): Promise<{
@@ -11561,12 +11965,7 @@ Current user's request: ${currentInput}`;
       analytics?: AnalyticsData;
       evaluation?: EvaluationData;
     },
-    stream: AsyncIterable<
-      | { content: string }
-      | { type: "audio"; audio: AudioChunk }
-      | { type: "tts_audio"; audio: TTSChunk }
-      | { type: "image"; imageOutput: { base64: string } }
-    >,
+    stream: AsyncIterable<ProviderStreamChunk>,
     config: {
       providerName: string;
       options: StreamOptions;
@@ -12015,6 +12414,46 @@ Current user's request: ${currentInput}`;
   }
 
   /**
+   * Whether a HITL confirmation is still awaiting a response on THIS instance.
+   *
+   * Emitting `hitl:confirmation-response` is not proof the decision landed. The
+   * forwarding listener for that event is installed once at construction, so
+   * `emitter.emit(...)` reports a listener was invoked even when nothing is
+   * waiting — the pending set lives one hop further in, on the HITL manager, and
+   * holds the `resolve`/`reject` of the suspended tool call. An instance built
+   * after the confirmation was issued (a session rebuilt from persisted state)
+   * therefore accepts the event and resolves nothing.
+   *
+   * Returns `false` in two different situations, which it deliberately does not
+   * distinguish: HITL was never configured on this instance, and the id is
+   * unknown or already settled. Both mean "emitting a response here achieves
+   * nothing", which is the question this answers. A caller that needs to tell a
+   * configuration mistake from an expired confirmation should check the HITL
+   * config separately rather than read that into this boolean.
+   *
+   * This is advisory, not atomic: it reports the state at the moment it is
+   * called. Nothing stops the confirmation timing out immediately afterwards, so
+   * emit on the answer without an `await` in between. Over the case it exists
+   * for — an instance rebuilt from persisted state, whose pending set is empty
+   * and can never repopulate for an id it never issued — absence cannot become
+   * presence, so the answer cannot go stale in the unsafe direction.
+   *
+   * @param confirmationId - The id from the `hitl:confirmation-request` event
+   * @returns `true` only if this instance is still holding that confirmation
+   *
+   * @example
+   * ```typescript
+   * if (!neurolink.hasPendingHITLConfirmation(confirmationId)) {
+   *   return refuse("This conversation has expired, so the action was not carried out.");
+   * }
+   * neurolink.getEventEmitter().emit("hitl:confirmation-response", { ... });
+   * ```
+   */
+  hasPendingHITLConfirmation(confirmationId: string): boolean {
+    return this.hitlManager?.hasPendingConfirmation(confirmationId) ?? false;
+  }
+
+  /**
    * Returns the instance-level tool-dedup configuration, or `undefined` when
    * toolDedup was not provided at construction time.
    *
@@ -12179,7 +12618,7 @@ Current user's request: ${currentInput}`;
   // ENHANCED: Tool Event Emission API
   // ========================================
 
-  // TODO(#1179): Add ToolExecutionEvent utility methods in future version
+  // TODO(#1576): Add ToolExecutionEvent utility methods in future version
   // Will provide structured event format for consistent tool event processing
 
   /**
@@ -12339,7 +12778,7 @@ Current user's request: ${currentInput}`;
     this.currentStreamToolExecutions = [];
   }
 
-  // TODO(#1179): Add getToolExecutionEvents() method in future version
+  // TODO(#1576): Add getToolExecutionEvents() method in future version
   // Will return properly formatted ToolExecutionEvent objects for structured event processing
 
   // ========================================
@@ -12469,10 +12908,20 @@ Current user's request: ${currentInput}`;
         convertedTool,
         options?.timeout,
         options?.maxRetries,
+        options?.totalTimeoutMs,
       );
 
       // Register with toolRegistry using MCPServerInfo directly
       this.toolRegistry.registerServer(mcpServerInfo);
+
+      // Re-registration replaces options wholesale: omitting `cacheable`
+      // clears a previous `cacheable: false`. A caller replacing a tool whose
+      // results are live state must repeat the flag.
+      if (options?.cacheable === false) {
+        this.uncacheableTools.add(name);
+      } else {
+        this.uncacheableTools.delete(name);
+      }
 
       // Emit tool registration success event
       this.emitter.emit("tools-register:end", {
@@ -12556,6 +13005,7 @@ Current user's request: ${currentInput}`;
     const serverId = `custom-tool-${name}`;
     const removed = this.toolRegistry.unregisterServer(serverId);
     if (removed) {
+      this.uncacheableTools.delete(name);
       logger.info(`Unregistered custom tool: ${name}`);
     }
     return removed;
@@ -12898,8 +13348,15 @@ Current user's request: ${currentInput}`;
     toolName: string,
     params: unknown = {},
     options?: {
+      /** Bound on ONE attempt. */
       timeout?: number;
       maxRetries?: number;
+      /**
+       * Bound on the WHOLE execution — every attempt plus the delays between
+       * them. Defaults to `timeout * (maxRetries + 1)`, which is what the
+       * retry loop already spent, so omitting it changes nothing.
+       */
+      totalTimeoutMs?: number;
       retryDelayMs?: number;
       /** Disable tool result caching for this call */
       disableToolCache?: boolean;
@@ -13069,6 +13526,8 @@ Current user's request: ${currentInput}`;
       | {
           timeout?: number;
           maxRetries?: number;
+          /** Ceiling on the whole execution across every attempt. */
+          totalTimeoutMs?: number;
           retryDelayMs?: number;
           disableToolCache?: boolean;
           bypassBatcher?: boolean;
@@ -13085,6 +13544,7 @@ Current user's request: ${currentInput}`;
     finalOptions: {
       timeout: number;
       maxRetries: number;
+      totalTimeout: number;
       retryDelayMs: number;
       authContext:
         | {
@@ -13157,16 +13617,35 @@ Current user's request: ${currentInput}`;
     );
 
     const toolInfo = this.toolRegistry.getToolInfo(toolName);
+    const attemptTimeout =
+      options?.timeout ??
+      toolInfo?.tool?.timeoutMs ??
+      TOOL_TIMEOUTS.EXECUTION_BATCH_MS;
+    const maxRetries =
+      options?.maxRetries ??
+      toolInfo?.tool?.maxRetries ??
+      RETRY_ATTEMPTS.DEFAULT;
+    const retryDelayMs = options?.retryDelayMs || RETRY_DELAYS.BASE_MS;
     const finalOptions = {
-      timeout:
-        options?.timeout ??
-        toolInfo?.tool?.timeoutMs ??
-        TOOL_TIMEOUTS.EXECUTION_BATCH_MS,
-      maxRetries:
-        options?.maxRetries ??
-        toolInfo?.tool?.maxRetries ??
-        RETRY_ATTEMPTS.DEFAULT,
-      retryDelayMs: options?.retryDelayMs || RETRY_DELAYS.BASE_MS,
+      timeout: attemptTimeout,
+      maxRetries,
+      // Ceiling on the whole execution, not one attempt. The default is what
+      // the retry loop already spent, and that is BOTH terms: every attempt at
+      // full length PLUS the fixed wait between them. Omitting the delays
+      // makes the default ceiling shorter than the envelope it is meant to
+      // reproduce, so `attemptTimeout = min(timeout, remaining)` clamps a
+      // later attempt below its configured timeout — the opposite of the
+      // "unchanged unless you ask for less" contract this default exists to
+      // keep. Before any of this the total was unbounded and merely implied:
+      // a tool that reliably hung burned every attempt at full length, and
+      // the surfaced error reported the per-attempt bound beside the
+      // whole-execution elapsed time, which reads as a timeout that was never
+      // enforced.
+      totalTimeout:
+        options?.totalTimeoutMs ??
+        toolInfo?.tool?.totalTimeoutMs ??
+        attemptTimeout * (maxRetries + 1) + retryDelayMs * maxRetries,
+      retryDelayMs,
       authContext: options?.authContext,
       disableToolCache: options?.disableToolCache,
     };
@@ -13229,23 +13708,63 @@ Current user's request: ${currentInput}`;
           circuitBreakerState: prepared.circuitBreaker.getState(),
         },
       );
+      const maxAttempts = prepared.finalOptions.maxRetries + 1;
+      const totalTimeout = prepared.finalOptions.totalTimeout;
+      const budgetStart = Date.now();
+      const deadline = budgetStart + totalTimeout;
+      let attemptNumber = 0;
       const result: T = await prepared.circuitBreaker.execute(async () => {
         return withRetry(
-          async () =>
-            withTimeout(
+          async () => {
+            attemptNumber++;
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) {
+              throw ErrorFactory.toolTimeout(
+                toolName,
+                totalTimeout,
+                undefined,
+                {
+                  attempt: attemptNumber,
+                  maxAttempts,
+                  attemptTimeoutMs: prepared.finalOptions.timeout,
+                  totalTimeoutMs: totalTimeout,
+                  elapsedMs: Date.now() - budgetStart,
+                  exhausted: true,
+                },
+              );
+            }
+            // Clamping to what is left is what makes the ceiling hard. Gating
+            // retries alone would not: the last attempt could start just under
+            // the deadline and still run a full attempt timeout past it.
+            const attemptTimeout = Math.min(
+              prepared.finalOptions.timeout,
+              remaining,
+            );
+            return withTimeout(
               this.executeToolInternal<T>(
                 toolName,
                 params,
                 prepared.finalOptions,
                 executionContext.hitlState,
               ),
-              prepared.finalOptions.timeout,
-              ErrorFactory.toolTimeout(toolName, prepared.finalOptions.timeout),
-            ),
+              attemptTimeout,
+              ErrorFactory.toolTimeout(toolName, attemptTimeout, undefined, {
+                attempt: attemptNumber,
+                maxAttempts,
+                attemptTimeoutMs: prepared.finalOptions.timeout,
+                totalTimeoutMs: totalTimeout,
+                elapsedMs: Date.now() - budgetStart,
+              }),
+            );
+          },
           {
-            maxAttempts: prepared.finalOptions.maxRetries + 1,
+            maxAttempts,
             delayMs: prepared.finalOptions.retryDelayMs,
-            isRetriable: isRetriableError,
+            // Stop when there is not enough budget left for the retry delay
+            // plus any real work after it.
+            isRetriable: (error: Error) =>
+              Date.now() + prepared.finalOptions.retryDelayMs < deadline &&
+              isRetriableError(error),
             onRetry: (attempt, error) => {
               toolRetryCount = attempt;
               mcpLogger.warn(
@@ -13583,6 +14102,19 @@ Current user's request: ${currentInput}`;
    * - Annotations: skip cache for destructive tools, retry safe tools on failure
    * - Middleware: apply global middleware chain before execution
    */
+  private toolCacheRepeatKey(
+    toolName: string,
+    params: unknown,
+  ): string | undefined {
+    try {
+      return `${toolName}:${JSON.stringify(params) ?? ""}`;
+    } catch {
+      // Unserializable args (circular refs) — no repeat tracking; the
+      // ToolResultCache's own keying handles (or rejects) them as before.
+      return undefined;
+    }
+  }
+
   private async executeToolInternal<T = unknown>(
     toolName: string,
     params: unknown,
@@ -13608,6 +14140,7 @@ Current user's request: ${currentInput}`;
       this.mcpToolResultCache &&
       !options.disableToolCache &&
       !this._disableToolCacheForCurrentRequest &&
+      !this.uncacheableTools.has(toolName) &&
       !toolAnnotations?.destructiveHint;
     const toolResultCache = this.mcpToolResultCache;
 
@@ -13620,12 +14153,25 @@ Current user's request: ${currentInput}`;
             __ctx: options.authContext ?? this.toolExecutionContext,
           }
         : params;
-    if (isCacheEnabled && toolResultCache) {
+    const repeatKey = this._generationTurnActive
+      ? this.toolCacheRepeatKey(toolName, cacheParams)
+      : undefined;
+    const isRepeatCallThisRequest =
+      repeatKey !== undefined &&
+      this._toolCacheKeysServedThisRequest.has(repeatKey);
+    if (repeatKey !== undefined) {
+      this._toolCacheKeysServedThisRequest.add(repeatKey);
+    }
+    if (isCacheEnabled && toolResultCache && !isRepeatCallThisRequest) {
       const cached = toolResultCache.getCachedResult(toolName, cacheParams);
       if (cached !== undefined) {
         logger.debug(`[${functionTag}] Cache HIT for tool: ${toolName}`);
         return cached as T;
       }
+    } else if (isRepeatCallThisRequest) {
+      logger.debug(
+        `[${functionTag}] Repeat call within this request — bypassing tool cache for: ${toolName}`,
+      );
     }
 
     // === MCP ENHANCEMENT: Middleware chain wrapper ===
@@ -14103,19 +14649,14 @@ Current user's request: ${currentInput}`;
     void AIProviderFactory;
     void hasProviderEnvVars;
 
-    const providers = [
-      "openai",
-      "bedrock",
-      "vertex",
-      "googleVertex",
-      "anthropic",
-      "azure",
-      "google-ai",
-      "huggingface",
-      "ollama",
-      "mistral",
-      "litellm",
-    ] as const;
+    // Derived from the descriptor registry instead of a hand-maintained
+    // list — covers all real providers (was previously hardcoded to 11,
+    // including "googleVertex" as a duplicate entry alongside "vertex";
+    // that alias remains resolvable via PROVIDER_ALIAS_INDEX/CLI choices,
+    // it just no longer gets its own separate status-check entry).
+    const providers = ProviderFactory.getAllDescriptors().map(
+      (d) => d.name,
+    ) as readonly string[];
 
     // Test providers with controlled concurrency
     // This reduces total time from 16s (sequential) to ~3s (parallel) while preventing resource exhaustion
@@ -15642,11 +16183,20 @@ Current user's request: ${currentInput}`;
    */
   async executeExternalMCPTool(
     serverId: string,
-    toolName: string,
+    requestedToolName: string,
     parameters: JsonObject,
     options?: { timeout?: number },
   ): Promise<unknown> {
+    // Falls back to the requested name so the catch block below still has
+    // something meaningful to log if resolution itself is what throws.
+    let toolName = requestedToolName;
     try {
+      // Direct-boundary name repair (see resolveDirectMcpToolName): an exact
+      // match returns requestedToolName unchanged, so every existing caller
+      // — including the AI-SDK generation path's createExternalMCPTool,
+      // which always calls with an already-discovered name — is unaffected.
+      toolName = this.resolveDirectMcpToolName(serverId, requestedToolName);
+
       mcpLogger.debug(
         `[NeuroLink] Executing external MCP tool: ${toolName} on ${serverId}`,
       );
@@ -15670,7 +16220,22 @@ Current user's request: ${currentInput}`;
           ? { __ctx: this.toolExecutionContext }
           : {}),
       };
-      if (cacheEnabled && this.mcpToolResultCache) {
+      // Same repeat-within-request bypass as executeToolInternal: a model
+      // re-calling the identical tool+args in one turn wants fresh state.
+      const externalRepeatKey = this._generationTurnActive
+        ? this.toolCacheRepeatKey(toolName, cacheKeyArgs)
+        : undefined;
+      const isExternalRepeatThisRequest =
+        externalRepeatKey !== undefined &&
+        this._toolCacheKeysServedThisRequest.has(externalRepeatKey);
+      if (externalRepeatKey !== undefined) {
+        this._toolCacheKeysServedThisRequest.add(externalRepeatKey);
+      }
+      if (
+        cacheEnabled &&
+        this.mcpToolResultCache &&
+        !isExternalRepeatThisRequest
+      ) {
         const cached = this.mcpToolResultCache.getCachedResult(
           toolName,
           cacheKeyArgs,
@@ -15731,6 +16296,84 @@ Current user's request: ${currentInput}`;
       );
       throw error;
     }
+  }
+
+  /**
+   * Resolve a tool name for a direct external MCP execution
+   * (`executeExternalMCPTool`) against the server's currently discovered
+   * tools.
+   *
+   * `experimental_repairToolCall` only runs inside the AI-SDK's own
+   * streamText/generateText loop (see toolCallRepair.ts), so a near-miss
+   * tool name reaching `executeExternalMCPTool` directly previously had no
+   * recovery at all — just the generic `Tool 'x' not found for server 'y'`
+   * `Error` that `ToolDiscoveryService.executeTool` throws deeper in the
+   * stack. This reuses the same name-matching policy
+   * (`resolveToolName`: case-insensitive exact → unambiguous substring →
+   * Levenshtein) so a repair here is accepted under exactly the rules
+   * already proven for the generation path.
+   *
+   * Exact match is a zero-risk fast path: it is returned unchanged before
+   * any resolution attempt, so every existing caller that already sends a
+   * valid name — including the AI-SDK path's `createExternalMCPTool`, which
+   * always executes with a name it just discovered — sees no behaviour
+   * change.
+   *
+   * Deliberately does NOT attempt a repair when the server is unknown or
+   * not connected: `ExternalServerManager.executeTool` throws distinct,
+   * more accurate errors for those states ("Server 'x' not found" /
+   * "not in connected state"), and resolving against an empty tool list
+   * here would replace those with a misleading "tool not found" instead.
+   */
+  private resolveDirectMcpToolName(
+    serverId: string,
+    requestedName: string,
+  ): string {
+    const server = this.getExternalMCPServer(serverId);
+    if (!server || server.status !== "connected" || !server.client) {
+      return requestedName;
+    }
+
+    const availableNames = this.getExternalMCPServerTools(serverId).map(
+      (tool) => tool.name,
+    );
+    if (availableNames.includes(requestedName)) {
+      return requestedName;
+    }
+
+    const resolution = resolveToolName(requestedName, availableNames);
+    if (!resolution) {
+      throw new ExternalMcpToolNotFoundError(
+        requestedName,
+        serverId,
+        rankToolNameCandidates(requestedName, availableNames),
+      );
+    }
+
+    // Recorded on a short-lived span rather than the method's return value:
+    // executeExternalMCPTool returns the raw upstream tool result verbatim
+    // (widely consumed as-is, e.g. by createExternalMCPTool's execute()),
+    // so wrapping it to carry resolution metadata would be a breaking
+    // change for every existing direct caller.
+    tracers.mcp.startActiveSpan(
+      "neurolink.mcp.toolNameRepair",
+      {
+        attributes: {
+          "mcp.server_id": serverId,
+          "mcp.tool_name.requested": requestedName,
+          "mcp.tool_name.resolved": resolution.name,
+          "mcp.tool_name.repair_strategy": resolution.strategy,
+          ...(resolution.score !== undefined
+            ? { "mcp.tool_name.repair_score": resolution.score }
+            : {}),
+        },
+      },
+      (span) => span.end(),
+    );
+    mcpLogger.info(
+      `[NeuroLink] Repaired external MCP tool name at direct execution boundary: "${requestedName}" → "${resolution.name}" (${resolution.strategy}) on server '${serverId}'`,
+    );
+    return resolution.name;
   }
 
   /**
@@ -16925,6 +17568,16 @@ Current user's request: ${currentInput}`;
 
     const worker = new NeuroLink(workerConfig);
 
+    // The cacheable:false flag lives BESIDE the registry, not in it, so a
+    // shared registry alone would re-enable caching on the worker for exactly
+    // the tools whose results are live state (tasks_list, command_status,
+    // collect_results). The worker inherits the host's full uncacheable set.
+    if (options?.shareToolRegistry !== false) {
+      for (const uncacheableName of this.uncacheableTools) {
+        worker.uncacheableTools.add(uncacheableName);
+      }
+    }
+
     // Constructing an instance rebinds the process-global logger sink to the
     // new instance's emitter — restore the host as the active sink so host
     // log bridges keep flowing while workers come and go.
@@ -17052,6 +17705,510 @@ Current user's request: ${currentInput}`;
   }
 
   /**
+   * Register the task CHECKLIST toolset — `tasks_create`, `tasks_update`,
+   * `tasks_list` — on this instance (TodoWrite-style planning for a
+   * long-running run). Opt-in and idempotent: existing callers see no new
+   * tools until they ask for them.
+   *
+   * The checklist is session state, not conversation state: it lives outside
+   * the message list, so summarization/compaction cannot lose it, and every
+   * tool result returns the whole list so the model re-anchors for free after
+   * a compaction. Read the same state from host code with
+   * {@link getTaskState} — that is all a completeness gate needs.
+   *
+   * Sessions come from the tool execution context. Call
+   * `setToolContext({ sessionId })` (or run the agent through
+   * `runIsolatedAgent`, which stamps one) so the checklist has a stable
+   * identity; a model tool call with no session anywhere falls back to a
+   * single default checklist per instance rather than one per call. A DIRECT
+   * `executeTool("tasks_create", …)` call should pass
+   * `authContext: { sessionId }` — the tool registry otherwise mints a fresh
+   * id for that one call.
+   *
+   * @see {@link getTaskState} for the host-side read
+   */
+  registerTaskTools(): void {
+    if (this.hasTaskChecklistTools) {
+      return;
+    }
+    const tools = createChecklistTools(this);
+    for (const [toolName, toolDef] of Object.entries(tools)) {
+      // Never cacheable: every one of these reads or mutates live checklist
+      // state, so a cached `tasks_list` would report a list that has already
+      // moved on — the exact silent staleness the checklist exists to prevent.
+      this.registerTool(toolName, toolDef, { cacheable: false });
+    }
+    this.hasTaskChecklistTools = true;
+    logger.info(
+      `[NeuroLink] Registered ${Object.keys(tools).length} task checklist tools`,
+    );
+  }
+
+  /**
+   * Read a session's task checklist — synchronous, so a completeness gate is
+   * one line of host code:
+   * `getTaskState(id).items.filter(i => i.status === "pending")`.
+   *
+   * Never throws: an unknown session simply has an empty checklist. Omit
+   * `sessionId` to read the session the tools would currently write to (the
+   * instance's tool-context session, or its default checklist).
+   */
+  getTaskState(sessionId?: string): ChecklistState {
+    return getChecklistState(sessionId ?? resolveChecklistSessionId(this));
+  }
+
+  /**
+   * Drop a session's checklist. Returns whether there was one to drop.
+   * Omit `sessionId` to clear the session the tools currently write to.
+   */
+  clearTaskState(sessionId?: string): boolean {
+    return clearChecklistState(sessionId ?? resolveChecklistSessionId(this));
+  }
+
+  // ========================================
+  // Async Delegation API (N2)
+  // ========================================
+
+  /**
+   * Register the background-delegation toolset — `delegate_task` and
+   * `collect_results` — on this instance. Opt-in and idempotent: existing
+   * callers see no new tools until they ask for them.
+   *
+   * Delegation through {@link registerAgentTool} is synchronous — the loop
+   * blocks on each worker. These tools make it asynchronous: `delegate_task`
+   * returns a `workerId` at once and the agent keeps working, then
+   * `collect_results` claims whichever worker finished FIRST. Concurrency is
+   * bounded by the same process-wide pool `registerAgentTool` uses (raised,
+   * never lowered, by `maxConcurrent`), each worker's FULL report is banked to
+   * a file via {@link bankArtifact}, and the outstanding counts ride along in
+   * every `tasks_list` result so the agent learns a worker landed without
+   * polling.
+   *
+   * @param options - Depth ceiling, pool raise, and queue wait
+   * @see {@link spawnDelegate} for the host-side spawn
+   * @see {@link collectDelegates} for the host-side collect
+   */
+  registerDelegationTools(options?: DelegateRegistrationOptions): void {
+    configureDelegation(this, options);
+    if (this.hasBackgroundDelegationTools) {
+      return;
+    }
+    const tools = createDelegationTools(this);
+    for (const [toolName, toolDef] of Object.entries(tools)) {
+      // Never cacheable: `delegate_task` starts a new worker every call and
+      // `collect_results` claims each outcome exactly once. A cached result
+      // would spawn nothing and hand the same worker back twice.
+      this.registerTool(toolName, toolDef, { cacheable: false });
+    }
+    this.hasBackgroundDelegationTools = true;
+    logger.info(
+      `[NeuroLink] Registered ${Object.keys(tools).length} background delegation tools`,
+    );
+  }
+
+  /**
+   * Start a background worker and get its handle immediately — before it has
+   * run anything, and long before it finishes.
+   *
+   * The worker runs through {@link runIsolatedAgent}: a fresh session on a
+   * worker instance sharing THIS instance's tool registry (so live MCP
+   * connections are reused), waste detection, honest stop reasons. Its
+   * complete report is banked when it settles; the outcome you collect carries
+   * a bounded summary plus the read-back call for the rest.
+   *
+   * @example
+   * ```typescript
+   * const a = await neurolink.spawnDelegate({ task: "Audit the auth changes" });
+   * const b = await neurolink.spawnDelegate({ task: "Review the migrations" });
+   * // …keep working…
+   * const first = await neurolink.collectDelegates({ mode: "any" });
+   * ```
+   *
+   * @param options - Task, scope, context, tool allowlist, budgets
+   * @returns The worker id, spawn time, and whether it is queued for a slot
+   * @throws when the task is empty or the caller is at the depth ceiling
+   */
+  async spawnDelegate(options: DelegateSpawnOptions): Promise<DelegateHandle> {
+    return spawnBackgroundDelegate(this, options);
+  }
+
+  /**
+   * Claim finished background workers — in COMPLETION order, which has nothing
+   * to do with spawn order. Each outcome is handed out exactly once.
+   *
+   * @param request - `{ mode: "any" | "all" }` or `{ workerId }`, plus `waitMs`
+   * @returns Claimed outcomes plus what is still pending/ready
+   */
+  async collectDelegates(
+    request: DelegateCollectRequest,
+  ): Promise<DelegateCollectResult> {
+    return collectBackgroundDelegates(this, request);
+  }
+
+  /**
+   * Cancel background workers: one by id, or every outstanding worker this
+   * instance spawned. Cancelled workers still settle into a claimable outcome
+   * saying so.
+   *
+   * @param workerId - Cancel just this worker; omit to cancel all
+   * @returns How many workers were cancelled
+   */
+  async cancelDelegates(workerId?: string): Promise<number> {
+    return cancelBackgroundDelegates(this, workerId);
+  }
+
+  // ========================================
+  // Artifact Banking API (N3)
+  // ========================================
+
+  /**
+   * This instance's artifact store, created on first use.
+   *
+   * Until now a store existed only when `mcp.outputLimits.strategy` was set to
+   * `"externalize"`, so a caller that just wanted to bank a worker report had
+   * to configure MCP output limits it did not use. This creates one on demand
+   * and registers `retrieve_context` alongside it, so a banked payload is
+   * readable by the model, not only by host code.
+   *
+   * Already-configured instances get the store they already had — the MCP
+   * output normalizer and banking deliberately share one store, so an
+   * externalized tool output and a banked report read back the same way.
+   *
+   * @returns The artifact store backing {@link bankArtifact} / {@link readArtifact}
+   */
+  getArtifactStore(): ArtifactStore {
+    if (!this.mcpArtifactStore) {
+      this.mcpArtifactStore = this.createConfiguredArtifactStore();
+    }
+    // A no-op when the constructor already registered it.
+    this.registerMemoryRetrievalTools();
+    return this.mcpArtifactStore;
+  }
+
+  /**
+   * Replace this instance's artifact store.
+   *
+   * Everything that writes or reads artifacts follows the swap: banking,
+   * `retrieve_context`, host-side `readArtifact`, and the MCP output
+   * normalizer — which is rebuilt here because it captured the previous store
+   * at construction. Assigning the field alone would miss it, and
+   * externalized tool outputs would keep landing in the old backend while
+   * read-backs looked in the new one.
+   *
+   * Call it before the first bank or externalized tool output: artifacts
+   * already in the previous store are not migrated, and their ids stop
+   * resolving through this instance. `artifacts.store` in the constructor
+   * config is the same thing without the ordering concern.
+   *
+   * Ownership: a store you hand in — here or via `artifacts.store` — stays
+   * yours to close. NeuroLink closes only the stores it built itself, when
+   * they are replaced here and on `shutdown()`.
+   *
+   * @param store - Any {@link ArtifactStore}
+   */
+  setArtifactStore(store: ArtifactStore): void {
+    const previous = this.mcpArtifactStore;
+    if (previous === store) {
+      return;
+    }
+    if (previous) {
+      logger.warn(
+        "[NeuroLink] Artifact store replaced — artifacts already written to " +
+          "the previous store will not resolve through this instance",
+      );
+      if (this.ownsArtifactStore && previous.close) {
+        void previous.close().catch((error: unknown) => {
+          logger.warn("[NeuroLink] Previous artifact store close failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }
+    }
+    this.mcpArtifactStore = store;
+    this.ownsArtifactStore = false;
+    this.installOutputNormalizer(store);
+    this.registerMemoryRetrievalTools();
+  }
+
+  /**
+   * Build the store the `artifacts` config (or `STORAGE_TYPE`) asks for. The
+   * Redis connection falls back to conversation memory's, so one
+   * `STORAGE_TYPE=redis` moves sessions and artifacts together.
+   */
+  private createConfiguredArtifactStore(): ArtifactStore {
+    const injected = this.artifactsConfig?.store !== undefined;
+    const store = createArtifactStore(
+      this.artifactsConfig,
+      this.conversationMemoryConfig?.conversationMemory?.redisConfig,
+    );
+    // An injected store is returned as-is by the factory and stays the
+    // caller's; anything else was built here and is this instance's to close.
+    this.ownsArtifactStore = !injected;
+    logger.debug("[NeuroLink] Artifact store initialized", {
+      backend: injected
+        ? "custom"
+        : resolveArtifactStorageType(this.artifactsConfig),
+    });
+    return store;
+  }
+
+  /**
+   * (Re)build the MCP output normalizer over `artifactStore`. A no-op unless
+   * `mcp.outputLimits` was configured — without it nothing is externalized.
+   */
+  private installOutputNormalizer(
+    artifactStore: ArtifactStore | undefined,
+  ): void {
+    if (!this.mcpOutputNormalizerConfig) {
+      return;
+    }
+    this.externalServerManager.setOutputNormalizer(
+      new McpOutputNormalizer(this.mcpOutputNormalizerConfig, artifactStore),
+    );
+    logger.debug("[NeuroLink] MCP output normalizer initialized", {
+      ...this.mcpOutputNormalizerConfig,
+      hasArtifactStore: artifactStore !== undefined,
+    });
+  }
+
+  /**
+   * Bank a payload to a file and get back a pointer to it.
+   *
+   * The payload is stored WHOLE. What you put in the conversation is the
+   * returned `preview` (a bounded head slice) and `readBackHint` (the literal
+   * `retrieve_context` call that fetches the rest) — so a 4 MB worker report
+   * costs a few hundred tokens of context and loses nothing, and compaction
+   * can drop the preview without destroying evidence.
+   *
+   * @example
+   * ```typescript
+   * const ref = await neurolink.bankArtifact(fullReport, {
+   *   kind: "worker-report",
+   *   label: "delegate:auth-review",
+   *   sessionId: "review-1421",
+   * });
+   * // Hand the model ref.preview + ref.readBackHint, never fullReport.
+   * ```
+   *
+   * @param payload  Complete text or JSON. Never truncated.
+   * @param options  `kind` and `label` are required; see {@link BankArtifactOptions}
+   * @returns Id, bounded preview, byte size, and the read-back call
+   */
+  async bankArtifact(
+    payload: string,
+    options: BankArtifactOptions,
+  ): Promise<BankedArtifactRef> {
+    return bankArtifactPayload(this, payload, options);
+  }
+
+  /**
+   * Read a banked payload back from host code — the programmatic twin of the
+   * model's `retrieve_context({ artifactId })` call.
+   *
+   * Omit `page` for the complete payload; pass `{ offset, limit }` to walk a
+   * large one in windows. Returns null when the id is unknown or expired.
+   *
+   * @param id    `artifactId` from a {@link BankedArtifactRef}
+   * @param page  Optional character window
+   */
+  async readArtifact(
+    id: string,
+    page?: ArtifactPageRequest,
+  ): Promise<string | null> {
+    return readBankedArtifact(this, id, page);
+  }
+
+  // ========================================
+  // Background Command API (N4)
+  // ========================================
+
+  /**
+   * Register the background-command toolset — `run_command_bg`,
+   * `command_status`, `command_output`, `command_kill` — on this instance, and
+   * declare what may be executed. Opt-in and idempotent: existing callers see
+   * no new tools until they ask for them.
+   *
+   * A reviewing agent needs to run real commands — a build, a test suite, a
+   * linter whose output is the evidence for a finding — without blocking its
+   * own loop and without losing a byte of what they printed. These tools start
+   * a command detached, write both streams to files as they arrive, and bank
+   * the COMPLETE files as artifacts when the command settles; the conversation
+   * gets a bounded tail plus the read-back call.
+   *
+   * The policy is not optional. `allowedExecutables` is matched exactly
+   * against `argv[0]`, `cwdRoot` is a realpath-checked sandbox, there is never
+   * a shell, and a command that outlives `defaultTimeoutMs` is killed.
+   *
+   * @param policy - What may run, where, for how long, and how loudly
+   * @see {@link startBackgroundCommand} for the host-side start
+   * @see {@link registerGitTools} for read-only git without a general policy
+   */
+  registerBackgroundCommandTools(policy: BackgroundCommandPolicy): void {
+    setCommandPolicy(this, policy);
+    if (this.hasBackgroundCommandTools) {
+      return;
+    }
+    const tools = createBackgroundCommandTools(this);
+    for (const [toolName, toolDef] of Object.entries(tools)) {
+      // Never cacheable: every one of these reads or changes live process
+      // state. A cached `command_status` would report a build that has already
+      // finished as still running, for the whole TTL.
+      this.registerTool(toolName, toolDef, { cacheable: false });
+    }
+    this.hasBackgroundCommandTools = true;
+    logger.info(
+      `[NeuroLink] Registered ${Object.keys(tools).length} background command tools`,
+    );
+  }
+
+  /**
+   * Declare (or replace) what this instance may execute, without registering
+   * the model-facing tools. Host code that only drives
+   * {@link startBackgroundCommand} itself needs nothing more than this.
+   *
+   * @param policy - What may run, where, for how long, and how loudly
+   */
+  setBackgroundCommandPolicy(policy: BackgroundCommandPolicy): void {
+    setCommandPolicy(this, policy);
+  }
+
+  /**
+   * Start a command in the background and get its task id immediately.
+   *
+   * @example
+   * ```typescript
+   * const { taskId } = await neurolink.startBackgroundCommand(
+   *   ["pnpm", "run", "lint"],
+   *   { cwd: repoRoot },
+   * );
+   * // …keep working…
+   * const status = await neurolink.awaitBackgroundCommand(taskId);
+   * const full = await neurolink.readArtifact(status.stdout!.artifactId);
+   * ```
+   *
+   * @param argv - Executable first, one entry per argument. Never a command string.
+   * @param options - cwd (sandboxed), timeout, byte cap, env, label, session
+   * @returns The task id, the argv that ran, and when it started
+   * @throws when no policy is set, argv is malformed, the executable is not
+   *         allowlisted, the policy vetoes it, or the cwd escapes the sandbox
+   */
+  async startBackgroundCommand(
+    argv: string[],
+    options: BackgroundCommandOptions,
+  ): Promise<BackgroundCommandHandle> {
+    return startCommand(this, argv, options);
+  }
+
+  /**
+   * Everything known about one command right now — synchronous, so a
+   * mid-loop monitor costs nothing.
+   *
+   * @param taskId - Task id from {@link startBackgroundCommand}
+   * @throws when the task id is unknown to this instance
+   */
+  getBackgroundCommandStatus(taskId: string): BackgroundCommandStatus {
+    return getCommandStatus(this, taskId);
+  }
+
+  /**
+   * Wait for a command to settle. `timeoutMs` bounds the WAIT, not the
+   * command: when it elapses the current status is returned rather than
+   * thrown, so a caller can poll in bounded steps and never lose the job.
+   *
+   * @param taskId - Task id from {@link startBackgroundCommand}
+   * @param opts - `timeoutMs` to bound the wait
+   */
+  async awaitBackgroundCommand(
+    taskId: string,
+    opts?: { timeoutMs?: number },
+  ): Promise<BackgroundCommandStatus> {
+    return awaitCommand(this, taskId, opts);
+  }
+
+  /**
+   * Kill a running command — SIGTERM, then SIGKILL five seconds later — and
+   * resolve with its settled status. Whatever it printed first is still
+   * banked: killing a command discards the process, never its output.
+   *
+   * @param taskId - Task id from {@link startBackgroundCommand}
+   * @param signal - Signal to send first. Default SIGTERM
+   */
+  async killBackgroundCommand(
+    taskId: string,
+    signal?: NodeJS.Signals,
+  ): Promise<BackgroundCommandStatus> {
+    return killCommand(this, taskId, signal);
+  }
+
+  /**
+   * Read one character window of a command's output straight from its log
+   * file — while it is still running, or long after it finished. Offsets,
+   * `totalSize` and `hasMore` match `retrieve_context` exactly.
+   *
+   * @param taskId - Task id from {@link startBackgroundCommand}
+   * @param page - Which stream, and which window of it
+   */
+  async readBackgroundCommandOutput(
+    taskId: string,
+    page: BackgroundCommandPageRequest,
+  ): Promise<BackgroundCommandOutputPage> {
+    return readCommandOutput(this, taskId, page);
+  }
+
+  // ========================================
+  // Read-only Git Toolset (N4.4)
+  // ========================================
+
+  /**
+   * Register the read-only git toolset — `git_log`, `git_show`, `git_diff`,
+   * `git_blame`, `git_merge_base`, `git_ls_files` — on this instance. Opt-in
+   * and idempotent.
+   *
+   * These are BOUNDED tools, not a shell: the model supplies values (a ref, a
+   * path, a line range), never flags, and each tool assembles a fixed argv
+   * from them. That is what keeps them read-only — a free-form argument string
+   * would carry `--output=<file>` and `diff.external` straight through.
+   *
+   * Registering them widens nothing else: they run under a private
+   * one-executable policy rooted at `repoRoot`, so `run_command_bg` still
+   * cannot execute git, and no general command policy is required.
+   *
+   * @param options - Repository root, plus timeout / byte-cap / preview bounds
+   */
+  registerGitTools(options: GitToolsetOptions): void {
+    configureGitTools(this, options);
+    if (this.hasGitTools) {
+      return;
+    }
+    const tools = createGitTools(this);
+    for (const [toolName, toolDef] of Object.entries(tools)) {
+      // Never cacheable: the working tree moves under these answers.
+      this.registerTool(toolName, toolDef, { cacheable: false });
+    }
+    this.hasGitTools = true;
+    logger.info(
+      `[NeuroLink] Registered ${Object.keys(tools).length} read-only git tools`,
+    );
+  }
+
+  /**
+   * Run one read-only git command from host code, with the same bounding the
+   * tools get: the complete stdout is banked, the result carries a preview and
+   * the read-back call.
+   *
+   * @param args - Git arguments, e.g. `["log", "--oneline"]`. Assembled by the
+   *               caller, which is responsible for every value in them
+   * @param sessionId - Session the command belongs to
+   * @throws when {@link registerGitTools} has not been called
+   */
+  async runGitCommand(
+    args: string[],
+    sessionId?: string,
+  ): Promise<GitToolResult> {
+    return runGitArgs(this, args, sessionId);
+  }
+
+  /**
    * Execute an agent network with the given input.
    *
    * @param network - The agent network to execute
@@ -17172,6 +18329,20 @@ Current user's request: ${currentInput}`;
     const cleanupErrors: Error[] = [];
 
     try {
+      // 0. Kill host-owned background work: a disposed instance must not
+      // leave child processes or delegate workers running.
+      try {
+        await killAllCommands(this);
+        await cancelBackgroundDelegates(this);
+      } catch (error) {
+        const err =
+          error instanceof Error
+            ? error
+            : new Error(`Background work cleanup error: ${String(error)}`);
+        cleanupErrors.push(err);
+        logger.warn("[NeuroLink] Error stopping background work:", error);
+      }
+
       // 1. Flush and shutdown OpenTelemetry
       try {
         logger.debug("[NeuroLink] Flushing and shutting down OpenTelemetry...");
@@ -17208,7 +18379,25 @@ Current user's request: ${currentInput}`;
         }
       }
 
-      // 3. Clear all event listeners to prevent memory leaks
+      // 3. Release the artifact store this instance built (a pooled Redis
+      // connection, for one). Same ownership rule as shutdown(): an injected
+      // store is the caller's to close. Without this step every
+      // construct / use / dispose cycle left the pooled reference acquired.
+      if (this.ownsArtifactStore && this.mcpArtifactStore?.close) {
+        try {
+          await this.mcpArtifactStore.close();
+          logger.debug("[NeuroLink] Artifact store closed");
+        } catch (error) {
+          const err =
+            error instanceof Error
+              ? error
+              : new Error(`Artifact store close error: ${String(error)}`);
+          cleanupErrors.push(err);
+          logger.warn("[NeuroLink] Error closing artifact store:", error);
+        }
+      }
+
+      // 4. Clear all event listeners to prevent memory leaks
       if (this.emitter) {
         try {
           logger.debug("[NeuroLink] Removing all event listeners...");
@@ -17227,7 +18416,7 @@ Current user's request: ${currentInput}`;
         }
       }
 
-      // 4. Clear all circuit breakers
+      // 5. Clear all circuit breakers
       if (this.toolCircuitBreakers && this.toolCircuitBreakers.size > 0) {
         try {
           logger.debug(
@@ -17245,7 +18434,7 @@ Current user's request: ${currentInput}`;
         }
       }
 
-      // 5. Clear all Maps and caches
+      // 6. Clear all Maps and caches
       try {
         logger.debug("[NeuroLink] Clearing maps and caches...");
 
@@ -17307,7 +18496,7 @@ Current user's request: ${currentInput}`;
         }
       }
 
-      // 6. Reset initialization flags
+      // 7. Reset initialization flags
       try {
         logger.debug("[NeuroLink] Resetting initialization state...");
         this.mcpInitialized = false;
@@ -17324,7 +18513,7 @@ Current user's request: ${currentInput}`;
         logger.warn("[NeuroLink] Error resetting state:", error);
       }
 
-      // 6. Log completion
+      // 7. Log completion
       if (cleanupErrors.length === 0) {
         logger.debug("[NeuroLink] ✅ Resource disposal completed successfully");
       } else {

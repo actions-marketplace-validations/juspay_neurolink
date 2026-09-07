@@ -3,6 +3,41 @@
 /**
  * Continuous Test Suite — Claude Proxy
  *
+ * ## Determinism exception (CLAUDE.md rule 15)
+ *
+ * Most of this suite drives the shipped CLI. A handful of cases instead import
+ * `__testHooks` from `claudeProxyRoutes`, plus `loadProxyConfig` and the
+ * accountQuota helpers, to cover 429-cooldown planning, account ordering by
+ * quota, and weekly-expiry ordering. Those are deterministic table-driven
+ * decisions with no live path: reproducing them end to end would mean
+ * provoking a specific sequence of 429s across several real accounts, which
+ * cannot be arranged on demand. `__testHooks` is a test-only export in `src/`
+ * and should shrink as this logic gains a real surface.
+ *
+ * Three further cases import `__openCodeTestHooks` from the proxy CLI command
+ * to cover OpenCode client auto-configuration. Those writers resolve paths
+ * from the environment and are reachable only from `proxy start` and
+ * `proxy setup` — neither of which can be pointed at a throwaway HOME without
+ * starting a real server and a launchd unit. Determinism here buys the one
+ * thing an end-to-end run cannot: asserting what the writer does when the
+ * target CLI is *absent*, which is the case that silently regressed.
+ *
+ * The `Proxy clients:` cases extend that same exception to the configurator
+ * registry (`src/cli/proxy-clients/`). They import the configurators directly
+ * because `detect()`/`apply()`/`restore()` resolve paths from HOME, and the
+ * behaviours worth pinning — refusing to write for an absent CLI, refusing to
+ * restore without a snapshot — are precisely the ones a live `proxy start`
+ * never exercises. `Analyze: exact rates…` is the exception: it drives the
+ * built CLI end to end.
+ *
+ * The `Ledger:` cases and `Accounts: route joins…` take the same exception for
+ * the same reason. The ledger's whole job is what happens to malformed input —
+ * a half-written line, a request logged twice, a token-less record arriving
+ * after a real one — none of which a live proxy can be asked to produce on
+ * demand. `Accounts:` invokes the route handler directly rather than over HTTP
+ * because the assertions are about the shape of the joined payload, not about
+ * transport.
+ *
  * Tests the proxy server end-to-end:
  * - Starts the proxy
  * - Sends real requests through it
@@ -16,10 +51,33 @@
  */
 
 import { spawn, ChildProcess } from "child_process";
+import * as http from "http";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { fileURLToPath } from "url";
+
+// This suite starts a real proxy process. Isolate every path before any proxy
+// module or CLI child can resolve the operator's home directory.
+const TEST_HOME = fs.mkdtempSync(
+  path.join(os.tmpdir(), "neurolink-proxy-e2e-home-"),
+);
+process.env.HOME = TEST_HOME;
+process.env.USERPROFILE = TEST_HOME;
+process.env.XDG_CONFIG_HOME = path.join(TEST_HOME, ".config");
+process.env.NEUROLINK_PROXY_TEST_ISOLATED = "1";
+const LIVE_PROXY_TESTS_ALLOWED =
+  process.env.NEUROLINK_PROXY_TEST_ALLOW_LIVE === "1";
+if (!LIVE_PROXY_TESTS_ALLOWED) {
+  for (const variable of [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+  ]) {
+    delete process.env[variable];
+  }
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -44,7 +102,15 @@ type TestResult = {
 // Color helpers — provided by shared harness
 // ============================================================================
 
-import { defineSuite, log, logSection } from "./helpers/harness.js";
+import {
+  defineSuite,
+  log,
+  logSection,
+  withCaseTimeout,
+  isCaseTimeout,
+} from "./helpers/harness.js";
+
+import type { AccountQuota } from "../src/lib/types/index.js";
 
 const { recordTest, runSuite } = defineSuite("Claude Proxy");
 
@@ -91,98 +157,24 @@ const LAUNCHD_GUARD_MARKERS = [
 
 /**
  * Anthropic model used for the proxy round-trip tests.
- * Reviewer follow-up: previously hardcoded `claude-sonnet-4-20250514` in
- * every request; now matches the rest of the suite by reading
- * `ANTHROPIC_MODEL` (config-parser fixtures at the bottom of the file
- * stay literal because they assert on the YAML they emitted).
+ * The default must remain a currently supported model. An explicit override is
+ * accepted only for an operator-authorized live test run.
  */
-const PROXY_TEST_MODEL =
-  process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514";
+const PROXY_TEST_MODEL = LIVE_PROXY_TESTS_ALLOWED
+  ? process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6"
+  : "claude-sonnet-4-6";
 
-// State file management: the proxy CLI uses a single global state file to
-// prevent multiple instances.  We back it up before our test run and restore
-// it afterwards so an already-running proxy on a different port is unaffected.
+// These paths are inside TEST_HOME. They can never refer to the installed proxy.
 const PROXY_STATE_PATH = path.join(
   os.homedir(),
   ".neurolink",
   "proxy-state.json",
 );
-let savedProxyState: string | null = null;
-let proxyStateExisted = false;
-
-function backupAndClearProxyState(): void {
-  try {
-    savedProxyState = fs.readFileSync(PROXY_STATE_PATH, "utf8");
-    proxyStateExisted = true;
-    fs.unlinkSync(PROXY_STATE_PATH);
-    log("Backed up and cleared existing proxy-state.json", "cyan");
-  } catch {
-    savedProxyState = null; // file did not exist
-    proxyStateExisted = false;
-  }
-}
-
-function restoreProxyState(): void {
-  if (proxyStateExisted && savedProxyState !== null) {
-    try {
-      fs.writeFileSync(PROXY_STATE_PATH, savedProxyState);
-      log("Restored original proxy-state.json", "cyan");
-    } catch {
-      /* best effort */
-    }
-  } else {
-    // File did not exist before tests — remove any file created during tests
-    try {
-      if (fs.existsSync(PROXY_STATE_PATH)) {
-        fs.unlinkSync(PROXY_STATE_PATH);
-        log("Removed proxy-state.json created during tests", "cyan");
-      }
-    } catch {
-      /* best effort */
-    }
-  }
-}
-
-// Claude Code settings backup: the proxy auto-writes ANTHROPIC_BASE_URL into
-// ~/.claude/settings.json.  We snapshot it before the test and restore after.
 const CLAUDE_SETTINGS_PATH = path.join(
   os.homedir(),
   ".claude",
   "settings.json",
 );
-let savedClaudeSettings: string | null = null;
-let claudeSettingsExisted = false;
-
-function backupClaudeSettings(): void {
-  try {
-    savedClaudeSettings = fs.readFileSync(CLAUDE_SETTINGS_PATH, "utf8");
-    claudeSettingsExisted = true;
-  } catch {
-    savedClaudeSettings = null;
-    claudeSettingsExisted = false;
-  }
-}
-
-function restoreClaudeSettings(): void {
-  if (claudeSettingsExisted && savedClaudeSettings !== null) {
-    try {
-      fs.writeFileSync(CLAUDE_SETTINGS_PATH, savedClaudeSettings);
-      log("Restored original Claude settings.json", "cyan");
-    } catch {
-      /* best effort */
-    }
-  } else {
-    // File did not exist before tests — remove any file created during tests
-    try {
-      if (fs.existsSync(CLAUDE_SETTINGS_PATH)) {
-        fs.unlinkSync(CLAUDE_SETTINGS_PATH);
-        log("Removed settings.json created during tests", "cyan");
-      }
-    } catch {
-      /* best effort */
-    }
-  }
-}
 
 /**
  * Start the proxy server as a child process.
@@ -195,11 +187,8 @@ async function startProxy(): Promise<boolean> {
     return false;
   }
 
-  // Remove stale state file so the CLI does not refuse to start
-  backupAndClearProxyState();
-
-  // Backup Claude Code settings (proxy auto-configures ANTHROPIC_BASE_URL)
-  backupClaudeSettings();
+  fs.mkdirSync(path.dirname(PROXY_STATE_PATH), { recursive: true });
+  fs.mkdirSync(path.dirname(CLAUDE_SETTINGS_PATH), { recursive: true });
 
   return new Promise<boolean>((resolve) => {
     proxyProcess = spawn(
@@ -378,6 +367,9 @@ const claudeHeaders: Record<string, string> = {
  * Returns true if credentials exist; false if they should be skipped.
  */
 function hasValidCredentials(): boolean {
+  if (!LIVE_PROXY_TESTS_ALLOWED) {
+    return false;
+  }
   // 1. Check TokenStore compound keys (tokenStore is async, use file check)
   //    The actual file used by TokenStore is "tokens.json" (not "token-store.json").
   const tokenStorePath = path.join(os.homedir(), ".neurolink", "tokens.json");
@@ -557,31 +549,40 @@ async function testProxyModelsEndpoint(): Promise<boolean | null> {
       return false;
     }
     const body = (await resp.json()) as {
-      object?: string;
       data?: Array<{
         id?: string;
-        object?: string;
-        created?: number;
-        owned_by?: string;
+        type?: string;
+        display_name?: string;
+        created_at?: string;
       }>;
+      first_id?: string | null;
+      last_id?: string | null;
+      has_more?: boolean;
     };
 
-    if (body.object !== "list") {
-      log(`Expected object="list", got "${body.object}"`, "red");
-      return false;
-    }
     if (!Array.isArray(body.data) || body.data.length === 0) {
       log("Expected non-empty data array", "red");
       return false;
     }
+    if (
+      typeof body.first_id !== "string" ||
+      typeof body.last_id !== "string" ||
+      typeof body.has_more !== "boolean"
+    ) {
+      log(
+        `Model pagination has incorrect shape: ${JSON.stringify(body)}`,
+        "red",
+      );
+      return false;
+    }
 
-    // Validate shape of each model entry
+    // This is the Anthropic-compatible route, not the OpenAI list schema.
     for (const model of body.data) {
       if (
         typeof model.id !== "string" ||
-        typeof model.object !== "string" ||
-        typeof model.created !== "number" ||
-        typeof model.owned_by !== "string"
+        model.type !== "model" ||
+        typeof model.display_name !== "string" ||
+        typeof model.created_at !== "string"
       ) {
         log(`Model entry has incorrect shape: ${JSON.stringify(model)}`, "red");
         return false;
@@ -597,6 +598,105 @@ async function testProxyModelsEndpoint(): Promise<boolean | null> {
       "red",
     );
     return false;
+  }
+}
+
+/**
+ * Codex CLI model discovery must not 404.
+ *
+ * The Codex CLI refreshes its model list on every invocation, hitting
+ * `GET /backend-api/codex/models?client_version=<v>`. The proxy registered only
+ * the `/responses` route, so that request 404'd and the CLI printed
+ * `failed to refresh available models: unexpected status 404 Not Found` on each
+ * run before silently falling back to a default model — the user's configured
+ * model quietly ignored.
+ *
+ * Driven against the spawned proxy exactly as the CLI drives it, including the
+ * client_version query the CLI sends. Without Codex credentials the relay
+ * cannot reach upstream and answers 401/502/503; that is a correct answer from
+ * a route that exists.
+ *
+ * The tolerated set is an ALLOW-list, not a deny-list, and that distinction is
+ * the whole point. An earlier version accepted anything that was not 404 or
+ * 405 — which meant it also accepted 400, and 400 is precisely what upstream
+ * returns when `client_version` is dropped from the forwarded query. That is
+ * the bug this route was written to fix, so the test passed on the regression
+ * it existed to catch. Any status outside the allow-list now fails.
+ */
+async function testCodexModelsDiscovery(): Promise<boolean | null> {
+  // 200 with credentials; 401 unauthenticated or rejected; 502/503 when
+  // upstream is unreachable or the refresh is transiently unavailable.
+  const ACCEPTED = new Set([200, 401, 502, 503]);
+  try {
+    const resp = await fetchProxy(
+      "/backend-api/codex/models?client_version=0.147.0",
+    );
+    if (resp.status === 404) {
+      log(
+        "Codex model discovery is unroutable — the CLI cannot list models",
+        "red",
+      );
+      return false;
+    }
+    if (resp.status === 405) {
+      log("Codex model discovery rejected the CLI's GET method", "red");
+      return false;
+    }
+    if (resp.status === 400) {
+      log(
+        "Codex model discovery answered 400 — the client_version query is not reaching upstream",
+        "red",
+      );
+      return false;
+    }
+    if (!ACCEPTED.has(resp.status)) {
+      log(
+        `Codex model discovery answered an unexpected status ${resp.status}`,
+        "red",
+      );
+      return false;
+    }
+    log(`Codex /models answered with status ${resp.status}`, "green");
+    return true;
+  } catch (err) {
+    // A transport failure here has two very different causes, and reporting
+    // both the same way is what was wrong before. This used to return false
+    // unconditionally, so a dropped connection to the throwaway proxy THIS
+    // SUITE spawned was reported as "Codex model discovery is unroutable". It
+    // did exactly that twice while `codex exec` was answering correctly
+    // through the same proxy and the route itself returned 200.
+    //
+    // But turning it into an unconditional skip is the opposite error: a route
+    // that deadlocks or resets the connection is a real defect, and it
+    // presents as a transport failure too. So distinguish them with a
+    // precondition rather than a guess — ask whether the proxy is answering at
+    // all. If /status responds, the process is healthy and this route
+    // specifically failed: that is a genuine finding and must FAIL. If /status
+    // is also unreachable, the harness lost its server and this case observed
+    // nothing, which is a SKIP.
+    //
+    // (Most catch blocks in this file return false. That is right for them —
+    // they assert on a response they did receive. This one is bounded by
+    // whether a request could be made at all.)
+    let proxyAlive: boolean;
+    try {
+      const health = await fetchProxy("/status");
+      proxyAlive = health.ok;
+    } catch {
+      proxyAlive = false;
+    }
+    if (proxyAlive) {
+      log(
+        "Codex model discovery threw while the proxy was still answering /status — the route itself failed",
+        "red",
+      );
+      return false;
+    }
+    log(
+      "the spawned proxy stopped answering entirely, so Codex model discovery was never observed",
+      "yellow",
+    );
+    return null;
   }
 }
 
@@ -1299,7 +1399,7 @@ async function testProxyConfigLoading(): Promise<boolean | null> {
 routing:
   modelMappings:
     - from: "test-model-*"
-      to: "claude-sonnet-4-20250514"
+      to: "claude-sonnet-4-6"
       provider: "anthropic"
   passthroughModels:
     - "claude-*"
@@ -1322,7 +1422,7 @@ routing:
       parsed.routing?.modelMappings &&
       parsed.routing.modelMappings.length > 0 &&
       parsed.routing.modelMappings[0].from === "test-model-*" &&
-      parsed.routing.modelMappings[0].to === "claude-sonnet-4-20250514";
+      parsed.routing.modelMappings[0].to === "claude-sonnet-4-6";
     const hasPassthrough =
       parsed.routing?.passthroughModels &&
       parsed.routing.passthroughModels.includes("claude-*");
@@ -1395,6 +1495,4618 @@ async function testProxyShutdown(): Promise<boolean | null> {
   }
 
   log("Proxy shutdown verified", "green");
+  return true;
+}
+
+// ============================================================================
+// Tests: OpenCode client auto-configuration (in-process, throwaway HOME)
+// ============================================================================
+
+/**
+ * OpenCode resolves its global config with the unmodified `xdg-basedir`
+ * package — `XDG_CONFIG_HOME || ~/.config`, with no platform branch. The proxy
+ * used to special-case darwin to `~/Library/Application Support/opencode`,
+ * which OpenCode never reads, so auto-configuration silently no-opped on every
+ * Mac.
+ */
+async function testOpenCodeConfigDirIsXdgOnAllPlatforms(): Promise<boolean> {
+  const { __openCodeTestHooks } =
+    await import("../src/cli/proxy-clients/openCode.js");
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  try {
+    process.env.XDG_CONFIG_HOME = "/tmp/neurolink-xdg-probe";
+    const dir = __openCodeTestHooks.getOpenCodeConfigDir();
+    if (dir !== path.join("/tmp/neurolink-xdg-probe", "opencode")) {
+      log(
+        `OpenCode config dir ignored XDG_CONFIG_HOME on ${process.platform}`,
+        "red",
+      );
+      return false;
+    }
+
+    delete process.env.XDG_CONFIG_HOME;
+    const fallback = __openCodeTestHooks.getOpenCodeConfigDir();
+    if (fallback !== path.join(os.homedir(), ".config", "opencode")) {
+      log(
+        `OpenCode config dir did not fall back to ~/.config on ${process.platform}`,
+        "red",
+      );
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+  }
+}
+
+/**
+ * The writer must report whether it actually wrote. It used to return void, so
+ * the caller printed "Auto-configured OpenCode settings" even when OpenCode was
+ * absent and nothing had been written.
+ */
+async function testOpenCodeWriterReportsWhetherItWrote(): Promise<boolean> {
+  const { __openCodeTestHooks } =
+    await import("../src/cli/proxy-clients/openCode.js");
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-opencode-"));
+  try {
+    // OpenCode absent: the config dir does not exist.
+    process.env.XDG_CONFIG_HOME = path.join(root, "absent");
+    const missing = await __openCodeTestHooks.setOpenCodeProxySettings(
+      "http://127.0.0.1:55669/v1",
+    );
+    if (missing !== false) {
+      log(
+        `OpenCode writer claimed success with no config dir (got ${String(missing)})`,
+        "red",
+      );
+      return false;
+    }
+
+    // OpenCode present: the config dir exists.
+    const present = path.join(root, "present");
+    fs.mkdirSync(path.join(present, "opencode"), { recursive: true });
+    process.env.XDG_CONFIG_HOME = present;
+    const wrote = await __openCodeTestHooks.setOpenCodeProxySettings(
+      "http://127.0.0.1:55669/v1",
+    );
+    if (wrote !== true) {
+      log(
+        `OpenCode writer did not report a successful write (got ${String(wrote)})`,
+        "red",
+      );
+      return false;
+    }
+
+    const written = JSON.parse(
+      fs.readFileSync(__openCodeTestHooks.getOpenCodeConfigPath(), "utf8"),
+    ) as { provider?: { neurolink?: { options?: { baseURL?: string } } } };
+    if (
+      written.provider?.neurolink?.options?.baseURL !==
+      "http://127.0.0.1:55669/v1"
+    ) {
+      log("OpenCode writer did not record the proxy base URL", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// ============================================================================
+// Tests: Gemini CLI Door (GOOGLE_GEMINI_BASE_URL round-trip)
+// ============================================================================
+
+/**
+ * The Gemini CLI (and any `@google/genai`-based client) honours
+ * `GOOGLE_GEMINI_BASE_URL` and, for a non-Vertex client, builds requests as
+ * `{baseUrl}/v1beta/models/{model}:generateContent` — traced from
+ * `getBaseUrl()` / `tModel()` / the `'{model}:generateContent'` template in
+ * `@google/genai`'s bundled client (`node_modules/@google/genai/dist/node/index.cjs`).
+ * That is also the path `src/lib/proxy/geminiFormat.ts`'s header comment says
+ * was "verified live" against this proxy before any route existed, returning
+ * a 404.
+ *
+ * The response shape asserted below matches `buildGeminiResponse()` in
+ * `src/lib/proxy/geminiFormat.ts` exactly: `candidates[0].content.parts[0].text`
+ * plus `usageMetadata.{promptTokenCount,candidatesTokenCount,totalTokenCount}`.
+ *
+ * No Google credential exists in this suite's environment — `GOOGLE_API_KEY`
+ * is deliberately stripped from `process.env` for every non-live run (see the
+ * `LIVE_PROXY_TESTS_ALLOWED` block near the top of this file), and this suite
+ * has no Google/Vertex equivalent of `hasValidCredentials()`. So this test
+ * cannot gate on "do we have creds" the way the Claude `/v1/messages` tests
+ * do — it has to tell "route missing" apart from "route reached, no account
+ * configured" purely from the live HTTP status, per the table in the design
+ * notes.
+ */
+async function testGeminiDoorGenerateContent(): Promise<boolean | null> {
+  try {
+    // --- The assertion that prevents a vacuous pass -------------------------
+    // Before trusting a 404 (or its absence) on the real path, prove the
+    // proxy's default "no route matched" behavior is actually live on this
+    // build: an unrelated, never-registered path must itself 404. If it
+    // doesn't — e.g. some catch-all started answering everything with a
+    // non-404 status — a non-404 on the real Gemini path below would prove
+    // nothing about routing, so this guard fails loudly instead of letting
+    // that happen silently.
+    const sentinel = await fetchProxy(
+      "/__gemini_door_e2e_sentinel_never_registered__",
+    );
+    if (sentinel.status !== 404) {
+      log(
+        `Baseline sentinel path returned ${sentinel.status}, not 404 — ` +
+          "cannot trust 404 as a 'route missing' signal on this build",
+        "red",
+      );
+      return false;
+    }
+
+    // --- Drive the door the way the Gemini CLI does -------------------------
+    const model = process.env.GOOGLE_GEMINI_TEST_MODEL || "gemini-2.5-flash";
+    const resp = await fetchProxy(`/v1beta/models/${model}:generateContent`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        // @google/genai always sends this once an apiKey is configured, even
+        // a throwaway one when pointed at a custom base URL. The Claude and
+        // Codex doors on this proxy never trust the client's own credential
+        // and route through server-managed accounts instead — the Gemini
+        // door is expected to do the same, so this value is inert either way.
+        "x-goog-api-key": "neurolink-proxy-e2e-placeholder",
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: "Reply with exactly: PROXY_TEST_OK" }],
+          },
+        ],
+        generationConfig: { maxOutputTokens: 64, temperature: 0 },
+      }),
+    });
+
+    // A real, well-known model id is used deliberately, not a synthetic one:
+    // `buildGeminiErrorResponse` in geminiFormat.ts takes an arbitrary status,
+    // so a *wired* door could in principle answer an unrecognized model with
+    // a legitimate 404 of its own (mirroring Google's real "model not found"
+    // error). A model the door should recognize keeps a 404 here attributable
+    // to "no route" rather than "bad model" — though this isn't a 100%
+    // guarantee against that collision.
+    if (resp.status === 404) {
+      log(
+        "Gemini door returned 404 — /v1beta/models/:model:generateContent " +
+          "is not routed on this proxy build",
+        "red",
+      );
+      return false;
+    }
+
+    if (resp.status === 400) {
+      // 400 is the door's OWN request-shape rejection: buildGeminiErrorResponse
+      // answers 400 when `contents` is missing or empty. This test builds the
+      // body itself and always sends one user turn, so a 400 means the request
+      // contract moved underneath it — never a missing credential. Skipping
+      // here would report SKIP on exactly the regression this test exists to
+      // catch.
+      const badReqText = await resp.text();
+      log(
+        "Gemini door answered 400 to a well-formed generateContent body — " +
+          `the request-shape contract has changed: ${badReqText.slice(0, 200)}`,
+        "red",
+      );
+      return false;
+    }
+
+    if (!resp.ok) {
+      // No Google account can exist in this suite's isolated TEST_HOME, and
+      // GOOGLE_API_KEY is stripped for every non-live run. Reaching the door
+      // and failing downstream (auth, "no accounts configured", upstream
+      // 5xx, ...) is the expected result without credentials — it proves the
+      // route matched, so it must not fail the test. Only a 404 above, a 400
+      // above, or a 200 with the wrong body below, does that.
+      const errText = await resp.text();
+      log(
+        `Gemini door reachable but returned ${resp.status} without ` +
+          `configured Google accounts (expected): ${errText.slice(0, 200)}`,
+        "yellow",
+      );
+      return null;
+    }
+
+    // --- Route matched AND produced a real answer (live creds only) --------
+    const body = (await resp.json()) as {
+      candidates?: Array<{
+        content?: { parts?: Array<{ text?: string }> };
+      }>;
+      usageMetadata?: {
+        promptTokenCount?: number;
+        candidatesTokenCount?: number;
+        totalTokenCount?: number;
+      };
+    };
+
+    const text = body.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (typeof text !== "string" || text.length === 0) {
+      log(
+        "Gemini door returned 200 but candidates[0].content.parts[0].text " +
+          `is missing/empty: ${JSON.stringify(body).slice(0, 200)}`,
+        "red",
+      );
+      return false;
+    }
+
+    const usage = body.usageMetadata;
+    if (
+      typeof usage?.promptTokenCount !== "number" ||
+      typeof usage?.candidatesTokenCount !== "number" ||
+      typeof usage?.totalTokenCount !== "number"
+    ) {
+      log(
+        "Gemini door returned 200 but usageMetadata is missing " +
+          "promptTokenCount/candidatesTokenCount/totalTokenCount",
+        "red",
+      );
+      return false;
+    }
+
+    log(
+      `Gemini door round-trip OK (model=${model}): "${text.slice(0, 60)}"`,
+      "green",
+    );
+    return true;
+  } catch (err) {
+    log(
+      `Gemini door test error: ${err instanceof Error ? err.message : String(err)}`,
+      "red",
+    );
+    return false;
+  }
+}
+
+/**
+ * Codex was the one configurator with no apply/restore round-trip test.
+ *
+ * It is also the one with the most to get wrong: unlike the other four it edits
+ * TOML by regex rather than round-tripping JSON, it keeps its snapshot in a
+ * sidecar file rather than inside the config, and it rewrites a top-level
+ * selector line that must stay in the preamble — a `model_provider` captured
+ * from inside a `[profiles.*]` table would be written back as the global
+ * selector on restore.
+ *
+ * This drives the real writer against a real config containing exactly that
+ * hazard: a user selector, unrelated keys, and a profile table with its own
+ * model_provider.
+ */
+async function testCodexConfiguratorRoundTrip(): Promise<boolean> {
+  const { __codexClientTestHooks } =
+    await import("../src/cli/proxy-clients/codex.js");
+  const url = "http://127.0.0.1:55669";
+
+  const runCase = async (
+    label: string,
+    preambleSelector: string | null,
+    check: (afterApply: string, afterRestore: string) => string | null,
+  ): Promise<boolean> => {
+    const prevHome = process.env.HOME;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-codex-"));
+    try {
+      process.env.HOME = root;
+      fs.mkdirSync(path.join(root, ".codex"), { recursive: true });
+      const configPath = __codexClientTestHooks.getCodexConfigPath();
+      fs.writeFileSync(
+        configPath,
+        [
+          'model = "gpt-5.1-codex"',
+          ...(preambleSelector ? [preambleSelector] : []),
+          'approval_policy = "on-request"',
+          "",
+          // The hazard: a profile table with its own selector. It must never
+          // be mistaken for the global one.
+          "[profiles.work]",
+          'model_provider = "some-other-provider"',
+          "",
+        ].join("\n"),
+      );
+
+      if (!(await __codexClientTestHooks.setCodexProxySettings(url))) {
+        log(`Codex ${label}: writer reported no write`, "red");
+        return false;
+      }
+      const afterApply = fs.readFileSync(configPath, "utf8");
+      if (!(await __codexClientTestHooks.clearCodexProxySettings(url))) {
+        log(`Codex ${label}: restore reported that it did nothing`, "red");
+        return false;
+      }
+      const afterRestore = fs.readFileSync(configPath, "utf8");
+
+      const failure = check(afterApply, afterRestore);
+      if (failure) {
+        log(`Codex ${label}: ${failure}`, "red");
+        return false;
+      }
+      return true;
+    } finally {
+      if (prevHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = prevHome;
+      }
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  // Case A — the user had a global selector. It must come back verbatim.
+  const withSelector = await runCase(
+    "with a user selector",
+    'model_provider = "openai"',
+    (applied, restored) => {
+      if (!/^model_provider = "neurolink"$/m.test(applied)) {
+        return "apply did not point the selector at the proxy";
+      }
+      if (!applied.includes("[model_providers.neurolink]")) {
+        return "apply did not write its managed provider table";
+      }
+      if (!/^approval_policy = "on-request"$/m.test(applied)) {
+        return "apply disturbed an unrelated top-level key";
+      }
+      if (!/^model_provider = "openai"$/m.test(restored)) {
+        return "restore did not put the user's selector back";
+      }
+      if (restored.includes("neurolink")) {
+        return "restore left its managed block behind";
+      }
+      return null;
+    },
+  );
+  if (!withSelector) {
+    return false;
+  }
+
+  // Case B — no global selector, only a profile's. This is what separates a
+  // preamble-scoped snapshot from a document-wide one: matched document-wide,
+  // the profile's provider is captured and then written back as the GLOBAL
+  // selector, silently repointing every Codex run at another provider.
+  return await runCase("with only a profile selector", null, (_a, restored) => {
+    // Scope to the preamble. A bare /^model_provider/m also matches the line
+    // inside [profiles.work], which is legitimate and must stay.
+    const preamble = restored.split(/^\[/m)[0];
+    if (/^model_provider = /m.test(preamble)) {
+      return "restore invented a global selector the user never had";
+    }
+    if (!restored.includes('model_provider = "some-other-provider"')) {
+      return "restore lost the profile table's own provider";
+    }
+    return null;
+  });
+}
+
+/**
+ * A client config must never be observable in a torn state.
+ *
+ * Every writer did readFileSync then writeFileSync. writeFileSync opens with
+ * O_TRUNC, so between the truncate and the last byte the user's config is
+ * short — and for a real config that is several syscalls wide, not an instant.
+ * Anything reading concurrently, including the CLI the config belongs to, can
+ * load a truncated file; a crash in that window leaves it truncated for good.
+ * Both Qwen's and OpenCode's configs hold live API keys.
+ *
+ * Measured against the pre-fix writer on a 1.4 MB config: 121 torn reads out of
+ * 3,717. This drives the real writer while a separate process reads — separate
+ * because writeFileSync blocks the writer's own event loop, so an in-process
+ * reader is never scheduled during the window it is supposed to catch.
+ */
+async function testClientConfigWritesAreAtomic(): Promise<boolean> {
+  const { __openCodeTestHooks } =
+    await import("../src/cli/proxy-clients/openCode.js");
+  const { spawn } = await import("child_process");
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-atomic-"));
+  const url = "http://127.0.0.1:55669/v1";
+  const probe = path.resolve("test/fixtures/config-reader-probe.mjs");
+  try {
+    fs.mkdirSync(path.join(root, "opencode"), { recursive: true });
+    process.env.XDG_CONFIG_HOME = root;
+    const configPath = __openCodeTestHooks.getOpenCodeConfigPath();
+
+    // Large enough that the write spans multiple syscalls. A small file can be
+    // written in one and would hide the window rather than prove it closed.
+    const filler: Record<string, string> = {};
+    for (let i = 0; i < 20000; i += 1) {
+      filler[`key_${i}`] = `value_${i}_${"x".repeat(40)}`;
+    }
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({ provider: {}, filler }, null, 2),
+    );
+
+    const durationMs = 4000;
+    const deadline = Date.now() + durationMs;
+    const reader = spawn(
+      process.execPath,
+      [probe, configPath, String(deadline)],
+      { stdio: ["ignore", "pipe", "inherit"] },
+    );
+    let out = "";
+    reader.stdout?.on("data", (d: Buffer) => {
+      out += d.toString();
+    });
+
+    let writes = 0;
+    while (Date.now() < deadline) {
+      await __openCodeTestHooks.setOpenCodeProxySettings(url);
+      await __openCodeTestHooks.clearOpenCodeProxySettings(url);
+      writes += 2;
+    }
+    // "close", not "exit", and with an "error" handler: a spawn that fails
+    // outright (ENOENT on the probe path) never emits "exit", so waiting on it
+    // alone hangs this suite forever instead of failing. "close" fires in both
+    // cases, and the guard below turns a probe that never ran into a failure
+    // rather than a hang.
+    await new Promise<void>((resolve) => {
+      reader.on("close", () => resolve());
+      reader.on("error", () => resolve());
+    });
+
+    const parsed = out.trim()
+      ? (JSON.parse(out.trim()) as {
+          total: number;
+          torn: number;
+          unreadable?: number;
+        })
+      : { total: 0, torn: 0, unreadable: 0 };
+    // Reads that never landed prove nothing either way, so they cannot count
+    // toward the sample this test claims to have taken.
+    const observed = parsed.total - (parsed.unreadable ?? 0);
+    if (observed === 0) {
+      log(
+        "atomic-write probe never completed a read; test proved nothing",
+        "red",
+      );
+      return false;
+    }
+    if (parsed.total === 0) {
+      log(
+        "atomic-write probe never read the config; test proved nothing",
+        "red",
+      );
+      return false;
+    }
+    if (writes === 0) {
+      log(
+        "atomic-write probe never wrote the config; test proved nothing",
+        "red",
+      );
+      return false;
+    }
+    if (parsed.torn > 0) {
+      log(
+        `a concurrent reader observed a torn config on ${parsed.torn} of ${parsed.total} reads`,
+        "red",
+      );
+      return false;
+    }
+
+    // A failed rename must not leave scratch files in the user's config dir.
+    const strays = fs
+      .readdirSync(path.dirname(configPath))
+      .filter((f) => f.includes(".tmp") || f.includes("neurolink-"));
+    if (strays.length > 0) {
+      log(`the writer left ${strays.length} scratch file(s) behind`, "red");
+      return false;
+    }
+    log(
+      `${observed} concurrent reads across ${writes} writes, none torn`,
+      "green",
+    );
+    return true;
+  } finally {
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Making a write atomic must not widen who can read the file.
+ *
+ * This is the trap the rename introduces and it is easy to miss. Overwriting in
+ * place leaves the destination's mode alone, so a config the user had locked to
+ * 0600 stayed 0600. A rename replaces the inode, so the destination inherits the
+ * TEMP file's mode — and a temp file created without an explicit mode lands at
+ * 0666 minus umask, i.e. 0644 by default. Without the carry-over, switching to
+ * atomic writes would silently relax every credential file it touched from
+ * owner-only to world-readable. Qwen's and OpenCode's configs hold live API
+ * keys, so that is a local disclosure, not a cosmetic change.
+ *
+ * Driven through the real configurators rather than the writer, because the
+ * whole point is the mode a USER's file ends up with after `proxy start`.
+ */
+async function testClientConfigWritesPreservePermissions(): Promise<boolean> {
+  const { __openCodeTestHooks } =
+    await import("../src/cli/proxy-clients/openCode.js");
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-mode-"));
+  const url = "http://127.0.0.1:55669/v1";
+  const modeOf = (p: string): string =>
+    (fs.statSync(p).mode & 0o777).toString(8);
+
+  try {
+    fs.mkdirSync(path.join(root, "opencode"), { recursive: true });
+    process.env.XDG_CONFIG_HOME = root;
+    const configPath = __openCodeTestHooks.getOpenCodeConfigPath();
+
+    // A user who locked their credential file down. This must survive.
+    fs.writeFileSync(configPath, JSON.stringify({ existing: true }));
+    fs.chmodSync(configPath, 0o600);
+
+    await __openCodeTestHooks.setOpenCodeProxySettings(url);
+    if (modeOf(configPath) !== "600") {
+      log(
+        `apply widened a 0600 config to 0${modeOf(configPath)} — credentials exposed to other local users`,
+        "red",
+      );
+      return false;
+    }
+
+    await __openCodeTestHooks.clearOpenCodeProxySettings(url);
+    if (modeOf(configPath) !== "600") {
+      log(`restore widened a 0600 config to 0${modeOf(configPath)}`, "red");
+      return false;
+    }
+
+    // A config the user deliberately left group-readable keeps that too — the
+    // rule is "carry the mode over", not "force 0600 on everyone".
+    fs.chmodSync(configPath, 0o644);
+    await __openCodeTestHooks.setOpenCodeProxySettings(url);
+    if (modeOf(configPath) !== "644") {
+      log(
+        `apply changed a 0644 config to 0${modeOf(configPath)} instead of preserving it`,
+        "red",
+      );
+      return false;
+    }
+
+    // A config that did not exist yet must not be born world-readable.
+    //
+    // The parent directory must NOT exist when this runs. writeFileAtomic does
+    // its own mkdirSync(dirname, {recursive: true}) for exactly the first-run
+    // case, and an earlier cut of this test wrote into `root/opencode` — which
+    // is created at the top of this function. That made the production mkdir
+    // dead weight here: deleting it would not have failed this test.
+    const freshDir = path.join(root, "opencode", "nested", "first-run");
+    const fresh = path.join(freshDir, "fresh.json");
+    if (fs.existsSync(freshDir)) {
+      log(
+        "the first-run directory already exists — this case no longer covers the absent-parent path",
+        "red",
+      );
+      return false;
+    }
+    const { writeFileAtomic } =
+      await import("../src/cli/proxy-clients/snapshot.js");
+    await writeFileAtomic(fresh, JSON.stringify({ apiKey: "sk-test" }));
+    if (!fs.existsSync(fresh)) {
+      log(
+        "writeFileAtomic did not create the file beneath an absent parent directory",
+        "red",
+      );
+      return false;
+    }
+    if (modeOf(fresh) !== "600") {
+      log(
+        `a newly created credential file landed at 0${modeOf(fresh)} rather than 0600`,
+        "red",
+      );
+      return false;
+    }
+
+    log(
+      "config permissions preserved across apply and restore; new files start at 0600",
+      "green",
+    );
+    return true;
+  } finally {
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Ask the OS for a free TCP port.
+ *
+ * The two cases below spawn their own proxies, and fixed ports made them
+ * collide with anything already listening — including another agent running
+ * this same suite in this worktree, which turned an unrelated concurrent run
+ * into a hard FAIL on EADDRINUSE. Binding port 0 and reading back what the
+ * kernel assigned leaves only the narrow window between close and re-bind,
+ * which is a better race than a guaranteed collision.
+ */
+async function freePort(): Promise<number> {
+  const net = await import("net");
+  return new Promise<number>((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      srv.close(() =>
+        port ? resolve(port) : reject(new Error("no free port")),
+      );
+    });
+  });
+}
+
+/**
+ * Spawn a proxy with its own HOME, its own port, and its own config.
+ *
+ * The suite's shared proxy is fine for a case that only needs a door to
+ * answer, but a case that reads what the proxy *wrote* must own the directory
+ * it reads: the shared log dir accumulates every other case's traffic, and
+ * whether a given record is present depends on suite ordering and on which
+ * earlier cases happened to have credentials. An isolated HOME makes the
+ * observation deterministic instead.
+ */
+async function spawnIsolatedProxy(options: {
+  configYaml?: string;
+  env?: Record<string, string>;
+}): Promise<{ port: number; home: string; stop: () => void } | null> {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "nl-isolated-proxy-"));
+  fs.mkdirSync(path.join(home, ".neurolink"), { recursive: true });
+  if (options.configYaml) {
+    fs.writeFileSync(
+      path.join(home, ".neurolink", "proxy-config.yaml"),
+      options.configYaml,
+    );
+  }
+
+  const port = await freePort();
+  const child = spawn(
+    process.execPath,
+    [
+      path.resolve("dist/cli/index.js"),
+      "proxy",
+      "start",
+      "--port",
+      String(port),
+      "--quiet",
+    ],
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        NEUROLINK_SKIP_MCP: "true",
+        NEUROLINK_PROXY_IGNORE_LAUNCHD: "1",
+        ...(options.env ?? {}),
+      },
+    },
+  );
+
+  // The pipes must be drained. Nothing else in this function reads them, and a
+  // child whose stdout+stderr fills the OS pipe buffer (~64KB) blocks on its
+  // next write — including, potentially, the write that would have served the
+  // /health request this function is waiting on. Accumulating the output also
+  // means a failed spawn can say why.
+  let childOutput = "";
+  child.stdout?.on("data", (chunk: Buffer) => {
+    childOutput += chunk.toString();
+  });
+  child.stderr?.on("data", (chunk: Buffer) => {
+    childOutput += chunk.toString();
+  });
+
+  // Without these the poll loop below cannot learn the child died, so a proxy
+  // that crashes on startup (bad flag, port already bound, throw before
+  // listen) burns the full 45s deadline retrying a connection that will never
+  // be accepted, instead of failing in well under a second.
+  let childExited: string | null = null;
+  child.once("error", (err) => {
+    childExited = `spawn error: ${err.message}`;
+  });
+  child.once("exit", (code, signal) => {
+    childExited = `exited early with code=${code} signal=${signal}`;
+  });
+
+  const stop = () => {
+    child.kill();
+    // The proxy is still flushing its journal when the kill lands, so a plain
+    // rmSync loses a race with it and throws ENOTEMPTY — `force` suppresses
+    // "missing", not "still being written to". That turned a PASSING assertion
+    // into a red test, intermittently, which is worse than either outcome:
+    // the failure names a temp directory and says nothing about the behaviour
+    // under test.
+    //
+    // Retry briefly, then give up silently. Cleanup of a temp directory must
+    // never decide whether a test passed.
+    try {
+      fs.rmSync(home, {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 100,
+      });
+    } catch {
+      // The OS reaps its own temp directory; a leftover here is not a result.
+    }
+  };
+
+  const deadline = Date.now() + 45_000;
+  while (Date.now() < deadline) {
+    // A crashed child will never answer. Check before probing so the common
+    // startup failure costs one poll interval rather than the whole deadline.
+    if (childExited !== null) {
+      log(
+        `isolated proxy ${childExited}${childOutput ? ` — ${childOutput.slice(-400)}` : ""}`,
+        "red",
+      );
+      stop();
+      return null;
+    }
+    try {
+      // Bounded deliberately. Node's fetch has no default request timeout, so
+      // a proxy that accepts the connection and then never answers blocks here
+      // forever — and the loop cannot re-check its own `deadline` while it is
+      // blocked inside the await. The suite's outer withCaseTimeout cannot
+      // rescue it either: Promise.race abandons the loser without cancelling
+      // it, and a case timeout aborts every remaining case in the run.
+      const probe = await fetch(`http://127.0.0.1:${port}/health`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (probe.ok) {
+        return { port, home, stop };
+      }
+    } catch {
+      // not listening yet
+    }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  log(
+    `isolated proxy never became healthy within 45s${childOutput ? ` — ${childOutput.slice(-400)}` : ""}`,
+    "red",
+  );
+  stop();
+  return null;
+}
+
+/**
+ * A multi-turn Gemini request must reach the provider with its history intact.
+ *
+ * The shared engine derives history with `conversationMessages.slice(0, -1)`,
+ * because the final turn is already sent separately as `prompt` — so
+ * claudeFormat and openaiFormat push EVERY turn, the last one included.
+ * geminiFormat pushed only the non-final turns, the intuitive reading of
+ * "history", which left the slice eating a real turn: a three-turn request
+ * arrived at the provider with the assistant's reply deleted.
+ *
+ * Nothing internal is asserted on. A proxy is spawned against a capture server
+ * standing in for the provider's HTTP endpoint, a three-turn generateContent
+ * goes through the real door, and the assertion is on what the provider
+ * actually received. The middle turn is the canary — the exact turn the bug
+ * ate. Both ends of the conversation are the control.
+ */
+async function testGeminiMultiTurnHistoryReachesProvider(): Promise<
+  boolean | null
+> {
+  const MARKERS = {
+    first: "TURN_ONE_USER",
+    canary: "TURN_TWO_MODEL_CANARY",
+    last: "TURN_THREE_USER",
+  };
+
+  let capturedBody: string | undefined;
+  const upstream = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c: Buffer) => {
+      raw += c.toString();
+    });
+    req.on("end", () => {
+      capturedBody = raw;
+      // The engine drives providers through stream(), so a plain JSON body
+      // yields "no content or tool calls" and a 500 at the door. SSE keeps the
+      // door's own answer honest while the capture above does the real work.
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+      });
+      const chunk = (o: unknown) => res.write(`data: ${JSON.stringify(o)}\n\n`);
+      chunk({
+        id: "chatcmpl-capture",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "capture-model",
+        choices: [{ index: 0, delta: { role: "assistant", content: "OK" } }],
+      });
+      chunk({
+        id: "chatcmpl-capture",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "capture-model",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: 10, completion_tokens: 1, total_tokens: 11 },
+      });
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+  });
+
+  const capturePort = await freePort();
+  let proxy: Awaited<ReturnType<typeof spawnIsolatedProxy>> = null;
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      upstream.once("error", reject);
+      upstream.listen(capturePort, "127.0.0.1", () => resolve());
+    });
+
+    proxy = await spawnIsolatedProxy({
+      configYaml: `routing:
+  modelMappings:
+    - from: "gemini-2.5-flash"
+      to: "capture-model"
+      provider: "openai-compatible"
+`,
+      env: {
+        OPENAI_COMPATIBLE_BASE_URL: `http://127.0.0.1:${capturePort}/v1`,
+        OPENAI_COMPATIBLE_API_KEY: "capture-key",
+      },
+    });
+    if (!proxy) {
+      log(
+        "capture proxy never became healthy; history could not be observed",
+        "yellow",
+      );
+      return null;
+    }
+
+    await fetch(
+      `http://127.0.0.1:${proxy.port}/v1beta/models/gemini-2.5-flash:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "user-agent": "neurolink-history-probe/1.0",
+        },
+        // Bounded: Node's fetch has no default timeout, and an unanswered
+        // request here hangs the case past its own bound (Promise.race cannot
+        // cancel the loser), which aborts every remaining case in the run.
+        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify({
+          contents: [
+            { role: "user", parts: [{ text: MARKERS.first }] },
+            { role: "model", parts: [{ text: MARKERS.canary }] },
+            { role: "user", parts: [{ text: MARKERS.last }] },
+          ],
+          generationConfig: { maxOutputTokens: 32 },
+        }),
+      },
+    );
+
+    if (!capturedBody) {
+      log(
+        "the capture upstream was never called; history could not be observed",
+        "yellow",
+      );
+      return null;
+    }
+
+    if (
+      !capturedBody.includes(MARKERS.first) ||
+      !capturedBody.includes(MARKERS.last)
+    ) {
+      log(
+        "the provider received neither end of the conversation; " +
+          "translation did not survive, so history is not observable here",
+        "yellow",
+      );
+      return null;
+    }
+
+    if (!capturedBody.includes(MARKERS.canary)) {
+      log(
+        "the provider received the first and last turns but not the middle " +
+          "one — conversation history is being truncated in translation",
+        "red",
+      );
+      return false;
+    }
+
+    log(
+      "a three-turn Gemini request reaches the provider with every turn intact",
+      "green",
+    );
+    return true;
+  } finally {
+    proxy?.stop();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+}
+
+/**
+ * Continuing from a model turn must reach a provider, not 500 at the door.
+ *
+ * Google lets a client send `contents` whose final entry is a model turn — the
+ * Gemini CLI does exactly that when continuing — and there is no user turn to
+ * become `input.text`. That left `prompt` empty, and NeuroLink's stream()
+ * rejects an empty input before any provider is contacted, so every continue
+ * failed with a 500 and the message "Stream options must include either
+ * input.text, input.audio, or stt.audio".
+ *
+ * This was missed twice over. The review that found the history-slice half of
+ * it proposed a terminal placeholder, which was applied and is correct as far
+ * as it goes — but a placeholder consumed by the slice does nothing about the
+ * prompt, and no case ever sent a model-final request to find out. The
+ * multi-turn case next door covers [user, model, user] only, which always has
+ * a user turn to promote.
+ *
+ * The status assertion is the load-bearing one here: the turns could all
+ * arrive correctly and the request still fail.
+ */
+async function testGeminiModelFinalTurnReachesProvider(): Promise<
+  boolean | null
+> {
+  const MARKERS = { user: "MF_USER_ONE", model: "MF_MODEL_FINAL_CANARY" };
+
+  let capturedBody: string | undefined;
+  const upstream = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c: Buffer) => {
+      raw += c.toString();
+    });
+    req.on("end", () => {
+      capturedBody = raw;
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+      });
+      const chunk = (o: unknown) => res.write(`data: ${JSON.stringify(o)}\n\n`);
+      chunk({
+        id: "chatcmpl-capture",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "capture-model",
+        choices: [{ index: 0, delta: { role: "assistant", content: "OK" } }],
+      });
+      chunk({
+        id: "chatcmpl-capture",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "capture-model",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: 8, completion_tokens: 1, total_tokens: 9 },
+      });
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+  });
+
+  const capturePort = await freePort();
+  let proxy: Awaited<ReturnType<typeof spawnIsolatedProxy>> = null;
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      upstream.once("error", reject);
+      upstream.listen(capturePort, "127.0.0.1", () => resolve());
+    });
+
+    proxy = await spawnIsolatedProxy({
+      configYaml: `routing:
+  modelMappings:
+    - from: "gemini-2.5-flash"
+      to: "capture-model"
+      provider: "openai-compatible"
+`,
+      env: {
+        OPENAI_COMPATIBLE_BASE_URL: `http://127.0.0.1:${capturePort}/v1`,
+        OPENAI_COMPATIBLE_API_KEY: "capture-key",
+      },
+    });
+    if (!proxy) {
+      log(
+        "capture proxy never became healthy; the model-final path could not be observed",
+        "yellow",
+      );
+      return null;
+    }
+
+    const resp = await fetch(
+      `http://127.0.0.1:${proxy.port}/v1beta/models/gemini-2.5-flash:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "user-agent": "neurolink-model-final-probe/1.0",
+        },
+        // Bounded: Node's fetch has no default timeout, and an unanswered
+        // request here hangs the case past its own bound (Promise.race cannot
+        // cancel the loser), which aborts every remaining case in the run.
+        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify({
+          // No trailing user turn — this is the continue-from-model shape.
+          contents: [
+            { role: "user", parts: [{ text: MARKERS.user }] },
+            { role: "model", parts: [{ text: MARKERS.model }] },
+          ],
+          generationConfig: { maxOutputTokens: 32 },
+        }),
+      },
+    );
+
+    if (resp.status !== 200) {
+      log(
+        `continuing from a model turn answered ${resp.status} instead of 200 — ` +
+          "the door is failing the CLI's continue flow",
+        "red",
+      );
+      return false;
+    }
+
+    if (!capturedBody) {
+      log(
+        "the capture upstream was never called on a model-final request",
+        "red",
+      );
+      return false;
+    }
+
+    if (
+      !capturedBody.includes(MARKERS.user) ||
+      !capturedBody.includes(MARKERS.model)
+    ) {
+      log(
+        "a model-final request reached the provider without its full history",
+        "red",
+      );
+      return false;
+    }
+
+    log(
+      "continuing from a model turn reaches the provider, with both turns intact",
+      "green",
+    );
+    return true;
+  } finally {
+    proxy?.stop();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+}
+
+/**
+ * Every inbound door must be covered by the tracking middleware.
+ *
+ * Hono matches a wildcard one path segment at a time, so `app.use("/v1/*")`
+ * does NOT cover `/v1beta/models/...` — the segment is `v1beta`, not `v1`.
+ * The Gemini door landed matching neither `/v1/*` nor `/backend-api/*`, so its
+ * requests were invisible to the request log, to per-CLI attribution, and to
+ * the in-flight counter the graceful drain waits on — an auto-update could
+ * therefore cut a live Gemini stream mid-answer.
+ *
+ * Observed the way an operator would: drive the real doors over HTTP, then
+ * read the lifecycle journal the proxy itself wrote. No credentials are needed
+ * — `request_accepted` is emitted BEFORE `next()`, so the record exists
+ * whether or not an account is configured downstream. The proxy is isolated so
+ * the journal contains this case's traffic and nothing else.
+ */
+async function testEveryDoorIsTracked(): Promise<boolean | null> {
+  const proxy = await spawnIsolatedProxy({});
+  if (!proxy) {
+    log(
+      "isolated proxy never became healthy; door tracking could not be observed",
+      "yellow",
+    );
+    return null;
+  }
+
+  try {
+    // One request per door, so a regression naming only one of them stays
+    // attributable to that door rather than to "tracking is off everywhere".
+    const doors = [
+      {
+        path: "/v1/messages",
+        body: {
+          model: "claude-sonnet-4-5",
+          max_tokens: 1,
+          messages: [{ role: "user", content: "hi" }],
+        },
+      },
+      {
+        path: "/v1beta/models/gemini-2.5-flash:generateContent",
+        body: {
+          contents: [{ role: "user", parts: [{ text: "hi" }] }],
+          generationConfig: { maxOutputTokens: 1 },
+        },
+      },
+    ];
+
+    for (const door of doors) {
+      await fetch(`http://127.0.0.1:${proxy.port}${door.path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "user-agent": "neurolink-door-tracking-probe/1.0",
+        },
+        // Bounded for the same reason as the probes above: an unanswered door
+        // would hang the case and take the rest of the run with it.
+        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify(door.body),
+      });
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    const lifecyclePath = path.join(
+      proxy.home,
+      ".neurolink",
+      "logs",
+      `proxy-lifecycle-${today}.jsonl`,
+    );
+
+    // Written by a queued async writer. Poll for the records rather than
+    // sleeping a guessed interval, so a loaded machine reports the real answer
+    // instead of "unobservable".
+    const trackedPaths = new Set<string>();
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      if (fs.existsSync(lifecyclePath)) {
+        for (const line of fs
+          .readFileSync(lifecyclePath, "utf8")
+          .split("\n")
+          .filter((l) => l.trim())) {
+          try {
+            const rec = JSON.parse(line) as { event?: string; path?: string };
+            if (rec.event === "request_accepted" && rec.path) {
+              trackedPaths.add(rec.path);
+            }
+          } catch {
+            // partial trailing line
+          }
+        }
+      }
+      if (trackedPaths.size >= doors.length) {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 300));
+    }
+
+    // The Anthropic door is the control: if IT is missing, tracking is off for
+    // reasons unrelated to the fix and this run proves nothing either way.
+    if (![...trackedPaths].some((p) => p.startsWith("/v1/messages"))) {
+      log(
+        "the control door produced no lifecycle record; " +
+          "tracking is not observable on this build",
+        "yellow",
+      );
+      return null;
+    }
+
+    if (![...trackedPaths].some((p) => p.startsWith("/v1beta/models/"))) {
+      log(
+        "the Gemini door produced no lifecycle record while the control door " +
+          "did — /v1beta/* is not covered by the tracking middleware",
+        "red",
+      );
+      return false;
+    }
+
+    log(
+      "every inbound door reaches the tracking middleware (anthropic + gemini)",
+      "green",
+    );
+    return true;
+  } finally {
+    proxy.stop();
+  }
+}
+
+/**
+ * Usage must be attributable to the CLI that spent it, not only the account.
+ *
+ * The proxy already derived a client label from User-Agent, then dropped it
+ * into an OTel span attribute and nothing else. The request log never carried
+ * it, so the ledger could group by account and by nothing else — a pooled
+ * operator could see that an account burned $40 today but not whether it was
+ * Claude Code or a runaway script.
+ *
+ * Driven the way the CLIs drive it: real requests to a spawned proxy carrying
+ * real User-Agent headers, then the attribution read back out of the log the
+ * proxy itself wrote. Nothing here is stubbed.
+ */
+async function testPerClientAttribution(): Promise<boolean | null> {
+  const logsDir = path.join(os.homedir(), ".neurolink", "logs");
+  const today = new Date().toISOString().slice(0, 10);
+  const logPath = path.join(logsDir, `proxy-${today}.jsonl`);
+  const sizeBefore = fs.existsSync(logPath) ? fs.statSync(logPath).size : 0;
+
+  // Every string here was captured from the real CLI — from this machine's
+  // proxy request log, or from a header-capture server the CLI was pointed at.
+  // None is invented, which is the standing rule for this table: a guessed
+  // prefix that never matches is indistinguishable from one that works.
+  //
+  // The last three MUST stay unknown, and are pinned so a later "helpful"
+  // mapping fails this test instead of silently misfiling unrelated traffic.
+  // `OpenAI/JS` is the stock OpenAI SDK UA, sent by every caller of that SDK —
+  // Copilot CLI among them, which is why Copilot cannot be named this way. The
+  // MSIE string is not a CLI's UA at all: it is what curl sends on a host whose
+  // ~/.curlrc sets one, so it is shared by every curl-driven caller there.
+  const agents = [
+    { ua: "claude-cli/2.1.223 (external, cli)", expect: "claude-code" },
+    {
+      ua: "opencode/1.3.13 ai-sdk/provider-utils/4.0.21 runtime/bun/1.3.13",
+      expect: "opencode",
+    },
+    { ua: "QwenCode/0.17.0 (darwin; arm64)", expect: "qwen-code" },
+    {
+      ua: "GeminiCLI-tui/0.53.0/gemini-3.1-pro-preview (darwin; arm64; terminal)",
+      expect: "gemini-cli",
+    },
+    { ua: "codex_exec/0.147.0 (Mac OS 26.6.0; arm64)", expect: "codex" },
+    { ua: "some-unreleased-cli/9.9.9", expect: "unknown" },
+    // Copilot CLI's own request.
+    { ua: "OpenAI/JS 5.20.1", expect: "unknown" },
+    // Any curl caller on a host with a user-agent in ~/.curlrc.
+    {
+      ua: "Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; Trident/5.0)",
+      expect: "unknown",
+    },
+  ];
+  for (const a of agents) {
+    await fetchProxy("/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "user-agent": a.ua },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-5",
+        max_tokens: 1,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+  }
+
+  if (!fs.existsSync(logPath)) {
+    log(
+      "proxy wrote no request log; attribution could not be observed",
+      "yellow",
+    );
+    return null;
+  }
+  // sizeBefore is a BYTE offset from statSync. Slicing a decoded string by it
+  // counts UTF-16 code units instead, so one multi-byte character anywhere in
+  // the earlier log shifts the cut and the first "appended" line arrives
+  // truncated mid-JSON. Slice the buffer, then decode.
+  const appended = fs
+    .readFileSync(logPath)
+    .subarray(sizeBefore)
+    .toString("utf8")
+    .split("\n")
+    .filter((l) => l.trim());
+  if (appended.length === 0) {
+    log(
+      "proxy appended no log lines; attribution could not be observed",
+      "yellow",
+    );
+    return null;
+  }
+
+  // Keyed by User-Agent, not by clientApp. Four of the callers above are
+  // expected to classify as "unknown", and a clientApp-keyed map would let
+  // them overwrite each other — turning a wrong answer for one caller into a
+  // pass as long as any single unknown row landed.
+  const seen = new Map<string, string>();
+  for (const line of appended) {
+    try {
+      const rec = JSON.parse(line) as {
+        clientApp?: string;
+        userAgent?: string;
+      };
+      if (rec.clientApp && rec.userAgent) {
+        seen.set(rec.userAgent, rec.clientApp);
+      }
+    } catch {
+      // partial trailing line
+    }
+  }
+
+  for (const a of agents) {
+    const actual = seen.get(a.ua);
+    if (actual === undefined) {
+      // Precondition, not a result: a UA that never reached the log says
+      // nothing about how it would have been classified. Fail loudly rather
+      // than let a request that never happened read as agreement.
+      log(`no request log row carried the User-Agent for ${a.expect}`, "red");
+      return false;
+    }
+    if (actual !== a.expect) {
+      log(
+        `attribution mismatch — a caller expected to classify as ${a.expect} ` +
+          `classified as ${actual} instead`,
+        "red",
+      );
+      return false;
+    }
+  }
+  // The raw header must survive for the client the classifier cannot name,
+  // otherwise every unrecognised CLI collapses into one indistinguishable
+  // bucket and the feature is useless exactly where it is most needed.
+  if (!seen.has("some-unreleased-cli/9.9.9")) {
+    log("an unrecognised client lost its raw User-Agent", "red");
+    return false;
+  }
+  log(`attributed ${seen.size} distinct clients from live traffic`, "green");
+  return true;
+}
+
+/**
+ * Every CLI the proxy configures must be one the proxy can also name.
+ *
+ * These two rosters are maintained in different files by different reflexes —
+ * you add a configurator to onboard a CLI, and you add a User-Agent prefix
+ * only once you have watched that CLI's traffic. They drifted apart in exactly
+ * that gap: five configurators shipped while CLIENT_PREFIXES still knew only
+ * Claude Code, so five of six CLIs were filed as "unknown" and the per-client
+ * usage feature reported one bucket while looking entirely healthy. Nothing
+ * failed, because an unattributed client is indistinguishable from a quiet one.
+ *
+ * So the check is structural rather than behavioural: adding a configurator
+ * now fails here until someone either measures its User-Agent or writes down
+ * why it cannot be measured.
+ */
+const UNATTRIBUTABLE_CLIENTS: ReadonlyMap<string, string> = new Map([
+  [
+    "copilot",
+    "sends the stock `OpenAI/JS <version>` SDK User-Agent, which every caller " +
+      "of that SDK sends; mapping it would misfile unrelated traffic",
+  ],
+]);
+
+async function testEveryConfiguredClientIsAttributable(): Promise<boolean> {
+  const { PROXY_CLIENT_CONFIGURATORS } =
+    await import("../src/cli/proxy-clients/registry.js");
+  const { getMappedClientNames } =
+    await import("../src/lib/proxy/clientAttribution.js");
+  const mapped = getMappedClientNames();
+
+  // Precondition. An empty or tiny roster would make every assertion below
+  // pass by having nothing to check, which is the failure mode this whole
+  // suite keeps rediscovering.
+  if (PROXY_CLIENT_CONFIGURATORS.length < 5) {
+    log(
+      "configurator roster looks truncated; the check would be vacuous",
+      "red",
+    );
+    return false;
+  }
+
+  for (const client of PROXY_CLIENT_CONFIGURATORS) {
+    if (mapped.has(client.id)) {
+      continue;
+    }
+    const reason = UNATTRIBUTABLE_CLIENTS.get(client.id);
+    if (!reason) {
+      log(
+        `a configured client has no User-Agent mapping and no recorded reason ` +
+          `for lacking one — measure its User-Agent and add the prefix, or add ` +
+          `it to UNATTRIBUTABLE_CLIENTS saying why that is impossible`,
+        "red",
+      );
+      return false;
+    }
+  }
+
+  // The exception list must not outlive its exceptions either: an entry for a
+  // client that has since been mapped, or removed, is stale documentation that
+  // would let a real regression hide behind it.
+  for (const id of UNATTRIBUTABLE_CLIENTS.keys()) {
+    const stillConfigured = PROXY_CLIENT_CONFIGURATORS.some((c) => c.id === id);
+    if (!stillConfigured) {
+      log(
+        "an unattributable-client exception names a client that is no longer configured",
+        "red",
+      );
+      return false;
+    }
+    if (mapped.has(id)) {
+      log(
+        "an unattributable-client exception names a client that is now mapped",
+        "red",
+      );
+      return false;
+    }
+  }
+
+  log(
+    `all ${PROXY_CLIENT_CONFIGURATORS.length} configured clients are either ` +
+      `attributable or documented as not being so`,
+    "green",
+  );
+  return true;
+}
+
+/**
+ * Restoring must require proving we own the value, not just the URL.
+ *
+ * The base-URL check catches a user who repointed the client somewhere else,
+ * but not one who kept the proxy URL and changed something beside it — a
+ * rotated key, an added field. Those edits were silently reverted to the
+ * snapshot on shutdown. Now that each writer records exactly what it wrote,
+ * a value that no longer matches that record is the user's: restore leaves it
+ * alone and only clears the proxy's own bookkeeping keys.
+ */
+async function testQwenRestoreLeavesUserEditedAuth(): Promise<boolean> {
+  const { __qwenCodeTestHooks } =
+    await import("../src/cli/proxy-clients/qwenCode.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-qwen-own-"));
+  const url = "http://127.0.0.1:55669/v1";
+  try {
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, ".qwen"), { recursive: true });
+    const settingsPath = __qwenCodeTestHooks.getQwenSettingsPath();
+    fs.writeFileSync(
+      settingsPath,
+      JSON.stringify(
+        {
+          $version: 2,
+          security: {
+            auth: {
+              selectedType: "openai",
+              baseUrl: "https://gateway.example.com/v1",
+              apiKey: "original-key",
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await __qwenCodeTestHooks.setQwenProxySettings(url);
+
+    // Still pointed at the proxy, but the user rotated the key beside it.
+    const live = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    (
+      (live.security as Record<string, unknown>).auth as Record<string, unknown>
+    ).apiKey = "rotated-by-user";
+    fs.writeFileSync(settingsPath, JSON.stringify(live, null, 2));
+
+    await __qwenCodeTestHooks.clearQwenProxySettings(url);
+
+    const after = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as {
+      security?: { auth?: { apiKey?: string } };
+      __proxy_original_qwen_auth?: unknown;
+      __proxy_written_qwen_auth?: unknown;
+    };
+    if (after.security?.auth?.apiKey !== "rotated-by-user") {
+      log("Qwen restore reverted a credential the user changed", "red");
+      return false;
+    }
+    if (
+      "__proxy_original_qwen_auth" in after ||
+      "__proxy_written_qwen_auth" in after
+    ) {
+      log("Qwen restore left its bookkeeping keys in the user's file", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/** See testQwenRestoreLeavesUserEditedAuth — same rule, Claude's env map. */
+async function testClaudeRestoreLeavesUserEditedValue(): Promise<boolean> {
+  const { __claudeCodeTestHooks } =
+    await import("../src/cli/proxy-clients/claudeCode.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-claude-own-"));
+  const url = "http://127.0.0.1:55669";
+  try {
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, ".claude"), { recursive: true });
+    const settingsPath = __claudeCodeTestHooks.getClaudeSettingsPath();
+    // The user had no ENABLE_TOOL_SEARCH at all, so the snapshot records
+    // "absent" and a restore would delete the key outright.
+    fs.writeFileSync(settingsPath, JSON.stringify({ env: {} }, null, 2));
+
+    await __claudeCodeTestHooks.setClaudeProxySettings(url);
+
+    // Base URL untouched, but the user turned tool search back off.
+    const live = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    (live.env as Record<string, string>).ENABLE_TOOL_SEARCH = "false";
+    fs.writeFileSync(settingsPath, JSON.stringify(live, null, 2));
+
+    await __claudeCodeTestHooks.clearClaudeProxySettings(url);
+
+    const after = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as {
+      env?: Record<string, string>;
+    };
+    if (after.env?.ENABLE_TOOL_SEARCH !== "false") {
+      log("Claude restore overwrote a value the user changed", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/** See testQwenRestoreLeavesUserEditedAuth — same rule, OpenCode's block. */
+async function testOpenCodeRestoreLeavesUserEditedBlock(): Promise<boolean> {
+  const { __openCodeTestHooks } =
+    await import("../src/cli/proxy-clients/openCode.js");
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-oc-own-"));
+  const url = "http://127.0.0.1:55669/v1";
+  try {
+    fs.mkdirSync(path.join(root, "opencode"), { recursive: true });
+    process.env.XDG_CONFIG_HOME = root;
+    const configPath = __openCodeTestHooks.getOpenCodeConfigPath();
+    fs.writeFileSync(configPath, JSON.stringify({ provider: {} }, null, 2));
+
+    await __openCodeTestHooks.setOpenCodeProxySettings(url);
+
+    // Same baseURL, but the user pinned a model list on our block.
+    const live = JSON.parse(fs.readFileSync(configPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    (
+      (live.provider as Record<string, unknown>).neurolink as Record<
+        string,
+        unknown
+      >
+    ).models = { "gpt-5.1": {} };
+    fs.writeFileSync(configPath, JSON.stringify(live, null, 2));
+
+    await __openCodeTestHooks.clearOpenCodeProxySettings(url);
+
+    const after = JSON.parse(fs.readFileSync(configPath, "utf8")) as {
+      provider?: { neurolink?: { models?: Record<string, unknown> } };
+    };
+    if (!after.provider?.neurolink?.models?.["gpt-5.1"]) {
+      log("OpenCode restore discarded a field the user added", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Regression: `proxy uninstall` must put every client config back.
+ *
+ * The shutdown path restores only on SIGINT. A launchd-managed service never
+ * receives one — `launchctl unload` and `proxy uninstall` both send SIGTERM,
+ * and the supervisor's own shutdown closure never touched client configs at
+ * all. So the documented one-command install left all five CLIs pointing at a
+ * socket that stopped answering, with no message saying why.
+ *
+ * Driven through the built CLI rather than the module, because the defect was
+ * precisely that the wiring was missing: a test that called the helper
+ * directly would have passed the whole time the bug existed.
+ */
+async function testUninstallRestoresClientConfigs(): Promise<boolean | null> {
+  if (process.platform !== "darwin") {
+    log("proxy uninstall is macOS-only; skipping on this platform", "yellow");
+    return null;
+  }
+  const cliEntry = path.join(process.cwd(), "dist", "cli", "index.js");
+  if (!fs.existsSync(cliEntry)) {
+    log("dist/cli/index.js not built; skipping", "yellow");
+    return null;
+  }
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-uninstall-"));
+  try {
+    // A proxy that ran on this host/port and pointed OpenCode at itself.
+    fs.mkdirSync(path.join(home, ".neurolink"), { recursive: true });
+    fs.writeFileSync(
+      path.join(home, ".neurolink", "proxy-state.json"),
+      JSON.stringify({
+        pid: 2147483000,
+        port: 55669,
+        host: "127.0.0.1",
+        strategy: "round-robin",
+        startTime: new Date(0).toISOString(),
+      }),
+    );
+
+    const openCodeDir = path.join(home, ".config", "opencode");
+    fs.mkdirSync(openCodeDir, { recursive: true });
+    const openCodePath = path.join(openCodeDir, "opencode.json");
+    fs.writeFileSync(
+      openCodePath,
+      JSON.stringify(
+        {
+          provider: {
+            neurolink: {
+              id: "neurolink",
+              name: "NeuroLink Proxy",
+              npm: "@ai-sdk/openai-compatible",
+              env: [],
+              models: {},
+              options: {
+                baseURL: "http://127.0.0.1:55669/v1",
+                apiKey: "neurolink-proxy",
+              },
+            },
+          },
+          __proxy_original_neurolink: { name: "user's own block" },
+        },
+        null,
+        2,
+      ),
+    );
+
+    const { execFileSync } = await import("node:child_process");
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home };
+    delete env.XDG_CONFIG_HOME;
+    try {
+      execFileSync(process.execPath, [cliEntry, "proxy", "uninstall"], {
+        env,
+        encoding: "utf8",
+        stdio: "pipe",
+        timeout: 60_000,
+      });
+    } catch {
+      // uninstall exits non-zero when nothing is installed; the restore is
+      // what this test is about, and it is asserted below either way.
+    }
+
+    const after = JSON.parse(fs.readFileSync(openCodePath, "utf8")) as {
+      provider?: { neurolink?: { name?: string } };
+    };
+    if (after.provider?.neurolink?.name !== "user's own block") {
+      log("proxy uninstall left OpenCode pointing at the removed proxy", "red");
+      return false;
+    }
+    // The shipped CLI must also strip the legacy in-file snapshot keys. This is
+    // the one place the built artifact — not the source hooks — is observed
+    // healing a config the previous writer corrupted; OpenCode rejects unknown
+    // top-level keys, so leaving them behind keeps the CLI unstartable even
+    // after a clean uninstall.
+    const leftover = Object.keys(
+      after as unknown as Record<string, unknown>,
+    ).filter((k) => k.startsWith("__proxy_"));
+    if (leftover.length > 0) {
+      log(
+        `proxy uninstall left ${leftover.length} proxy-private top-level key(s) in opencode.json`,
+        "red",
+      );
+      return false;
+    }
+    return true;
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The assertion whose absence let two fatal defects ship.
+ *
+ * The existing OpenCode coverage checked that the writer wrote, returned the
+ * right boolean, and recorded the base URL — all true of a config OpenCode
+ * refuses to load. Nothing checked the output was *usable*, so both of these
+ * shipped and bricked the CLI on every invocation:
+ *
+ *   Unrecognized keys: "__proxy_original_neurolink", "__proxy_written_neurolink"
+ *   ProviderModelNotFoundError: providerID "neurolink", suggestions: []
+ *
+ * OpenCode rejects unknown top-level keys, and resolves `--model` against
+ * `provider.<id>.models` alone. These two properties are what "usable" means
+ * for this file; assert them directly rather than trusting the writer.
+ */
+async function testOpenCodeWriterOutputIsLoadable(): Promise<boolean> {
+  const { __openCodeTestHooks } =
+    await import("../src/cli/proxy-clients/openCode.js");
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-oc-load-"));
+  try {
+    process.env.XDG_CONFIG_HOME = path.join(root, "config");
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, "config", "opencode"), { recursive: true });
+    await __openCodeTestHooks.setOpenCodeProxySettings(
+      "http://127.0.0.1:55669/v1",
+    );
+    const written = JSON.parse(
+      fs.readFileSync(__openCodeTestHooks.getOpenCodeConfigPath(), "utf8"),
+    ) as Record<string, unknown>;
+
+    const unknownTopLevel = Object.keys(written).filter((k) =>
+      k.startsWith("__proxy_"),
+    );
+    if (unknownTopLevel.length > 0) {
+      // Naming the count, not the payload: an assertion message that quotes
+      // config content can trip isExpectedProviderError and downgrade a real
+      // failure to a skip. See CLAUDE.md.
+      log(
+        `OpenCode config carries ${unknownTopLevel.length} proxy-private top-level key(s); OpenCode rejects unknown keys`,
+        "red",
+      );
+      return false;
+    }
+
+    const provider = written.provider as
+      | Record<string, { models?: Record<string, unknown> }>
+      | undefined;
+    const models = provider?.neurolink?.models;
+    if (!models || Object.keys(models).length === 0) {
+      log(
+        "OpenCode provider.neurolink.models is empty; every --model would be unresolvable",
+        "red",
+      );
+      return false;
+    }
+
+    // The snapshot must exist, and must not be inside the managed file.
+    if (!fs.existsSync(__openCodeTestHooks.getOpenCodeSnapshotPath())) {
+      log("OpenCode snapshot was not persisted outside opencode.json", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+    if (prevHome === undefined) {
+      // Leaving HOME pointed at a directory we are about to delete makes later
+      // cases resolve config under a path that no longer exists, and recreate
+      // it as leaked state.
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * A config already corrupted by the pre-fix writer must heal, not stay broken.
+ *
+ * Users who ran any previous version have the two `__proxy_*` keys on disk. If
+ * apply() only stopped writing them, those users would still have an OpenCode
+ * that refuses to start. The legacy in-file snapshot is also the only record
+ * of their original provider block, so it must be adopted, not dropped.
+ */
+async function testOpenCodeMigratesLegacyInFileSnapshot(): Promise<boolean> {
+  const { __openCodeTestHooks } =
+    await import("../src/cli/proxy-clients/openCode.js");
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-oc-migrate-"));
+  try {
+    process.env.XDG_CONFIG_HOME = path.join(root, "config");
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, "config", "opencode"), { recursive: true });
+    const url = "http://127.0.0.1:55669/v1";
+    fs.writeFileSync(
+      __openCodeTestHooks.getOpenCodeConfigPath(),
+      JSON.stringify({
+        provider: { neurolink: { id: "neurolink", options: { baseURL: url } } },
+        __proxy_original_neurolink: { id: "neurolink", marker: "user-block" },
+      }),
+    );
+
+    await __openCodeTestHooks.setOpenCodeProxySettings(url);
+    const healed = JSON.parse(
+      fs.readFileSync(__openCodeTestHooks.getOpenCodeConfigPath(), "utf8"),
+    ) as Record<string, unknown>;
+    if (Object.keys(healed).some((k) => k.startsWith("__proxy_"))) {
+      log("apply() left legacy proxy keys in opencode.json", "red");
+      return false;
+    }
+
+    // Restoring must hand back the block the legacy snapshot was holding.
+    await __openCodeTestHooks.clearOpenCodeProxySettings(url);
+    const restored = JSON.parse(
+      fs.readFileSync(__openCodeTestHooks.getOpenCodeConfigPath(), "utf8"),
+    ) as { provider?: { neurolink?: { marker?: string } } };
+    if (restored.provider?.neurolink?.marker !== "user-block") {
+      log("migration lost the user's original provider block", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+    if (prevHome === undefined) {
+      // Leaving HOME pointed at a directory we are about to delete makes later
+      // cases resolve config under a path that no longer exists, and recreate
+      // it as leaked state.
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Gemini's `.env` is the user's file; the writer owns exactly two lines of it.
+ *
+ * Restore must be byte-exact rather than "close enough": the file routinely
+ * holds unrelated variables for other tools, plus comments and an ordering the
+ * user chose. Reconstructing it would silently reformat all of that.
+ */
+async function testGeminiEnvWriterRoundTrip(): Promise<boolean> {
+  const { __geminiTestHooks } =
+    await import("../src/cli/proxy-clients/gemini.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-gemini-"));
+  try {
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, ".gemini"), { recursive: true });
+    const url = "http://127.0.0.1:55669";
+    const userEnv =
+      "# notes\nOTHER_TOOL=keep-me\nGEMINI_API_KEY=user-real-key\n";
+    fs.writeFileSync(__geminiTestHooks.getGeminiEnvPath(), userEnv);
+
+    await __geminiTestHooks.setGeminiProxySettings(url);
+    const applied = fs.readFileSync(
+      __geminiTestHooks.getGeminiEnvPath(),
+      "utf8",
+    );
+    if (!applied.includes(`GOOGLE_GEMINI_BASE_URL=${url}`)) {
+      log("Gemini writer did not record the proxy base URL", "red");
+      return false;
+    }
+    if (!applied.includes("OTHER_TOOL=keep-me")) {
+      log("Gemini writer dropped an unrelated variable", "red");
+      return false;
+    }
+
+    await __geminiTestHooks.clearGeminiProxySettings(url);
+    if (
+      fs.readFileSync(__geminiTestHooks.getGeminiEnvPath(), "utf8") !== userEnv
+    ) {
+      log("Gemini restore did not reproduce the original .env exactly", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      // Leaving HOME pointed at a directory we are about to delete makes later
+      // cases resolve config under a path that no longer exists, and recreate
+      // it as leaked state.
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * A malformed snapshot must never be read as "the user had nothing here".
+ *
+ * Snapshots are ordinary files: a full disk truncates them, a person edits
+ * them, an older version leaves a different shape. `JSON.parse` accepts `{}`
+ * happily, and the restore paths then see an absent `original` — which they
+ * treat as "there was no provider block", and act on by deleting the real one.
+ * Measured before the guard: the user's provider.neurolink was destroyed.
+ */
+async function testOpenCodeMalformedSnapshotIsIgnored(): Promise<boolean> {
+  const { __openCodeTestHooks } =
+    await import("../src/cli/proxy-clients/openCode.js");
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-oc-badsnap-"));
+  try {
+    process.env.XDG_CONFIG_HOME = path.join(root, "config");
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, "config", "opencode"), { recursive: true });
+    fs.mkdirSync(path.join(root, ".neurolink"), { recursive: true });
+    const url = "http://127.0.0.1:55669/v1";
+    fs.writeFileSync(
+      __openCodeTestHooks.getOpenCodeConfigPath(),
+      JSON.stringify({
+        provider: {
+          neurolink: {
+            id: "neurolink",
+            marker: "user",
+            options: { baseURL: url },
+          },
+        },
+      }),
+    );
+    fs.writeFileSync(__openCodeTestHooks.getOpenCodeSnapshotPath(), "{}");
+
+    await __openCodeTestHooks.clearOpenCodeProxySettings(url);
+    const after = JSON.parse(
+      fs.readFileSync(__openCodeTestHooks.getOpenCodeConfigPath(), "utf8"),
+    ) as { provider?: { neurolink?: { marker?: string } } };
+    if (after.provider?.neurolink?.marker !== "user") {
+      log(
+        "a malformed snapshot caused restore to delete the user's provider block",
+        "red",
+      );
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+    if (prevHome === undefined) {
+      // Leaving HOME pointed at a directory we are about to delete makes later
+      // cases resolve config under a path that no longer exists, and recreate
+      // it as leaked state.
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Same hazard on the Gemini side, with a different failure shape: a snapshot
+ * without `originalEnv` handed `undefined` to the atomic writer and threw.
+ * restoreAllClients catches per-client errors, so the throw was invisible and
+ * the user stayed pointed at a proxy that was no longer running.
+ */
+async function testGeminiMalformedSnapshotIsIgnored(): Promise<boolean> {
+  const { __geminiTestHooks } =
+    await import("../src/cli/proxy-clients/gemini.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-gm-badsnap-"));
+  try {
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, ".gemini"), { recursive: true });
+    fs.mkdirSync(path.join(root, ".neurolink"), { recursive: true });
+    const url = "http://127.0.0.1:55669";
+    fs.writeFileSync(
+      __geminiTestHooks.getGeminiEnvPath(),
+      `OTHER_TOOL=keep-me\nGOOGLE_GEMINI_BASE_URL=${url}\nGEMINI_API_KEY=neurolink-proxy\n`,
+    );
+    fs.writeFileSync(__geminiTestHooks.getGeminiSnapshotPath(), "{}");
+
+    await __geminiTestHooks.clearGeminiProxySettings(url);
+    const after = fs.existsSync(__geminiTestHooks.getGeminiEnvPath())
+      ? fs.readFileSync(__geminiTestHooks.getGeminiEnvPath(), "utf8")
+      : "";
+    if (!after.includes("OTHER_TOOL=keep-me")) {
+      log("a malformed snapshot cost the user an unrelated variable", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      // Leaving HOME pointed at a directory we are about to delete makes later
+      // cases resolve config under a path that no longer exists, and recreate
+      // it as leaked state.
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Restore must undo our two variables, not replay the whole file.
+ *
+ * Writing `snapshot.originalEnv` over the current `.env` discards everything
+ * the user changed after apply() — and the base-URL guard cannot catch it,
+ * because the URL still matches. Measured before the fix: a line added after
+ * apply() was gone after restore.
+ */
+async function testGeminiRestoreKeepsPostApplyEdits(): Promise<boolean> {
+  const { geminiConfigurator, __geminiTestHooks } =
+    await import("../src/cli/proxy-clients/gemini.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-gm-edits-"));
+  try {
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, ".gemini"), { recursive: true });
+    const url = "http://127.0.0.1:55669";
+    fs.writeFileSync(__geminiTestHooks.getGeminiEnvPath(), "OTHER=original\n");
+
+    await geminiConfigurator.apply(url);
+    fs.appendFileSync(
+      __geminiTestHooks.getGeminiEnvPath(),
+      "ADDED_AFTER_APPLY=important\n",
+    );
+    await geminiConfigurator.restore(url);
+
+    const after = fs.readFileSync(__geminiTestHooks.getGeminiEnvPath(), "utf8");
+    if (!after.includes("ADDED_AFTER_APPLY=important")) {
+      log("restore discarded a variable the user added after apply", "red");
+      return false;
+    }
+    if (after.includes("GOOGLE_GEMINI_BASE_URL")) {
+      log("restore left the managed base URL behind", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Two XDG roots under one HOME are two independent OpenCode installs.
+ *
+ * The snapshot path derived from HOME alone while the config path derived from
+ * XDG_CONFIG_HOME, so the second apply() overwrote the first's saved original.
+ * Measured before the fix: clearing root A restored root B's provider block
+ * onto it.
+ */
+async function testOpenCodeSnapshotIsScopedPerConfigDir(): Promise<boolean> {
+  const { __openCodeTestHooks } =
+    await import("../src/cli/proxy-clients/openCode.js");
+  const prevHome = process.env.HOME;
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-oc-xdg-"));
+  try {
+    process.env.HOME = root;
+    const url = "http://127.0.0.1:55669/v1";
+    const seed = (dir: string, marker: string): void => {
+      fs.mkdirSync(path.join(root, dir, "opencode"), { recursive: true });
+      fs.writeFileSync(
+        path.join(root, dir, "opencode", "opencode.json"),
+        JSON.stringify({
+          provider: {
+            neurolink: { id: "neurolink", marker, options: { baseURL: url } },
+          },
+        }),
+      );
+    };
+    seed("cfgA", "BLOCK-A");
+    seed("cfgB", "BLOCK-B");
+
+    process.env.XDG_CONFIG_HOME = path.join(root, "cfgA");
+    await __openCodeTestHooks.setOpenCodeProxySettings(url);
+    process.env.XDG_CONFIG_HOME = path.join(root, "cfgB");
+    await __openCodeTestHooks.setOpenCodeProxySettings(url);
+
+    process.env.XDG_CONFIG_HOME = path.join(root, "cfgA");
+    await __openCodeTestHooks.clearOpenCodeProxySettings(url);
+    const restored = JSON.parse(
+      fs.readFileSync(
+        path.join(root, "cfgA", "opencode", "opencode.json"),
+        "utf8",
+      ),
+    ) as { provider?: { neurolink?: { marker?: string } } };
+    if (restored.provider?.neurolink?.marker !== "BLOCK-A") {
+      log(
+        "restoring one XDG root did not return that root's own provider block",
+        "red",
+      );
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * "No usable snapshot" and "no snapshot file" are different, and the gap was
+ * the user's API key.
+ *
+ * apply() gated snapshot capture on `existsSync`, so a file that existed but
+ * could not be parsed satisfied it: the placeholder went over the real key and
+ * nothing recorded it. restore() then took its no-snapshot path and removed the
+ * variable outright. Measured before the fix: the `.env` came back empty.
+ */
+async function testGeminiApplyRefusesOnUnusableSnapshot(): Promise<boolean> {
+  const { geminiConfigurator, __geminiTestHooks } =
+    await import("../src/cli/proxy-clients/gemini.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-gm-unusable-"));
+  try {
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, ".gemini"), { recursive: true });
+    fs.mkdirSync(path.join(root, ".neurolink"), { recursive: true });
+    const url = "http://127.0.0.1:55669";
+    fs.writeFileSync(
+      __geminiTestHooks.getGeminiEnvPath(),
+      "GEMINI_API_KEY=user-real-key\n",
+    );
+    fs.writeFileSync(__geminiTestHooks.getGeminiSnapshotPath(), "{}");
+
+    const applied = await geminiConfigurator.apply(url);
+    if (applied !== false) {
+      log("apply() claimed success despite an unusable snapshot", "red");
+      return false;
+    }
+    await geminiConfigurator.restore(url);
+    const after = fs.existsSync(__geminiTestHooks.getGeminiEnvPath())
+      ? fs.readFileSync(__geminiTestHooks.getGeminiEnvPath(), "utf8")
+      : "";
+    if (!after.includes("user-real-key")) {
+      log("an unusable snapshot cost the user their API key", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * A legacy record carrying only the written key proves the proxy wrote
+ * something. It does NOT prove the user had no provider block of their own,
+ * and treating it as `original: null` made restore delete a real one.
+ */
+async function testOpenCodePartialLegacyRecordIsNotRestoredFrom(): Promise<boolean> {
+  const { __openCodeTestHooks } =
+    await import("../src/cli/proxy-clients/openCode.js");
+  const prevHome = process.env.HOME;
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-oc-partial-"));
+  try {
+    process.env.HOME = root;
+    process.env.XDG_CONFIG_HOME = path.join(root, "config");
+    fs.mkdirSync(path.join(root, "config", "opencode"), { recursive: true });
+    const url = "http://127.0.0.1:55669/v1";
+    const block = {
+      id: "neurolink",
+      marker: "user",
+      options: { baseURL: url },
+    };
+    fs.writeFileSync(
+      __openCodeTestHooks.getOpenCodeConfigPath(),
+      JSON.stringify({
+        provider: { neurolink: block },
+        __proxy_written_neurolink: block,
+      }),
+    );
+
+    await __openCodeTestHooks.clearOpenCodeProxySettings(url);
+    const after = JSON.parse(
+      fs.readFileSync(__openCodeTestHooks.getOpenCodeConfigPath(), "utf8"),
+    ) as Record<string, unknown> & {
+      provider?: { neurolink?: { marker?: string } };
+    };
+    if (after.provider?.neurolink?.marker !== "user") {
+      log(
+        "a partial legacy record caused the user's block to be deleted",
+        "red",
+      );
+      return false;
+    }
+    if (Object.keys(after).some((k) => k.startsWith("__proxy_"))) {
+      log("the partial legacy key was left in opencode.json", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The unscoped snapshot is shared by every XDG root on the machine, so it must
+ * never outrank a record belonging to this config in particular. Preferring it
+ * let one root adopt another root's `original` and restore the wrong block.
+ */
+async function testOpenCodePrefersInFileSnapshotOverGlobalFallback(): Promise<boolean> {
+  const { __openCodeTestHooks } =
+    await import("../src/cli/proxy-clients/openCode.js");
+  const prevHome = process.env.HOME;
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-oc-prec-"));
+  try {
+    process.env.HOME = root;
+    process.env.XDG_CONFIG_HOME = path.join(root, "cfgB");
+    fs.mkdirSync(path.join(root, "cfgB", "opencode"), { recursive: true });
+    fs.mkdirSync(path.join(root, ".neurolink"), { recursive: true });
+    const url = "http://127.0.0.1:55669/v1";
+    const block = { id: "neurolink", options: { baseURL: url } };
+
+    // A global snapshot left by a DIFFERENT root, naming a foreign original.
+    fs.writeFileSync(
+      path.join(root, ".neurolink", "opencode-proxy-snapshot.json"),
+      JSON.stringify({ original: { id: "neurolink", marker: "ROOT-A" } }),
+    );
+    // This root's own in-file record, naming its own original.
+    fs.writeFileSync(
+      __openCodeTestHooks.getOpenCodeConfigPath(),
+      JSON.stringify({
+        provider: { neurolink: block },
+        __proxy_original_neurolink: { id: "neurolink", marker: "ROOT-B" },
+        __proxy_written_neurolink: block,
+      }),
+    );
+
+    await __openCodeTestHooks.clearOpenCodeProxySettings(url);
+    const after = JSON.parse(
+      fs.readFileSync(__openCodeTestHooks.getOpenCodeConfigPath(), "utf8"),
+    ) as { provider?: { neurolink?: { marker?: string } } };
+    if (after.provider?.neurolink?.marker !== "ROOT-B") {
+      log(
+        "restore preferred another root's global snapshot over this config's own record",
+        "red",
+      );
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The unscoped snapshot belongs to whichever root has not migrated yet.
+ *
+ * Restore used to delete both snapshot paths unconditionally, so a root that
+ * restored from its own scoped file still removed the shared legacy one — and
+ * with it, another root's only record of its original provider block.
+ */
+async function testOpenCodeClearKeepsOtherRootsLegacySnapshot(): Promise<boolean> {
+  const { __openCodeTestHooks } =
+    await import("../src/cli/proxy-clients/openCode.js");
+  const prevHome = process.env.HOME;
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-oc-shared-"));
+  try {
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, ".neurolink"), { recursive: true });
+    const url = "http://127.0.0.1:55669/v1";
+    const legacyPath = path.join(
+      root,
+      ".neurolink",
+      "opencode-proxy-snapshot.json",
+    );
+    // Root A has not been migrated: its only record is the shared file.
+    fs.writeFileSync(
+      legacyPath,
+      JSON.stringify({ original: { id: "neurolink", marker: "A-ORIGINAL" } }),
+    );
+
+    // Root B applies (gaining a scoped snapshot) and then clears.
+    process.env.XDG_CONFIG_HOME = path.join(root, "cfgB");
+    fs.mkdirSync(path.join(root, "cfgB", "opencode"), { recursive: true });
+    fs.writeFileSync(
+      __openCodeTestHooks.getOpenCodeConfigPath(),
+      JSON.stringify({ provider: {} }),
+    );
+    await __openCodeTestHooks.setOpenCodeProxySettings(url);
+    await __openCodeTestHooks.clearOpenCodeProxySettings(url);
+
+    if (!fs.existsSync(legacyPath)) {
+      log("clearing one XDG root deleted another root's only snapshot", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Restore with no usable record must not "tidy up" the managed variables.
+ *
+ * GEMINI_API_KEY may hold the user's real key. Removing it without a snapshot
+ * to restore from destroys something unrecoverable; leaving a stale base URL
+ * behind only costs a failed request the user can diagnose.
+ */
+async function testGeminiClearWithoutSnapshotKeepsTheKey(): Promise<boolean> {
+  const { geminiConfigurator, __geminiTestHooks } =
+    await import("../src/cli/proxy-clients/gemini.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-gm-nosnap-"));
+  try {
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, ".gemini"), { recursive: true });
+    const url = "http://127.0.0.1:55669";
+    fs.writeFileSync(
+      __geminiTestHooks.getGeminiEnvPath(),
+      `GOOGLE_GEMINI_BASE_URL=${url}\nGEMINI_API_KEY=user-real-key\n`,
+    );
+
+    const restored = await geminiConfigurator.restore(url);
+    if (restored !== false) {
+      log("clear() claimed success with no snapshot to restore from", "red");
+      return false;
+    }
+    const after = fs.readFileSync(__geminiTestHooks.getGeminiEnvPath(), "utf8");
+    if (!after.includes("user-real-key")) {
+      log("clear() removed an API key it had no record of", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * A snapshot that no longer describes the file is stale, not authoritative.
+ *
+ * If restore cannot delete the snapshot, or the user edits a managed variable
+ * afterwards, reusing the stored record makes the next restore replay outdated
+ * values over the newer ones.
+ */
+async function testGeminiRecapturesStaleSnapshot(): Promise<boolean> {
+  const { geminiConfigurator, __geminiTestHooks } =
+    await import("../src/cli/proxy-clients/gemini.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-gm-stale-"));
+  try {
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, ".gemini"), { recursive: true });
+    const url = "http://127.0.0.1:55669";
+    fs.writeFileSync(
+      __geminiTestHooks.getGeminiEnvPath(),
+      "GEMINI_API_KEY=first-key\n",
+    );
+
+    await geminiConfigurator.apply(url);
+    await geminiConfigurator.restore(url);
+    // Simulate a restore whose snapshot cleanup failed, then a user edit.
+    fs.writeFileSync(
+      __geminiTestHooks.getGeminiSnapshotPath(),
+      JSON.stringify({
+        originalEnv: "GEMINI_API_KEY=first-key\n",
+        written: { baseUrl: url, apiKey: "neurolink-proxy" },
+      }),
+    );
+    fs.writeFileSync(
+      __geminiTestHooks.getGeminiEnvPath(),
+      "GEMINI_API_KEY=second-key\n",
+    );
+
+    await geminiConfigurator.apply(url);
+    await geminiConfigurator.restore(url);
+    const after = fs.readFileSync(__geminiTestHooks.getGeminiEnvPath(), "utf8");
+    if (!after.includes("second-key")) {
+      log("a stale snapshot replayed an outdated key over a newer one", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * A migration that was interrupted must not adopt the proxy's own block as the
+ * user's original.
+ *
+ * apply() writes the external snapshot before opencode.json. If the config
+ * write then fails — reachable, because applyAllClients() catches each
+ * client's error and carries on — the retry runs against a config that still
+ * holds the legacy `__proxy_*` keys. The scoped snapshot from the failed
+ * attempt used to win precedence there, and on a migration run it is
+ * *guaranteed* to disagree with what is on disk: the old writer's block has
+ * `models: {}` while the new writer's `written` carries the full map, so
+ * valuesMatch() is always false and shouldCaptureSnapshot() re-captures. The
+ * re-capture then records the OLD PROXY BLOCK as the user's original and drops
+ * the real one the in-file record was still holding. Silent and permanent.
+ *
+ * Not an unlucky mismatch — structural to the migration path, which is exactly
+ * the path where the in-file record is the only copy of the truth.
+ */
+async function testOpenCodeInterruptedMigrationKeepsTrueOriginal(): Promise<boolean> {
+  const { __openCodeTestHooks } =
+    await import("../src/cli/proxy-clients/openCode.js");
+  const prevHome = process.env.HOME;
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), "neurolink-oc-interrupt-"),
+  );
+  try {
+    process.env.HOME = root;
+    process.env.XDG_CONFIG_HOME = path.join(root, "config");
+    fs.mkdirSync(path.join(root, "config", "opencode"), { recursive: true });
+    fs.mkdirSync(path.join(root, ".neurolink"), { recursive: true });
+    const url = "http://127.0.0.1:55669/v1";
+    const userOriginal = {
+      id: "neurolink",
+      marker: "true-user-original",
+      options: { baseURL: "https://the-users-own-endpoint" },
+    };
+    // The old writer's output: models empty, plus the in-file legacy keys.
+    const oldProxyBlock = {
+      id: "neurolink",
+      name: "NeuroLink Proxy",
+      npm: "@ai-sdk/openai-compatible",
+      env: [],
+      models: {},
+      options: { baseURL: url, apiKey: "neurolink-proxy" },
+    };
+    fs.writeFileSync(
+      __openCodeTestHooks.getOpenCodeConfigPath(),
+      JSON.stringify({
+        provider: { neurolink: oldProxyBlock },
+        __proxy_original_neurolink: userOriginal,
+        __proxy_written_neurolink: oldProxyBlock,
+      }),
+    );
+    // The state a failed config write leaves behind: scoped snapshot landed,
+    // its `written` carries the NEW block, so it cannot match what is on disk.
+    fs.writeFileSync(
+      __openCodeTestHooks.getOpenCodeSnapshotPath(),
+      JSON.stringify({
+        original: userOriginal,
+        written: { ...oldProxyBlock, models: { "claude-haiku-4-5": {} } },
+      }),
+    );
+
+    await __openCodeTestHooks.setOpenCodeProxySettings(url);
+
+    const snap = JSON.parse(
+      fs.readFileSync(__openCodeTestHooks.getOpenCodeSnapshotPath(), "utf8"),
+    ) as { original?: { marker?: string } };
+    if (snap.original?.marker !== "true-user-original") {
+      log(
+        "an interrupted migration replaced the user's original with the proxy's own block",
+        "red",
+      );
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * A written file is not a live configuration.
+ *
+ * Copilot reads provider settings from the environment only — `app.js`
+ * resolves COPILOT_PROVIDER_BASE_URL through `process.env` with no config-file
+ * fallback — so its configurator writes a script the user must source. Until
+ * they do, Copilot talks to GitHub while the proxy prints a green check. On
+ * the machine this was developed against the script was sourced in no profile
+ * at all, so that check had been wrong for its entire existence.
+ */
+async function testCopilotReportsWhenItsScriptIsNotSourced(): Promise<boolean> {
+  const { applyAllClients, restoreAllClients } =
+    await import("../src/cli/proxy-clients/registry.js");
+  const prevHome = process.env.HOME;
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-cop-note-"));
+  try {
+    process.env.HOME = root;
+    // XDG_CONFIG_HOME too, not just HOME. This drives the whole roster, and
+    // OpenCode resolves its config dir through XDG_CONFIG_HOME first — leaving
+    // it unscoped means a developer who has it set gets their real
+    // opencode.json rewritten by a test. testApplyAllReportsPerClient one
+    // function away already scopes both; this diverged from it.
+    process.env.XDG_CONFIG_HOME = path.join(root, ".config");
+    fs.mkdirSync(path.join(root, ".copilot"), { recursive: true });
+
+    const before = (await applyAllClients("http://127.0.0.1:55669")).find(
+      (r) => r.id === "copilot",
+    );
+    if (before?.applied !== true) {
+      log("Copilot writer did not report a successful write", "red");
+      return false;
+    }
+    if (!before.note) {
+      log(
+        "Copilot reported plain success for a script no profile sources",
+        "red",
+      );
+      return false;
+    }
+
+    // Once a profile sources it, the outstanding action is gone.
+    fs.writeFileSync(
+      path.join(root, ".zshrc"),
+      "[ -f ~/.neurolink/copilot-env.sh ] && . ~/.neurolink/copilot-env.sh\n",
+    );
+    const after = (await applyAllClients("http://127.0.0.1:55669")).find(
+      (r) => r.id === "copilot",
+    );
+    if (after?.note) {
+      log("Copilot still reported an outstanding action once sourced", "red");
+      return false;
+    }
+    // Leave nothing applied, matching testApplyAllReportsPerClient.
+    await restoreAllClients("http://127.0.0.1:55669");
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Copilot's BYOK path refuses to start without an explicit model, so a script
+ * that stops at the base URL leaves the user passing --model on every single
+ * invocation. Measured before the fix: `copilot -p "..."` exited 1 with "BYOK
+ * providers require an explicit model".
+ *
+ * The default is written through `${VAR:-default}` so a user who exports their
+ * own choice before sourcing keeps it.
+ */
+async function testCopilotEnvScriptSetsAModelId(): Promise<boolean> {
+  const { __copilotTestHooks } =
+    await import("../src/cli/proxy-clients/copilot.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-cop-model-"));
+  try {
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, ".copilot"), { recursive: true });
+    await __copilotTestHooks.setCopilotProxySettings(
+      "http://127.0.0.1:55669/v1",
+    );
+    const script = fs.readFileSync(
+      __copilotTestHooks.getCopilotEnvPath(),
+      "utf8",
+    );
+    if (!script.includes("COPILOT_PROVIDER_MODEL_ID")) {
+      log(
+        "Copilot env script sets no model id; BYOK refuses to start without one",
+        "red",
+      );
+      return false;
+    }
+    if (!script.includes("COPILOT_PROVIDER_MODEL_ID:-")) {
+      log("Copilot model id is not user-overridable", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * A duplicated key silently wins over ours.
+ *
+ * Gemini CLI resolves `.env` with dotenv, which takes the LAST assignment —
+ * measured, not assumed: a file listing the proxy URL first and a dead port
+ * second sent the request to the dead port. The helpers matched with "m" and
+ * no "g", so a pre-existing duplicate left our value overridden while apply()
+ * reported success and Gemini went on talking to Google.
+ *
+ * Restore has the mirror of it: clearing only the first occurrence leaves a
+ * later assignment still pointing at a proxy that is no longer running.
+ */
+async function testGeminiCollapsesDuplicateManagedKeys(): Promise<boolean> {
+  const { geminiConfigurator, __geminiTestHooks } =
+    await import("../src/cli/proxy-clients/gemini.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-gm-dup-"));
+  try {
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, ".gemini"), { recursive: true });
+    const url = "http://127.0.0.1:55669";
+    fs.writeFileSync(
+      __geminiTestHooks.getGeminiEnvPath(),
+      "GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:59999\nOTHER_TOOL=keep-me\nGOOGLE_GEMINI_BASE_URL=http://127.0.0.1:58888\n",
+    );
+
+    await geminiConfigurator.apply(url);
+    const applied = fs.readFileSync(
+      __geminiTestHooks.getGeminiEnvPath(),
+      "utf8",
+    );
+    const matches = applied.match(/^GOOGLE_GEMINI_BASE_URL=.*$/gm) ?? [];
+    if (matches.length !== 1) {
+      log(
+        `apply left ${matches.length} base-URL assignments; dotenv resolves the last, so ours can be overridden`,
+        "red",
+      );
+      return false;
+    }
+    if (!matches[0]?.endsWith(url)) {
+      log("the surviving base-URL assignment is not the proxy's", "red");
+      return false;
+    }
+    if (!applied.includes("OTHER_TOOL=keep-me")) {
+      log("collapsing duplicates dropped an unrelated variable", "red");
+      return false;
+    }
+
+    // Restore puts back the value the user actually had — which here IS a base
+    // URL, their own, so its presence is correct. What must not survive is a
+    // second assignment or the proxy's value: dotenv resolves the last, so
+    // either would leave the CLI pointed somewhere the user did not choose.
+    await geminiConfigurator.restore(url);
+    const restored = fs.readFileSync(
+      __geminiTestHooks.getGeminiEnvPath(),
+      "utf8",
+    );
+    const after = restored.match(/^GOOGLE_GEMINI_BASE_URL=.*$/gm) ?? [];
+    if (after.length !== 1) {
+      log(
+        `restore left ${after.length} base-URL assignments; dotenv resolves the last`,
+        "red",
+      );
+      return false;
+    }
+    if (after[0]?.includes(url)) {
+      log("restore left the proxy's base URL in place", "red");
+      return false;
+    }
+    if (!restored.includes("OTHER_TOOL=keep-me")) {
+      log("restore dropped an unrelated variable", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Ownership must be judged on the assignment the CLI actually resolves.
+ *
+ * dotenv takes the last one, so a user who appends their own
+ * GOOGLE_GEMINI_BASE_URL after apply() has already repointed Gemini — our line
+ * is still on the page but no longer in effect. Checking the first assignment
+ * saw our value, passed the ownership test, and restore then deleted the
+ * endpoint the CLI was using. Measured before the fix: the user's endpoint was
+ * gone and restore reported success.
+ */
+async function testGeminiRestoreRespectsAUserRepoint(): Promise<boolean> {
+  const { geminiConfigurator, __geminiTestHooks } =
+    await import("../src/cli/proxy-clients/gemini.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-gm-repoint-"));
+  try {
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, ".gemini"), { recursive: true });
+    const url = "http://127.0.0.1:55669";
+    fs.writeFileSync(
+      __geminiTestHooks.getGeminiEnvPath(),
+      "GEMINI_API_KEY=user-key\n",
+    );
+    await geminiConfigurator.apply(url);
+    fs.appendFileSync(
+      __geminiTestHooks.getGeminiEnvPath(),
+      "GOOGLE_GEMINI_BASE_URL=https://the-users-own-endpoint\n",
+    );
+
+    const restored = await geminiConfigurator.restore(url);
+    const after = fs.readFileSync(__geminiTestHooks.getGeminiEnvPath(), "utf8");
+    if (!after.includes("the-users-own-endpoint")) {
+      log(
+        "restore deleted the endpoint the user had repointed Gemini at",
+        "red",
+      );
+      return false;
+    }
+    if (restored !== false) {
+      log("restore claimed success on a config it does not own", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The round-trip must be byte-exact on CRLF too.
+ *
+ * The existing round-trip case fixtures an LF-only `.env`, which is precisely
+ * where a line-ending bug cannot show: replacing "\n" with "\n" is a no-op. A
+ * rewrite that captured the terminator and re-emitted a bare LF therefore
+ * passed it while silently converting CRLF to LF — and on the ordinary
+ * single-occurrence path, not just on duplicates. Gemini CLI is cross-platform,
+ * so a Windows-authored .env is not an exotic input.
+ *
+ * The suite had zero `\r` literals anywhere before this case.
+ */
+async function testGeminiRoundTripsCrlfExactly(): Promise<boolean> {
+  const { geminiConfigurator, __geminiTestHooks } =
+    await import("../src/cli/proxy-clients/gemini.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-gm-crlf-"));
+  try {
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, ".gemini"), { recursive: true });
+    const url = "http://127.0.0.1:55669";
+    const original =
+      "FOO=bar\r\nGOOGLE_GEMINI_BASE_URL=http://original\r\nBAZ=qux\r\n";
+    fs.writeFileSync(__geminiTestHooks.getGeminiEnvPath(), original);
+
+    await geminiConfigurator.apply(url);
+    await geminiConfigurator.restore(url);
+
+    const back = fs.readFileSync(__geminiTestHooks.getGeminiEnvPath(), "utf8");
+    if (back !== original) {
+      // Naming the discrepancy, not printing the payload: a message quoting
+      // file content can match isExpectedProviderError() and downgrade a real
+      // failure to a skip.
+      const changed = back.includes("\r\nGOOGLE_GEMINI_BASE_URL")
+        ? "content"
+        : "line ending on the managed key";
+      log(
+        `CRLF .env did not round-trip byte-exactly — ${changed} differs`,
+        "red",
+      );
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Regression: a stale snapshot must never outlive the value it describes.
+ *
+ * The snapshot-on-first-touch guard exists so a second apply() cannot record
+ * the proxy's own block as the "original". But the guard is presence-only, so
+ * after an unclean kill (no restore ran) the sentinel survives in the file. If
+ * the user then replaces the block by hand and the proxy restarts, apply()
+ * overwrites their edit while keeping the now-stale snapshot — and the next
+ * restore writes the stale value back, destroying the user's real config.
+ *
+ * Each of the three JSON configurators is checked, because each carries its
+ * own copy of the guard.
+ */
+async function testOpenCodeReSnapshotsAfterUncleanExit(): Promise<boolean> {
+  const { __openCodeTestHooks } =
+    await import("../src/cli/proxy-clients/openCode.js");
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-opencode-"));
+  const url = "http://127.0.0.1:55669/v1";
+  try {
+    fs.mkdirSync(path.join(root, "opencode"), { recursive: true });
+    process.env.XDG_CONFIG_HOME = root;
+    const configPath = __openCodeTestHooks.getOpenCodeConfigPath();
+
+    // User starts with no provider.neurolink at all.
+    fs.writeFileSync(configPath, JSON.stringify({ provider: {} }, null, 2));
+    await __openCodeTestHooks.setOpenCodeProxySettings(url);
+
+    // Proxy is killed uncleanly: no restore runs, the sentinel stays behind.
+    // The user then writes their own block over the proxy's.
+    const crashed = JSON.parse(fs.readFileSync(configPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    (crashed.provider as Record<string, unknown>).neurolink = {
+      name: "user's own gateway",
+      options: { baseURL: "https://gateway.example.com", apiKey: "real-key" },
+    };
+    fs.writeFileSync(configPath, JSON.stringify(crashed, null, 2));
+
+    // Proxy restarts, then shuts down cleanly.
+    await __openCodeTestHooks.setOpenCodeProxySettings(url);
+    await __openCodeTestHooks.clearOpenCodeProxySettings(url);
+
+    const after = JSON.parse(fs.readFileSync(configPath, "utf8")) as {
+      provider?: { neurolink?: { name?: string } };
+    };
+    if (after.provider?.neurolink?.name !== "user's own gateway") {
+      log(
+        "OpenCode restore discarded a block the user wrote after an unclean exit",
+        "red",
+      );
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/** See testOpenCodeReSnapshotsAfterUncleanExit — same hazard, Claude's env map. */
+async function testClaudeReSnapshotsAfterUncleanExit(): Promise<boolean> {
+  const { __claudeCodeTestHooks } =
+    await import("../src/cli/proxy-clients/claudeCode.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-claude-"));
+  const url = "http://127.0.0.1:55669";
+  try {
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, ".claude"), { recursive: true });
+    const settingsPath = __claudeCodeTestHooks.getClaudeSettingsPath();
+    fs.writeFileSync(settingsPath, JSON.stringify({ env: {} }, null, 2));
+
+    await __claudeCodeTestHooks.setClaudeProxySettings(url);
+
+    const crashed = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    (crashed.env as Record<string, string>).ANTHROPIC_BASE_URL =
+      "https://gateway.example.com";
+    fs.writeFileSync(settingsPath, JSON.stringify(crashed, null, 2));
+
+    await __claudeCodeTestHooks.setClaudeProxySettings(url);
+    await __claudeCodeTestHooks.clearClaudeProxySettings(url);
+
+    const after = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as {
+      env?: Record<string, string>;
+    };
+    if (after.env?.ANTHROPIC_BASE_URL !== "https://gateway.example.com") {
+      log(
+        "Claude restore discarded a base URL the user set after an unclean exit",
+        "red",
+      );
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * See testOpenCodeReSnapshotsAfterUncleanExit. Qwen is the worst case of the
+ * three: security.auth holds the user's real API key, so a stale snapshot
+ * deletes a live credential rather than a URL.
+ */
+async function testQwenReSnapshotsAfterUncleanExit(): Promise<boolean> {
+  const { __qwenCodeTestHooks } =
+    await import("../src/cli/proxy-clients/qwenCode.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-qwen-"));
+  const url = "http://127.0.0.1:55669/v1";
+  try {
+    process.env.HOME = root;
+    fs.mkdirSync(path.join(root, ".qwen"), { recursive: true });
+    const settingsPath = __qwenCodeTestHooks.getQwenSettingsPath();
+    fs.writeFileSync(settingsPath, JSON.stringify({ $version: 2 }, null, 2));
+
+    await __qwenCodeTestHooks.setQwenProxySettings(url);
+
+    const crashed = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    (crashed.security as Record<string, unknown>).auth = {
+      selectedType: "openai",
+      baseUrl: "https://gateway.example.com/v1",
+      apiKey: "user-real-key",
+    };
+    fs.writeFileSync(settingsPath, JSON.stringify(crashed, null, 2));
+
+    await __qwenCodeTestHooks.setQwenProxySettings(url);
+    await __qwenCodeTestHooks.clearQwenProxySettings(url);
+
+    const after = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as {
+      security?: { auth?: { apiKey?: string } };
+    };
+    if (after.security?.auth?.apiKey !== "user-real-key") {
+      log(
+        "Qwen restore discarded a credential the user set after an unclean exit",
+        "red",
+      );
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/** A user's pre-existing provider.neurolink must survive set() then clear(). */
+async function testOpenCodeClearRestoresUserConfig(): Promise<boolean> {
+  const { __openCodeTestHooks } =
+    await import("../src/cli/proxy-clients/openCode.js");
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-opencode-"));
+  try {
+    fs.mkdirSync(path.join(root, "opencode"), { recursive: true });
+    process.env.XDG_CONFIG_HOME = root;
+    const configPath = __openCodeTestHooks.getOpenCodeConfigPath();
+    const original = { provider: { neurolink: { name: "user's own block" } } };
+    fs.writeFileSync(configPath, JSON.stringify(original, null, 2));
+
+    await __openCodeTestHooks.setOpenCodeProxySettings(
+      "http://127.0.0.1:55669/v1",
+    );
+    await __openCodeTestHooks.clearOpenCodeProxySettings(
+      "http://127.0.0.1:55669/v1",
+    );
+
+    const after = JSON.parse(fs.readFileSync(configPath, "utf8")) as {
+      provider?: { neurolink?: { name?: string } };
+    };
+    if (after.provider?.neurolink?.name !== "user's own block") {
+      log(
+        "OpenCode clear did not restore the user's pre-existing block",
+        "red",
+      );
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Task 1 of the ClientConfigurator refactor: the registry must export an
+ * array of configurators, each with a unique id and the full contract
+ * (displayName, detect, apply, restore). This asserts the contract only —
+ * not the final roster, which lands in a later task.
+ */
+async function testProxyClientRegistryShape(): Promise<boolean> {
+  const { PROXY_CLIENT_CONFIGURATORS } =
+    await import("../src/cli/proxy-clients/registry.js");
+  if (!Array.isArray(PROXY_CLIENT_CONFIGURATORS)) {
+    log("registry does not export an array of configurators", "red");
+    return false;
+  }
+  const ids = new Set<string>();
+  for (const configurator of PROXY_CLIENT_CONFIGURATORS) {
+    if (ids.has(configurator.id)) {
+      log("registry contains a duplicate configurator id", "red");
+      return false;
+    }
+    ids.add(configurator.id);
+    if (
+      typeof configurator.displayName !== "string" ||
+      typeof configurator.detect !== "function" ||
+      typeof configurator.apply !== "function" ||
+      typeof configurator.restore !== "function"
+    ) {
+      log(
+        `configurator ${configurator.id} is missing a required member`,
+        "red",
+      );
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Claude was the only writer with no installed-check: it created
+ * ~/.claude/settings.json even when Claude Code had never been installed.
+ */
+async function testClaudeConfiguratorDetectsInstall(): Promise<boolean> {
+  const { claudeCodeConfigurator } =
+    await import("../src/cli/proxy-clients/claudeCode.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-claude-"));
+  try {
+    process.env.HOME = path.join(root, "absent");
+    if (await claudeCodeConfigurator.detect()) {
+      log("Claude configurator reported installed with no ~/.claude", "red");
+      return false;
+    }
+    const present = path.join(root, "present");
+    fs.mkdirSync(path.join(present, ".claude"), { recursive: true });
+    process.env.HOME = present;
+    if (!(await claudeCodeConfigurator.detect())) {
+      log("Claude configurator did not detect an existing ~/.claude", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+async function testCodexConfiguratorDetectsInstall(): Promise<boolean> {
+  const { codexConfigurator } =
+    await import("../src/cli/proxy-clients/codex.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-codex-"));
+  try {
+    process.env.HOME = path.join(root, "absent");
+    if (await codexConfigurator.detect()) {
+      log("Codex configurator reported installed with no config.toml", "red");
+      return false;
+    }
+    const present = path.join(root, "present");
+    fs.mkdirSync(path.join(present, ".codex"), { recursive: true });
+    fs.writeFileSync(
+      path.join(present, ".codex", "config.toml"),
+      'model = "x"\n',
+    );
+    process.env.HOME = present;
+    if (!(await codexConfigurator.detect())) {
+      log("Codex configurator did not detect an existing config.toml", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+async function testProxyClientRoster(): Promise<boolean> {
+  const { PROXY_CLIENT_CONFIGURATORS } =
+    await import("../src/cli/proxy-clients/registry.js");
+  const ids = PROXY_CLIENT_CONFIGURATORS.map((c) => c.id).join(",");
+  if (ids !== "claude-code,opencode,codex,qwen-code,copilot,gemini-cli") {
+    log(
+      "configurator roster or order changed — apply order is behaviour",
+      "red",
+    );
+    return false;
+  }
+  return true;
+}
+
+async function testApplyAllReportsPerClient(): Promise<boolean> {
+  const { applyAllClients, restoreAllClients, PROXY_CLIENT_CONFIGURATORS } =
+    await import("../src/cli/proxy-clients/registry.js");
+  const prevHome = process.env.HOME;
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-clients-"));
+  try {
+    // Only OpenCode is "installed": its config dir exists, the other two do not.
+    process.env.HOME = root;
+    process.env.XDG_CONFIG_HOME = path.join(root, ".config");
+    fs.mkdirSync(path.join(root, ".config", "opencode"), { recursive: true });
+
+    const applied = await applyAllClients("http://127.0.0.1:55669");
+    if (
+      applied.map((r) => r.id).join(",") !==
+      "claude-code,opencode,codex,qwen-code,copilot,gemini-cli"
+    ) {
+      log("applyAllClients returned results out of registry order", "red");
+      return false;
+    }
+    const byId = new Map(applied.map((r) => [r.id, r]));
+    if (byId.get("opencode")?.applied !== true) {
+      log("installed client was not reported as applied", "red");
+      return false;
+    }
+    if (byId.get("codex")?.applied !== false) {
+      log("absent client was reported as applied", "red");
+      return false;
+    }
+    if (byId.get("claude-code")?.applied !== false) {
+      log("absent Claude Code was reported as applied", "red");
+      return false;
+    }
+    // The gate must be detect(), not the configurator's own internal guard:
+    // an absent client must be skipped cleanly, never attempted and caught.
+    for (const id of [
+      "claude-code",
+      "codex",
+      "qwen-code",
+      "copilot",
+      "gemini-cli",
+    ]) {
+      if (byId.get(id)?.error !== undefined) {
+        log("an absent client was attempted instead of being skipped", "red");
+        return false;
+      }
+    }
+
+    const restored = await restoreAllClients("http://127.0.0.1:55669");
+    if (restored.length !== PROXY_CLIENT_CONFIGURATORS.length) {
+      log("restoreAllClients did not report every client", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    if (prevXdg === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = prevXdg;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Qwen Code stores its provider under `security.auth` and speaks OpenAI Chat
+ * Completions. Shape verified against a real ~/.qwen/settings.json ($version 2).
+ */
+async function testQwenConfiguratorRoundTrip(): Promise<boolean> {
+  const { qwenCodeConfigurator } =
+    await import("../src/cli/proxy-clients/qwenCode.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-qwen-"));
+  try {
+    process.env.HOME = path.join(root, "absent");
+    if (await qwenCodeConfigurator.detect()) {
+      log("Qwen configurator reported installed with no ~/.qwen", "red");
+      return false;
+    }
+
+    const present = path.join(root, "present");
+    fs.mkdirSync(path.join(present, ".qwen"), { recursive: true });
+    const settingsPath = path.join(present, ".qwen", "settings.json");
+    const original = {
+      security: {
+        auth: {
+          selectedType: "openai",
+          apiKey: "user-own-key",
+          baseUrl: "https://user.example.invalid",
+        },
+      },
+      model: { name: "claude-sonnet-4-5" },
+      $version: 2,
+    };
+    fs.writeFileSync(settingsPath, JSON.stringify(original, null, 2));
+    process.env.HOME = present;
+
+    if (!(await qwenCodeConfigurator.detect())) {
+      log("Qwen configurator did not detect an existing ~/.qwen", "red");
+      return false;
+    }
+    if (!(await qwenCodeConfigurator.apply("http://127.0.0.1:55669"))) {
+      log("Qwen configurator did not report a successful write", "red");
+      return false;
+    }
+
+    const applied = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as {
+      security?: { auth?: { baseUrl?: string; selectedType?: string } };
+      model?: { name?: string };
+    };
+    if (applied.security?.auth?.baseUrl !== "http://127.0.0.1:55669/v1") {
+      log("Qwen configurator did not record the proxy base URL", "red");
+      return false;
+    }
+    if (applied.security?.auth?.selectedType !== "openai") {
+      log("Qwen configurator did not select the openai auth type", "red");
+      return false;
+    }
+    if (applied.model?.name !== "claude-sonnet-4-5") {
+      log("Qwen configurator disturbed an unrelated setting", "red");
+      return false;
+    }
+
+    if (!(await qwenCodeConfigurator.restore("http://127.0.0.1:55669"))) {
+      log("Qwen configurator did not report a successful restore", "red");
+      return false;
+    }
+    const restored = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as {
+      security?: { auth?: { baseUrl?: string; apiKey?: string } };
+    };
+    if (
+      restored.security?.auth?.baseUrl !== "https://user.example.invalid" ||
+      restored.security?.auth?.apiKey !== "user-own-key"
+    ) {
+      log("Qwen restore did not put the user's own auth block back", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Copilot CLI reads its provider config from the environment only — there is
+ * no config file to write — so the configurator emits a sourceable script
+ * inside the proxy's own directory rather than editing a shell profile.
+ */
+async function testCopilotConfiguratorWritesEnvFile(): Promise<boolean> {
+  const { copilotConfigurator, __copilotTestHooks } =
+    await import("../src/cli/proxy-clients/copilot.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-copilot-"));
+  try {
+    process.env.HOME = path.join(root, "absent");
+    if (await copilotConfigurator.detect()) {
+      log("Copilot configurator reported installed with no ~/.copilot", "red");
+      return false;
+    }
+
+    const present = path.join(root, "present");
+    fs.mkdirSync(path.join(present, ".copilot"), { recursive: true });
+    process.env.HOME = present;
+    if (!(await copilotConfigurator.detect())) {
+      log("Copilot configurator did not detect an existing ~/.copilot", "red");
+      return false;
+    }
+    if (!(await copilotConfigurator.apply("http://127.0.0.1:55669"))) {
+      log("Copilot configurator did not report a successful write", "red");
+      return false;
+    }
+
+    const envPath = __copilotTestHooks.getCopilotEnvPath();
+    if (!fs.existsSync(envPath)) {
+      log("Copilot configurator did not write its env script", "red");
+      return false;
+    }
+    const script = fs.readFileSync(envPath, "utf8");
+    for (const needle of [
+      "COPILOT_PROVIDER_TYPE",
+      "COPILOT_PROVIDER_BASE_URL",
+      "COPILOT_PROVIDER_API_KEY",
+      "http://127.0.0.1:55669/v1",
+    ]) {
+      if (!script.includes(needle)) {
+        log("Copilot env script is missing a required export", "red");
+        return false;
+      }
+    }
+
+    if (!(await copilotConfigurator.restore("http://127.0.0.1:55669"))) {
+      log("Copilot configurator did not report a successful restore", "red");
+      return false;
+    }
+    if (fs.existsSync(envPath)) {
+      log("Copilot env script survived restore", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Regression: with no `__proxy_original_env` snapshot, the Claude restore path
+ * used to treat every managed key as "did not exist before" and delete it,
+ * wiping a real user value. OpenCode and Qwen both refuse in that case; this
+ * asserts Claude does too.
+ */
+async function testClaudeRestoreRefusesWithoutSnapshot(): Promise<boolean> {
+  const { __claudeCodeTestHooks } =
+    await import("../src/cli/proxy-clients/claudeCode.js");
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-claude-snap-"));
+  try {
+    fs.mkdirSync(path.join(root, ".claude"), { recursive: true });
+    const settingsPath = path.join(root, ".claude", "settings.json");
+    // A user-owned config the proxy never touched: no snapshot key present.
+    fs.writeFileSync(
+      settingsPath,
+      JSON.stringify(
+        {
+          env: {
+            ANTHROPIC_BASE_URL: "https://user-own-gateway.example.invalid",
+            ENABLE_TOOL_SEARCH: "true",
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    process.env.HOME = root;
+
+    // Called with no expectedBaseUrl, the way a defensive shutdown path might.
+    const result = await __claudeCodeTestHooks.clearClaudeProxySettings();
+    if (result !== false) {
+      log("Claude restore claimed success with no snapshot to restore", "red");
+      return false;
+    }
+
+    const after = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as {
+      env?: { ANTHROPIC_BASE_URL?: string; ENABLE_TOOL_SEARCH?: string };
+    };
+    if (
+      after.env?.ANTHROPIC_BASE_URL !==
+      "https://user-own-gateway.example.invalid"
+    ) {
+      log("Claude restore destroyed a user value it did not own", "red");
+      return false;
+    }
+    if (after.env?.ENABLE_TOOL_SEARCH !== "true") {
+      log("Claude restore removed a user-set managed key", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Regression: `isExactPricingMatch` used to re-implement the table lookup
+ * instead of reusing `findRates`, so it missed Bedrock's vendor-prefix strip
+ * and Vertex's fallback to the Google table. Both are exact hits that were
+ * reported to the operator as guessed rates.
+ */
+/**
+ * A streamed request is logged twice: once when the response headers are known
+ * and again when the body finishes and its token counts arrive. The Codex
+ * engine does exactly this, and the second write is the only one that carries
+ * usage.
+ *
+ * Merging those two records rather than replacing is what makes the tokens
+ * survive alongside the first record's status and errorType. Nothing covered
+ * it, so a revert to a plain overwrite would have gone unnoticed while
+ * silently zeroing every Codex request's cost.
+ */
+async function testAnalyzeMergesDoubleWrittenRequest(): Promise<boolean> {
+  const { execFileSync } = await import("child_process");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-merge-"));
+  const logs = path.join(dir, "logs");
+  fs.mkdirSync(logs, { recursive: true });
+  const ts = new Date().toISOString();
+  const day = ts.slice(0, 10);
+  const base = {
+    timestamp: ts,
+    method: "POST",
+    path: "/backend-api/codex/responses",
+    stream: true,
+    toolCount: 0,
+    account: "codex-a",
+    accountType: "codex-oauth",
+    responseStatus: 200,
+    responseTimeMs: 4200,
+    requestId: "codex-double",
+  };
+  const rows = [
+    // Headers are known; no usage yet, and no model resolved.
+    JSON.stringify(base),
+    // Stream finished: usage and provider arrive on a second line.
+    JSON.stringify({
+      ...base,
+      model: "gpt-5.1-codex",
+      provider: "openai",
+      inputTokens: 17339,
+      outputTokens: 700,
+      cacheReadTokens: 8576,
+    }),
+  ];
+  fs.writeFileSync(
+    path.join(logs, `proxy-${day}.jsonl`),
+    rows.join("\n") + "\n",
+  );
+
+  try {
+    const out = execFileSync(
+      process.execPath,
+      [
+        "dist/cli/index.js",
+        "proxy",
+        "analyze",
+        "--logs-dir",
+        logs,
+        "--format",
+        "json",
+      ],
+      { encoding: "utf8" },
+    );
+    const report = JSON.parse(out) as {
+      requests?: { completed?: number };
+      cache?: { outputTokens?: number; estimatedCostUsd?: number };
+    };
+    // One request, not two: the second line enriches the first.
+    if (report.requests?.completed !== 1) {
+      log("analyze counted a re-logged request more than once", "red");
+      return false;
+    }
+    if (report.cache?.outputTokens !== 700) {
+      log("analyze lost the usage carried by the second record", "red");
+      return false;
+    }
+    if (!report.cache?.estimatedCostUsd) {
+      log("analyze priced a merged request at nothing", "red");
+      return false;
+    }
+    return true;
+  } catch {
+    log("proxy analyze did not produce a parseable report", "red");
+    return false;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The same double write can straddle a report's window edge: a Codex turn that
+ * gets its headers at 23:59:50 and finishes at 00:00:05 puts every token it
+ * spent in a record stamped after `--until`.
+ *
+ * Filtering that record out by its own timestamp drops the usage silently —
+ * the request still counts as completed, but contributes nothing to tokens or
+ * cost, and nothing in the report says so. A request the window already
+ * admitted has to keep accepting its own later records.
+ */
+async function testAnalyzeKeepsUsageAcrossWindowEdge(): Promise<boolean> {
+  const { execFileSync } = await import("child_process");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-window-"));
+  const logs = path.join(dir, "logs");
+  fs.mkdirSync(logs, { recursive: true });
+
+  const headersAt = "2026-08-20T23:59:50.000Z";
+  const finishedAt = "2026-08-21T00:00:05.000Z";
+  const base = {
+    method: "POST",
+    path: "/backend-api/codex/responses",
+    stream: true,
+    toolCount: 0,
+    account: "codex-a",
+    accountType: "codex-oauth",
+    responseStatus: 200,
+    responseTimeMs: 15_000,
+    requestId: "codex-straddle",
+  };
+  fs.writeFileSync(
+    path.join(logs, "proxy-2026-08-20.jsonl"),
+    JSON.stringify({ ...base, timestamp: headersAt }) + "\n",
+  );
+  fs.writeFileSync(
+    path.join(logs, "proxy-2026-08-21.jsonl"),
+    JSON.stringify({
+      ...base,
+      timestamp: finishedAt,
+      model: "gpt-5.1-codex",
+      provider: "openai",
+      inputTokens: 17339,
+      outputTokens: 700,
+      cacheReadTokens: 8576,
+    }) + "\n",
+  );
+
+  try {
+    const out = execFileSync(
+      process.execPath,
+      [
+        "dist/cli/index.js",
+        "proxy",
+        "analyze",
+        "--logs-dir",
+        logs,
+        "--since",
+        "2026-08-20T00:00:00Z",
+        "--until",
+        "2026-08-20T23:59:59Z",
+        "--format",
+        "json",
+      ],
+      { encoding: "utf8" },
+    );
+    const report = JSON.parse(out) as {
+      requests?: { completed?: number };
+      cache?: { outputTokens?: number };
+    };
+    if (report.requests?.completed !== 1) {
+      log("analyze did not count the request its window admitted", "red");
+      return false;
+    }
+    if (report.cache?.outputTokens !== 700) {
+      log(
+        "analyze dropped the usage of a request whose completion landed after the window",
+        "red",
+      );
+      return false;
+    }
+    return true;
+  } catch {
+    log("proxy analyze did not produce a parseable report", "red");
+    return false;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function testAnalyzePricingProvenance(): Promise<boolean> {
+  const { execFileSync } = await import("child_process");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-pricing-"));
+  const logs = path.join(dir, "logs");
+  fs.mkdirSync(logs, { recursive: true });
+  const ts = new Date().toISOString();
+  const day = ts.slice(0, 10);
+  const rows = [
+    {
+      requestId: "b1",
+      model: "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+      provider: "bedrock",
+    },
+    { requestId: "v1", model: "gemini-2.5-pro", provider: "vertex" },
+    { requestId: "s1", model: "claude-sonnet-4-5", provider: "anthropic" },
+  ].map((r) =>
+    JSON.stringify({
+      timestamp: ts,
+      method: "POST",
+      path: "/v1/messages",
+      stream: false,
+      toolCount: 0,
+      account: "a",
+      accountType: "oauth",
+      responseStatus: 200,
+      responseTimeMs: 900,
+      inputTokens: 1000,
+      outputTokens: 100,
+      ...r,
+    }),
+  );
+  fs.writeFileSync(
+    path.join(logs, `proxy-${day}.jsonl`),
+    rows.join("\n") + "\n",
+  );
+
+  try {
+    const out = execFileSync(
+      process.execPath,
+      [
+        "dist/cli/index.js",
+        "proxy",
+        "analyze",
+        "--logs-dir",
+        logs,
+        "--format",
+        "json",
+      ],
+      { encoding: "utf8" },
+    );
+    const report = JSON.parse(out) as {
+      cache?: { requestsPriced?: number; requestsPricedByPrefix?: number };
+    };
+    if (report.cache?.requestsPriced !== 3) {
+      log(
+        "analyze did not price every request that carried a known model",
+        "red",
+      );
+      return false;
+    }
+    if (report.cache?.requestsPricedByPrefix !== 0) {
+      log(
+        "analyze reported an exact rate as an inferred one — provenance regressed",
+        "red",
+      );
+      return false;
+    }
+    return true;
+  } catch {
+    log("proxy analyze did not produce a parseable report", "red");
+    return false;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ============================================================================
+// Tests: GET /accounts and the per-account usage ledger
+// ============================================================================
+
+/** Write a request-log fixture into an isolated HOME and read it back. */
+async function withLedgerHome<T>(
+  rows: Record<string, unknown>[],
+  date: string,
+  fn: (home: string) => Promise<T>,
+): Promise<T> {
+  const prevHome = process.env.HOME;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-ledger-"));
+  fs.mkdirSync(path.join(root, ".neurolink", "logs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, ".neurolink", "logs", `proxy-${date}.jsonl`),
+    rows.map((r) => JSON.stringify(r)).join("\n") + "\n",
+  );
+  process.env.HOME = root;
+  try {
+    return await fn(root);
+  } finally {
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const LEDGER_DATE = "2026-01-15";
+
+function ledgerRow(over: Record<string, unknown>): Record<string, unknown> {
+  return {
+    timestamp: `${LEDGER_DATE}T00:00:00.000Z`,
+    method: "POST",
+    path: "/v1/messages",
+    stream: false,
+    toolCount: 0,
+    accountType: "oauth",
+    responseStatus: 200,
+    responseTimeMs: 100,
+    model: "claude-sonnet-5",
+    inputTokens: 1000,
+    outputTokens: 100,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    ...over,
+  };
+}
+
+/**
+ * A request can be logged twice — once on response headers, once when a
+ * streamed body finishes and its token counts arrive. Summing raw lines would
+ * double count it.
+ */
+async function testLedgerDedupesRepeatedRequestId(): Promise<boolean> {
+  const { readAccountUsage, resetAccountLedgerCache } =
+    await import("../src/lib/proxy/accountLedger.js");
+  return await withLedgerHome(
+    [
+      ledgerRow({
+        requestId: "r1",
+        account: "a@t",
+        inputTokens: 0,
+        outputTokens: 0,
+      }),
+      ledgerRow({
+        requestId: "r1",
+        account: "a@t",
+        inputTokens: 1000,
+        outputTokens: 100,
+      }),
+    ],
+    LEDGER_DATE,
+    async () => {
+      resetAccountLedgerCache();
+      const row = (await readAccountUsage(LEDGER_DATE)).get("anthropic:a@t");
+      if (!row) {
+        log("ledger did not report the account at all", "red");
+        return false;
+      }
+      if (row.requests !== 1) {
+        log("ledger counted a re-logged request twice", "red");
+        return false;
+      }
+      if (row.inputTokens !== 1000 || row.outputTokens !== 100) {
+        log(
+          "ledger summed both records instead of taking the later one",
+          "red",
+        );
+        return false;
+      }
+      return true;
+    },
+  );
+}
+
+/**
+ * A later record for the same requestId can carry NO token fields — a terminal
+ * error logged after a successful response, for instance. A naive spread merge
+ * lets its zeros overwrite real usage, silently erasing the request's tokens.
+ */
+async function testLedgerKeepsMaxTokensAcrossRecords(): Promise<boolean> {
+  const { readAccountUsage, resetAccountLedgerCache } =
+    await import("../src/lib/proxy/accountLedger.js");
+  return await withLedgerHome(
+    [
+      ledgerRow({ requestId: "r1", account: "a@t" }),
+      // No token fields at all on the second record.
+      {
+        timestamp: `${LEDGER_DATE}T00:00:01.000Z`,
+        requestId: "r1",
+        account: "a@t",
+        accountType: "oauth",
+        model: "claude-sonnet-5",
+        errorType: "stream_error",
+      },
+    ],
+    LEDGER_DATE,
+    async () => {
+      resetAccountLedgerCache();
+      const row = (await readAccountUsage(LEDGER_DATE)).get("anthropic:a@t");
+      if (!row) {
+        log("ledger dropped the account", "red");
+        return false;
+      }
+      if (row.inputTokens !== 1000 || row.outputTokens !== 100) {
+        log("a token-less later record erased the recorded usage", "red");
+        return false;
+      }
+      return true;
+    },
+  );
+}
+
+/**
+ * The request log is shared with the Codex engine, and an operator can use the
+ * same email for both. Codex tokens must not land on the Anthropic row.
+ */
+async function testLedgerKeysCodexRowsByEngine(): Promise<boolean> {
+  // The request log is shared by both engines and an operator can use one
+  // email for both. Keying the ledger by bare label merged them; keying by
+  // the provider-qualified account key keeps each engine's tokens on its own
+  // row, and a row that has no key of its own derives one from its type.
+  const { readAccountUsage, resetAccountLedgerCache } =
+    await import("../src/lib/proxy/accountLedger.js");
+  return await withLedgerHome(
+    [
+      ledgerRow({ requestId: "r1", account: "same@t" }),
+      ledgerRow({
+        requestId: "r2",
+        account: "same@t",
+        accountKey: "codex:same@t",
+        accountType: "codex-oauth",
+        model: "gpt-5.6-sol",
+        inputTokens: 999999,
+        outputTokens: 999999,
+      }),
+    ],
+    LEDGER_DATE,
+    async () => {
+      resetAccountLedgerCache();
+      const usage = await readAccountUsage(LEDGER_DATE);
+      const anthropic = usage.get("anthropic:same@t");
+      const codex = usage.get("codex:same@t");
+      if (!anthropic) {
+        log("ledger dropped the Anthropic row entirely", "red");
+        return false;
+      }
+      if (anthropic.requests !== 1 || anthropic.inputTokens !== 1000) {
+        log("Codex usage was attributed to the Anthropic account", "red");
+        return false;
+      }
+      if (!codex || codex.requests !== 1 || codex.inputTokens !== 999999) {
+        log("Codex usage was dropped instead of landing on its own row", "red");
+        return false;
+      }
+      if (usage.has("same@t")) {
+        log(
+          "ledger still exposes a bare-label row that both engines collide on",
+          "red",
+        );
+        return false;
+      }
+      return true;
+    },
+  );
+}
+
+/** Cost must be real, and an unknown model must be named rather than silently zeroed. */
+async function testLedgerCostsAndFlagsUnpriced(): Promise<boolean> {
+  const { readAccountUsage, resetAccountLedgerCache } =
+    await import("../src/lib/proxy/accountLedger.js");
+  return await withLedgerHome(
+    [
+      ledgerRow({ requestId: "r1", account: "a@t" }),
+      ledgerRow({
+        requestId: "r2",
+        account: "a@t",
+        model: "claude-imaginary-99",
+        inputTokens: 500,
+        outputTokens: 50,
+      }),
+    ],
+    LEDGER_DATE,
+    async () => {
+      resetAccountLedgerCache();
+      const row = (await readAccountUsage(LEDGER_DATE)).get("anthropic:a@t");
+      if (!row) {
+        log("ledger did not report the account", "red");
+        return false;
+      }
+      // claude-sonnet-5: 1000 in @ $2/M + 100 out @ $10/M = 0.002 + 0.001
+      if (Math.abs(row.costUsd - 0.003) > 1e-9) {
+        log("ledger cost does not match the published rate", "red");
+        return false;
+      }
+      if (row.unpricedRequests !== 1) {
+        log("ledger did not count the unpriced request", "red");
+        return false;
+      }
+      if (row.unpricedModels.join(",") !== "claude-imaginary-99") {
+        log("ledger did not name the unpriced model", "red");
+        return false;
+      }
+      return true;
+    },
+  );
+}
+
+/** A line still being appended must not be parsed truncated. */
+async function testLedgerIgnoresPartialTrailingLine(): Promise<boolean> {
+  const { readAccountUsage, resetAccountLedgerCache } =
+    await import("../src/lib/proxy/accountLedger.js");
+  return await withLedgerHome(
+    [ledgerRow({ requestId: "r1", account: "a@t" })],
+    LEDGER_DATE,
+    async (home) => {
+      const file = path.join(
+        home,
+        ".neurolink",
+        "logs",
+        `proxy-${LEDGER_DATE}.jsonl`,
+      );
+      fs.appendFileSync(file, '{"requestId":"r2","account":"a@t","inputTo');
+      resetAccountLedgerCache();
+      const first = (await readAccountUsage(LEDGER_DATE)).get("anthropic:a@t");
+      if (!first || first.requests !== 1) {
+        log("ledger consumed a partial trailing line", "red");
+        return false;
+      }
+      // Completing the line must then be picked up whole.
+      fs.appendFileSync(
+        file,
+        'kens":1000,"outputTokens":100,"accountType":"oauth","model":"claude-sonnet-5"}\n',
+      );
+      const second = (await readAccountUsage(LEDGER_DATE)).get("anthropic:a@t");
+      if (!second || second.requests !== 2) {
+        log(
+          "ledger did not pick up the completed line on the next read",
+          "red",
+        );
+        return false;
+      }
+      return true;
+    },
+  );
+}
+
+/**
+ * Two genuinely distinct requests can share a requestId.
+ *
+ * `ctx.requestId` comes straight from a client-supplied `X-Request-ID` header
+ * when one is present, and nothing enforces uniqueness — a fixed correlation
+ * header, an idempotency wrapper or a load-test harness will reuse one for
+ * every call. The ledger dedupes by requestId to collapse the Codex double
+ * write, so without a way to tell a re-log from a repeat, N real requests
+ * against the same account and model collapsed into one and reported a
+ * fraction of the tokens and cost actually spent.
+ */
+async function testLedgerSeparatesDistinctRequestsSharingAnId(): Promise<boolean> {
+  const { readAccountUsage, resetAccountLedgerCache } =
+    await import("../src/lib/proxy/accountLedger.js");
+  const rows = Array.from({ length: 5 }, () =>
+    ledgerRow({ requestId: "fixed-id-123", account: "a@t" }),
+  );
+  return await withLedgerHome(rows, LEDGER_DATE, async () => {
+    resetAccountLedgerCache();
+    const totals = (await readAccountUsage(LEDGER_DATE)).get("anthropic:a@t");
+    if (!totals) {
+      log("ledger reported nothing for an account with traffic", "red");
+      return false;
+    }
+    if (totals.requests !== 5) {
+      log(
+        "ledger collapsed distinct requests that shared a client-supplied id",
+        "red",
+      );
+      return false;
+    }
+    if (totals.inputTokens !== 5000 || totals.outputTokens !== 500) {
+      log("ledger undercounted tokens across a shared request id", "red");
+      return false;
+    }
+    return true;
+  });
+}
+
+/**
+ * Every row must carry a `kind` that says what it really is.
+ *
+ * The row set is built from two loops: real logins from the quota snapshot,
+ * then whatever is left in the usage stats. The second loop tagged everything
+ * that was not a translation pseudo-account as `internal` — including a real
+ * OAuth account that had been disabled or dropped from the allowlist, which is
+ * exactly the account an operator is looking for when they ask why traffic
+ * stopped. The docs tell consumers to filter `internal` out, so it vanished.
+ *
+ * This also pins the row set to something non-empty. The original shape test
+ * looped over `body.accounts` to assert its invariants and never seeded an
+ * account, so with an empty array both loops ran zero times and it passed no
+ * matter what the handler did.
+ */
+async function testAccountsRowsAreClassifiedByKind(): Promise<boolean> {
+  const { createClaudeProxyRoutes, __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  const stats = await import("../src/lib/proxy/usageStats.js");
+  await stats.resetUsageStatsForTests();
+
+  // A real login that stopped being routable, plus the two pseudo-accounts.
+  stats.recordAttempt("alice@example.com", "oauth");
+  stats.recordFinalSuccess("alice@example.com", "oauth");
+  stats.recordAttempt("proxy/internal", "internal");
+  stats.recordFinalSuccess("proxy/internal", "internal");
+  stats.recordAttempt("gemini-translate", "translation");
+  stats.recordFinalSuccess("gemini-translate", "translation");
+  // Alice is a real login that is in the token store but not routed (disabled
+  // or allowlist-excluded). A login absent from the store is removed, not
+  // unrouted, and gets no row — see testAccountsOmitsRemovedLoginsKeepsDisabledOnes.
+  __testHooks.setAccountDirectoryForTests({
+    knownKeys: new Set(["anthropic:alice@example.com"]),
+    anthropic: [],
+    codex: [],
+  });
+
+  const route = createClaudeProxyRoutes().routes.find((r) =>
+    r.path.endsWith("/accounts"),
+  );
+  if (!route) {
+    __testHooks.setAccountDirectoryForTests(null);
+    log("GET /accounts is not registered", "red");
+    return false;
+  }
+  const body = (await route.handler({
+    query: {},
+    headers: {},
+    method: "GET",
+    path: "/accounts",
+    requestId: "suite",
+  } as never)) as {
+    accounts?: { label?: string; kind?: string; type?: string }[];
+  };
+  __testHooks.setAccountDirectoryForTests(null);
+  const rows = body.accounts ?? [];
+  if (rows.length < 3) {
+    log("accounts did not report the seeded rows", "red");
+    return false;
+  }
+  for (const row of rows) {
+    if (!row.kind) {
+      log("an account row is missing its kind discriminator", "red");
+      return false;
+    }
+  }
+  const byLabel = new Map(rows.map((r) => [r.label, r]));
+  if (byLabel.get("alice@example.com")?.kind !== "account") {
+    log(
+      "a real credential was tagged as internal plumbing and would be filtered out",
+      "red",
+    );
+    return false;
+  }
+  if (byLabel.get("proxy/internal")?.kind !== "internal") {
+    log("an internal pseudo-account was not tagged as internal", "red");
+    return false;
+  }
+  if (byLabel.get("gemini-translate")?.kind !== "translation") {
+    log("a translation pseudo-account was not tagged as translation", "red");
+    return false;
+  }
+  await stats.resetUsageStatsForTests();
+  return true;
+}
+
+/**
+ * The configured primary account must be identifiable in the row set.
+ *
+ * Both row loops hardcoded `isPrimary: false`, so the field was always false
+ * and a dashboard could never mark the account the pool actually prefers —
+ * while `CliAccountsRow` still advertised it as meaningful. The key is
+ * available in the handler's own closure, and account keys compare through
+ * anthropicAccountKeysEqual, which normalises a bare label to its full key.
+ */
+async function testAccountsMarksThePrimaryAccount(): Promise<boolean> {
+  const { createClaudeProxyRoutes, __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  const stats = await import("../src/lib/proxy/usageStats.js");
+  await stats.resetUsageStatsForTests();
+
+  stats.recordAttempt("primary@example.com", "oauth");
+  stats.recordFinalSuccess("primary@example.com", "oauth");
+  stats.recordAttempt("other@example.com", "oauth");
+  stats.recordFinalSuccess("other@example.com", "oauth");
+  // Both are logins the token store knows but does not route; a stats entry
+  // with no login behind it is omitted as removed and would not be a row.
+  __testHooks.setAccountDirectoryForTests({
+    knownKeys: new Set([
+      "anthropic:primary@example.com",
+      "anthropic:other@example.com",
+    ]),
+    anthropic: [],
+    codex: [],
+  });
+
+  const route = createClaudeProxyRoutes(
+    undefined,
+    "",
+    "fill-first",
+    false,
+    // Full pool key; the rows carry the bare label, so the comparison has to
+    // normalise rather than match on string identity.
+    "anthropic:primary@example.com",
+  ).routes.find((r) => r.path.endsWith("/accounts"));
+  if (!route) {
+    log("GET /accounts is not registered", "red");
+    return false;
+  }
+
+  const body = (await route.handler({
+    query: {},
+    headers: {},
+    method: "GET",
+    path: "/accounts",
+    requestId: "suite",
+  } as never)) as {
+    accounts?: { label?: string; isPrimary?: boolean }[];
+  };
+  const rows = body.accounts ?? [];
+  if (rows.length < 2) {
+    log("accounts did not report the seeded rows", "red");
+    return false;
+  }
+  const byLabel = new Map(rows.map((r) => [r.label, r]));
+  if (byLabel.get("primary@example.com")?.isPrimary !== true) {
+    log("the configured primary account was not marked as primary", "red");
+    return false;
+  }
+  if (byLabel.get("other@example.com")?.isPrimary !== false) {
+    log("a non-primary account was marked as primary", "red");
+    return false;
+  }
+  __testHooks.setAccountDirectoryForTests(null);
+  await stats.resetUsageStatsForTests();
+  return true;
+}
+
+/**
+ * Quota windows must reach consumers already normalised.
+ *
+ * Asserted directly rather than through the route: a window only appears on a
+ * row built from a live quota snapshot, which needs a seeded token store, so
+ * the route-level loop over `row.quota.windows` runs zero times in this suite
+ * and can never see a regression here.
+ */
+async function testAccountsQuotaWindowsAreNormalised(): Promise<boolean> {
+  const { __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  // resetsAt is Unix seconds on the wire; consumers want milliseconds.
+  const weeklyResetSeconds = Math.floor(Date.UTC(2026, 7, 22, 0, 0, 0) / 1000);
+  const normalised = __testHooks.normalizeQuotaForAccounts({
+    weeklyResetAt: weeklyResetSeconds,
+    windows: [
+      { name: "session", status: "allowed", resetsAt: weeklyResetSeconds },
+      { name: "weekly", status: "rejected", resetsAt: weeklyResetSeconds },
+    ],
+  }) as { weeklyResetAtMs?: number; windows?: Record<string, unknown>[] };
+
+  if (normalised?.weeklyResetAtMs !== weeklyResetSeconds * 1000) {
+    log("a reset timestamp was not normalised to milliseconds", "red");
+    return false;
+  }
+  const windows = normalised.windows ?? [];
+  if (windows.length !== 2) {
+    log("normalisation dropped a quota window", "red");
+    return false;
+  }
+  for (const w of windows) {
+    if (!("severity" in w) || !("isActive" in w) || !("resetsAtMs" in w)) {
+      log("a quota window was not normalised for consumers", "red");
+      return false;
+    }
+  }
+  if (windows[1].severity !== "critical") {
+    log("a rejected window was not raised to critical severity", "red");
+    return false;
+  }
+  return true;
+}
+
+/**
+ * The ledger must split an account's usage by the CLI that spent it.
+ *
+ * One account is routinely shared by several CLIs, so an account-level total
+ * cannot answer "what is costing me this". Rows written before attribution
+ * existed carry no client at all and must land in their own bucket rather than
+ * being folded into a named one, which would overstate that client's spend.
+ */
+async function testLedgerSplitsUsageByClient(): Promise<boolean> {
+  const { readAccountUsage, resetAccountLedgerCache } =
+    await import("../src/lib/proxy/accountLedger.js");
+  const rows = [
+    ledgerRow({ requestId: "c1", account: "a@t", clientApp: "claude-code" }),
+    ledgerRow({ requestId: "c2", account: "a@t", clientApp: "claude-code" }),
+    ledgerRow({ requestId: "o1", account: "a@t", clientApp: "opencode" }),
+    // Pre-attribution row: no clientApp, no userAgent.
+    ledgerRow({ requestId: "x1", account: "a@t" }),
+  ];
+  return await withLedgerHome(rows, LEDGER_DATE, async () => {
+    resetAccountLedgerCache();
+    const row = (await readAccountUsage(LEDGER_DATE)).get("anthropic:a@t");
+    if (!row) {
+      log("ledger reported nothing for an account with traffic", "red");
+      return false;
+    }
+    if (row.requests !== 4) {
+      log("ledger lost a request while splitting by client", "red");
+      return false;
+    }
+    const claude = row.byClient["claude-code"];
+    const opencode = row.byClient["opencode"];
+    const legacy = row.byClient["unattributed"];
+    if (!claude || claude.requests !== 2) {
+      log("ledger did not group both requests under their client", "red");
+      return false;
+    }
+    if (!opencode || opencode.requests !== 1) {
+      log("ledger dropped a second client's usage", "red");
+      return false;
+    }
+    if (!legacy || legacy.requests !== 1) {
+      log("a row predating attribution was not kept in its own bucket", "red");
+      return false;
+    }
+    // The split must reconcile with the total, or a dashboard showing both
+    // side by side contradicts itself.
+    const summed = Object.values(row.byClient).reduce(
+      (n, c) => n + c.requests,
+      0,
+    );
+    if (summed !== row.requests) {
+      log("per-client requests do not reconcile with the account total", "red");
+      return false;
+    }
+    const summedCost = Number(
+      Object.values(row.byClient)
+        .reduce((n, c) => n + c.costUsd, 0)
+        .toFixed(6),
+    );
+    if (summedCost !== row.costUsd) {
+      log("per-client cost does not reconcile with the account total", "red");
+      return false;
+    }
+    return true;
+  });
+}
+
+/** The route must join quota, stats and usage, and label the cost basis. */
+/**
+ * A stats entry for a login that is no longer in the token store is a removed
+ * account, not an unrouted one. The route used to resurrect it forever — a
+ * deleted login served requests once, its counters persist, and "type oauth
+ * with no route" was read as "disabled", so it rendered as a phantom UNROUTED
+ * card in every dashboard. Disabled and allowlist-excluded logins are still
+ * in the store and must keep rendering; that is the case the rule exists for.
+ */
+async function testAccountsOmitsRemovedLoginsKeepsDisabledOnes(): Promise<boolean> {
+  const { createClaudeProxyRoutes, __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  const stats = await import("../src/lib/proxy/usageStats.js");
+  await stats.resetUsageStatsForTests();
+  stats.recordAttempt("ghost@example.com", "oauth");
+  stats.recordFinalSuccess("ghost@example.com", "oauth");
+  stats.recordAttempt("disabled@example.com", "oauth");
+  stats.recordFinalSuccess("disabled@example.com", "oauth");
+  __testHooks.setAccountDirectoryForTests({
+    knownKeys: new Set(["anthropic:disabled@example.com"]),
+    anthropic: [],
+    codex: [],
+  });
+  try {
+    const route = createClaudeProxyRoutes().routes.find((r) =>
+      r.path.endsWith("/accounts"),
+    );
+    if (!route) {
+      log("GET /accounts is not registered", "red");
+      return false;
+    }
+    const body = (await route.handler({
+      query: {},
+      headers: {},
+      method: "GET",
+      path: "/accounts",
+      requestId: "suite",
+    } as never)) as {
+      accounts?: {
+        label?: string;
+        kind?: string;
+        status?: string | null;
+        provider?: string;
+      }[];
+    };
+    const rows = body.accounts ?? [];
+    const disabled = rows.find((r) => r.label === "disabled@example.com");
+    if (
+      !disabled ||
+      disabled.kind !== "account" ||
+      disabled.status !== "unrouted"
+    ) {
+      log(
+        "a login that is in the token store but not routed lost its unrouted row",
+        "red",
+      );
+      return false;
+    }
+    if (disabled.provider !== "anthropic") {
+      log("an unrouted row does not name its provider", "red");
+      return false;
+    }
+    if (rows.some((r) => r.label === "ghost@example.com")) {
+      log(
+        "a login that was removed from the token store was resurrected as an unrouted account",
+        "red",
+      );
+      return false;
+    }
+    return true;
+  } finally {
+    __testHooks.setAccountDirectoryForTests(null);
+    await stats.resetUsageStatsForTests();
+  }
+}
+
+/**
+ * One email, two engines. The Codex login shares its label with the Anthropic
+ * one; the route used to join stats and today's usage by bare label, so the
+ * Codex login was either swallowed by the Anthropic row or, with a unique
+ * label, tagged as internal plumbing because "codex-oauth" was not a real
+ * account type. Every join is by provider-qualified key now, and each row
+ * says which engine it belongs to.
+ */
+async function testAccountsKeepsCodexDistinctFromSameLabelAnthropic(): Promise<boolean> {
+  const { createClaudeProxyRoutes, __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  const stats = await import("../src/lib/proxy/usageStats.js");
+  const { currentUsageDate, resetAccountLedgerCache } =
+    await import("../src/lib/proxy/accountLedger.js");
+  await stats.resetUsageStatsForTests();
+  stats.recordAttempt("same@example.com", "oauth");
+  stats.recordFinalSuccess("same@example.com", "oauth");
+  stats.recordAttempt("same@example.com", "oauth");
+  stats.recordFinalSuccess("same@example.com", "oauth");
+  stats.recordAttempt("same@example.com", "codex-oauth");
+  stats.recordFinalSuccess("same@example.com", "codex-oauth");
+  __testHooks.setAccountDirectoryForTests({
+    knownKeys: new Set([
+      "anthropic:same@example.com",
+      "codex:same@example.com",
+    ]),
+    anthropic: [],
+    codex: [],
+  });
+  const today = currentUsageDate();
+  try {
+    return await withLedgerHome(
+      [
+        ledgerRow({
+          requestId: "a1",
+          account: "same@example.com",
+          accountKey: "anthropic:same@example.com",
+          timestamp: `${today}T00:00:00.000Z`,
+        }),
+        ledgerRow({
+          requestId: "c1",
+          account: "same@example.com",
+          accountKey: "codex:same@example.com",
+          accountType: "codex-oauth",
+          model: "gpt-5.6-sol",
+          inputTokens: 777,
+          outputTokens: 7,
+          timestamp: `${today}T00:00:00.000Z`,
+        }),
+      ],
+      today,
+      async () => {
+        resetAccountLedgerCache();
+        const route = createClaudeProxyRoutes().routes.find((r) =>
+          r.path.endsWith("/accounts"),
+        );
+        if (!route) {
+          log("GET /accounts is not registered", "red");
+          return false;
+        }
+        const body = (await route.handler({
+          query: {},
+          headers: {},
+          method: "GET",
+          path: "/accounts",
+          requestId: "suite",
+        } as never)) as {
+          accounts?: {
+            label?: string;
+            key?: string | null;
+            kind?: string;
+            provider?: string;
+            requests?: number | null;
+            usage?: { inputTokens?: number } | null;
+          }[];
+        };
+        const rows = (body.accounts ?? []).filter(
+          (r) => r.label === "same@example.com",
+        );
+        const anthropic = rows.find((r) => r.provider === "anthropic");
+        const codex = rows.find((r) => r.provider === "codex");
+        if (!anthropic || !codex) {
+          log(
+            "the two engines' logins sharing one email did not both get an account row",
+            "red",
+          );
+          return false;
+        }
+        if (anthropic.kind !== "account" || codex.kind !== "account") {
+          log(
+            "a Codex login was tagged as plumbing instead of an account",
+            "red",
+          );
+          return false;
+        }
+        if (
+          anthropic.key !== "anthropic:same@example.com" ||
+          codex.key !== "codex:same@example.com"
+        ) {
+          log("rows do not carry their provider-qualified keys", "red");
+          return false;
+        }
+        if (anthropic.requests !== 2 || codex.requests !== 1) {
+          log(
+            "request counters were joined by label and crossed engines",
+            "red",
+          );
+          return false;
+        }
+        if (
+          anthropic.usage?.inputTokens !== 1000 ||
+          codex.usage?.inputTokens !== 777
+        ) {
+          log("today's usage was joined by label and crossed engines", "red");
+          return false;
+        }
+        return true;
+      },
+    );
+  } finally {
+    __testHooks.setAccountDirectoryForTests(null);
+    await stats.resetUsageStatsForTests();
+    resetAccountLedgerCache();
+  }
+}
+
+/**
+ * /limits is the quota source every dashboard row is built from. It only ever
+ * enumerated Anthropic logins, so a Codex login had no quota row anywhere and
+ * every surface downstream inherited the gap.
+ */
+async function testLimitsSnapshotEnumeratesBothEngines(): Promise<boolean> {
+  const { __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  const account = (key: string, label: string) => ({
+    key,
+    label,
+    token: "t",
+    type: "oauth" as const,
+  });
+  __testHooks.setAccountDirectoryForTests({
+    knownKeys: new Set(["anthropic:a@example.com", "codex:a@example.com"]),
+    anthropic: [account("anthropic:a@example.com", "a@example.com")],
+    codex: [account("codex:a@example.com", "a@example.com")],
+  });
+  try {
+    const limits = await __testHooks.refreshAccountLimits({
+      snapshotOnly: true,
+    });
+    const byKey = new Map(limits.results.map((r) => [r.key, r]));
+    const anthropic = byKey.get("anthropic:a@example.com");
+    const codex = byKey.get("codex:a@example.com");
+    if (!anthropic || !codex) {
+      log("a snapshot /limits did not enumerate both engines' logins", "red");
+      return false;
+    }
+    if (anthropic.provider !== "anthropic" || codex.provider !== "codex") {
+      log(
+        "limits results do not say which engine each login belongs to",
+        "red",
+      );
+      return false;
+    }
+    if (anthropic.status !== "snapshot" || codex.status !== "snapshot") {
+      log("a snapshot request fetched instead of reading stored state", "red");
+      return false;
+    }
+    return true;
+  } finally {
+    __testHooks.setAccountDirectoryForTests(null);
+  }
+}
+
+async function testAccountsRouteShape(): Promise<boolean> {
+  const { createClaudeProxyRoutes } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  const route = createClaudeProxyRoutes().routes.find((r) =>
+    r.path.endsWith("/accounts"),
+  );
+  if (!route || route.method !== "GET") {
+    log(
+      "GET /accounts is not registered on the Claude proxy route group",
+      "red",
+    );
+    return false;
+  }
+  const body = (await route.handler({
+    query: {},
+    headers: {},
+    method: "GET",
+    path: "/accounts",
+    requestId: "suite",
+  } as never)) as {
+    costBasis?: string;
+    quotaFromSnapshot?: boolean;
+    accounts?: { kind?: string; quota?: Record<string, unknown> | null }[];
+  };
+
+  if (body.costBasis !== "api-equivalent") {
+    log(
+      "cost basis is not labelled, so a consumer could read it as a bill",
+      "red",
+    );
+    return false;
+  }
+  if (body.quotaFromSnapshot !== true) {
+    log("a polled route defaulted to a live upstream quota fetch", "red");
+    return false;
+  }
+  if (!Array.isArray(body.accounts)) {
+    log("accounts is not an array", "red");
+    return false;
+  }
+  for (const row of body.accounts) {
+    if (!row.kind) {
+      log("an account row is missing its kind discriminator", "red");
+      return false;
+    }
+    const windows = (row.quota?.windows ?? []) as Record<string, unknown>[];
+    for (const w of windows) {
+      if (!("severity" in w) || !("isActive" in w) || !("resetsAtMs" in w)) {
+        log("a quota window was not normalised for consumers", "red");
+        return false;
+      }
+    }
+  }
   return true;
 }
 
@@ -1524,9 +6236,31 @@ async function testPrimaryMaybeResetToHome(): Promise<boolean | null> {
 // Tests: quota-aware cooldown planning (reset-based, no 60s hardcap)
 // ============================================================================
 
-function makeQuota(
-  over: Record<string, number | string>,
-): Record<string, number | string> {
+/**
+ * Report a routing-case failure and reset the shared runtime state first.
+ *
+ * `__testHooks` state is module-level, so a case that returns early on failure
+ * leaves the next case reading its accounts and quotas. One real failure then
+ * cascades into unrelated ones and buries the original cause.
+ */
+async function failRoutingCase(message: string): Promise<false> {
+  const { __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  log(message, "red");
+  __testHooks.resetAllRuntimeState();
+  return false;
+}
+
+/**
+ * Fixed epoch-ms the routing cases evaluate against. Cases must also pass
+ * `lastUpdated: TEST_NOW` into makeQuota: routing discards a snapshot older
+ * than QUOTA_SNAPSHOT_FRESHNESS_MS, and the wall-clock default sits far
+ * enough from this clock to read as months stale, which silently routes a
+ * case down the unknown-quota probe path instead of the comparator.
+ */
+const TEST_NOW = 1_800_000_000_000;
+
+function makeQuota(over: Partial<AccountQuota> = {}): AccountQuota {
   return {
     sessionUsed: 0,
     sessionStatus: "allowed",
@@ -1635,7 +6369,70 @@ async function testPlanCooldownFor429(): Promise<boolean | null> {
     return false;
   }
 
-  log("planCooldownFor429: 4 cases passed", "green");
+  // 5. A Fable-scoped 429 can carry top-level `unified: rejected` even while
+  // the account-wide session and weekly windows are allowed. It must rotate
+  // this request, preserve the scoped quota window, and never park the account
+  // for unrelated models.
+  const scopedResetSec = nowSec + 3 * 24 * 3600;
+  const fableScopedQuota = makeQuota({
+    unifiedStatus: "rejected",
+    overageStatus: "rejected",
+    lastUpdated: now,
+    sessionResetAt: nowSec + 2 * 3600,
+    weeklyResetAt: nowSec + 5 * 24 * 3600,
+    windows: [
+      {
+        kind: "weekly_scoped",
+        group: "weekly",
+        used: 1,
+        status: "rejected",
+        resetsAt: scopedResetSec,
+        scopeModel: "claude-fable-5",
+      },
+    ],
+  });
+  const scopedPlan = __testHooks.planCooldownFor429(
+    fableScopedQuota,
+    0,
+    now,
+    undefined,
+    undefined,
+    "claude-fable-5-20260115",
+  );
+  if (
+    scopedPlan.scope !== "model" ||
+    scopedPlan.reason !== "unified" ||
+    scopedPlan.rotateImmediately !== true ||
+    scopedPlan.coolingUntil !== scopedResetSec * 1000
+  ) {
+    log(
+      `planCooldownFor429: scoped case must rotate without account cooldown, got ${JSON.stringify(scopedPlan)}`,
+      "red",
+    );
+    return false;
+  }
+  const previouslyParked = {
+    coolingUntil: now + 12 * 3600 * 1000,
+    coolingReason: "unified" as const,
+  };
+  const scopedReconciliation = __testHooks.reconcileCooldownFromQuota(
+    previouslyParked as never,
+    fableScopedQuota,
+    now,
+  );
+  if (
+    scopedReconciliation?.kind !== "cleared" ||
+    previouslyParked.coolingUntil !== undefined ||
+    previouslyParked.coolingReason !== undefined
+  ) {
+    log(
+      "planCooldownFor429: scoped evidence must clear a historical account-wide unified cooldown",
+      "red",
+    );
+    return false;
+  }
+
+  log("planCooldownFor429: 5 cases passed", "green");
   return true;
 }
 
@@ -1658,14 +6455,21 @@ async function testOrderAccountsByQuota(): Promise<boolean | null> {
   // a: weekly resets in 3d ; b: weekly resets in 8h (soonest) ; c: session
   // rejected (cooling until +2h). Expect: b (soonest weekly) → a → c (unusable).
   __testHooks.setAccountRuntimeState("anthropic:a", {
-    quota: makeQuota({ weeklyResetAt: nowSec + 3 * 24 * 3600 }) as never,
+    quota: makeQuota({
+      lastUpdated: now,
+      weeklyResetAt: nowSec + 3 * 24 * 3600,
+    }) as never,
   });
   __testHooks.setAccountRuntimeState("anthropic:b", {
-    quota: makeQuota({ weeklyResetAt: nowSec + 8 * 3600 }) as never,
+    quota: makeQuota({
+      lastUpdated: now,
+      weeklyResetAt: nowSec + 8 * 3600,
+    }) as never,
   });
   __testHooks.setAccountRuntimeState("anthropic:c", {
     coolingUntil: now + 2 * 3600 * 1000,
     quota: makeQuota({
+      lastUpdated: now,
       sessionStatus: "rejected",
       sessionResetAt: nowSec + 2 * 3600,
     }) as never,
@@ -1683,16 +6487,16 @@ async function testOrderAccountsByQuota(): Promise<boolean | null> {
     return false;
   }
 
-  // Probe-first: an account with NO quota data must sort before known
-  // accounts (one request reveals its windows). Ranking it last would starve
-  // it forever: never picked → never observed → never comparable.
+  // Unknown quota must not displace known healthy accounts. The adaptive
+  // refresh coordinator discovers unknown windows through the lightweight
+  // usage endpoint instead of sending production traffic as a probe.
   const d: Acct = { key: "anthropic:d", label: "d", token: "t", type: "oauth" };
   const probeOrdered = __testHooks
     .orderAccountsByQuota([a, b, d] as never, now, undefined)
     .map((x: { label: string }) => x.label);
-  if (probeOrdered.join(",") !== "d,b,a") {
+  if (probeOrdered.join(",") !== "b,a,d") {
     log(
-      `orderAccountsByQuota: expected d,b,a (unknown probed first), got ${probeOrdered.join(",")}`,
+      `orderAccountsByQuota: expected b,a,d (known healthy before unknown), got ${probeOrdered.join(",")}`,
       "red",
     );
     __testHooks.resetAllRuntimeState();
@@ -1716,7 +6520,7 @@ async function testOrderAccountsByQuota(): Promise<boolean | null> {
 
   __testHooks.resetAllRuntimeState();
   log(
-    "orderAccountsByQuota: soonest-reset-first + probe-first + primary tie-break passed",
+    "orderAccountsByQuota: soonest-reset-first + known-before-unknown + primary tie-break passed",
     "green",
   );
   return true;
@@ -1725,6 +6529,1129 @@ async function testOrderAccountsByQuota(): Promise<boolean | null> {
 // ============================================================================
 // Tests: weekly-expiry-first ordering, soft limit, and reset freshening
 // ============================================================================
+
+async function testScopedQuotaRouting(): Promise<boolean | null> {
+  const { __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  __testHooks.resetAllRuntimeState();
+  const now = TEST_NOW;
+  const nowSec = Math.floor(now / 1000);
+
+  type Acct = { key: string; label: string; token: string; type: "oauth" };
+  const mk = (label: string): Acct => ({
+    key: `anthropic:${label}`,
+    label,
+    token: "t",
+    type: "oauth",
+  });
+
+  const baseQuota = (windows?: unknown[]) => ({
+    sessionUsed: 0.1,
+    sessionStatus: "allowed",
+    sessionResetAt: nowSec + 3600,
+    weeklyUsed: 0.1,
+    weeklyStatus: "allowed",
+    weeklyResetAt: nowSec + 5 * 24 * 3600,
+    fallbackPercentage: 0,
+    overageStatus: "rejected",
+    lastUpdated: now,
+    windows,
+  });
+  const scoped = (scopeModel: string, used: number, status = "allowed") => ({
+    kind: "weekly_scoped",
+    group: "weekly",
+    used,
+    status,
+    resetsAt: nowSec + 4 * 24 * 3600,
+    isActive: true,
+    scopeModel,
+  });
+  const order = (accts: Acct[], model?: string): string =>
+    __testHooks
+      .orderAccountsByQuota(
+        accts as never,
+        now,
+        undefined,
+        undefined,
+        undefined,
+        model,
+      )
+      .map((x: { label: string }) => x.label)
+      .join(",");
+
+  const fail = (message: string): false => {
+    log(message, "red");
+    __testHooks.resetAllRuntimeState();
+    return false;
+  };
+
+  // A scoped cap that is spent must exclude the account for THAT model only.
+  const a = mk("a");
+  const b = mk("b");
+  __testHooks.setAccountRuntimeState(a.key, {
+    quota: baseQuota([scoped("Fable", 1.0, "rejected")]) as never,
+  });
+  __testHooks.setAccountRuntimeState(b.key, { quota: baseQuota() as never });
+  if (order([a, b], "claude-fable-5-20260115") !== "b,a") {
+    return fail("scoped routing: exhausted scoped cap must sort last");
+  }
+  if (order([a, b], "claude-sonnet-4-5-20250929") !== "a,b") {
+    return fail("scoped routing: other models must not be penalised");
+  }
+  // A scoped rejection must never park the whole account.
+  if (__testHooks.getAccountRuntimeState(a.key)?.coolingUntil !== undefined) {
+    return fail("scoped routing: scoped rejection must not set a cooldown");
+  }
+
+  // Unscoped traffic must behave exactly as before.
+  __testHooks.resetAllRuntimeState();
+  const c = mk("c");
+  const d = mk("d");
+  __testHooks.setAccountRuntimeState(c.key, {
+    quota: { ...baseQuota(), weeklyResetAt: nowSec + 3 * 24 * 3600 } as never,
+  });
+  __testHooks.setAccountRuntimeState(d.key, {
+    quota: { ...baseQuota(), weeklyResetAt: nowSec + 8 * 3600 } as never,
+  });
+  if (order([c, d]) !== "d,c" || order([c, d], "claude-sonnet-4-5") !== "d,c") {
+    return fail("scoped routing: unscoped ordering must be unchanged");
+  }
+
+  // Fill-first inside the scoped allowance, and headroom demotion past the
+  // soft limit.
+  __testHooks.resetAllRuntimeState();
+  const e = mk("e");
+  const f = mk("f");
+  __testHooks.setAccountRuntimeState(e.key, {
+    quota: baseQuota([scoped("Fable", 0.2)]) as never,
+  });
+  __testHooks.setAccountRuntimeState(f.key, {
+    quota: baseQuota([scoped("Fable", 0.8)]) as never,
+  });
+  if (order([e, f], "claude-fable-5-20260115") !== "f,e") {
+    return fail("scoped routing: higher scoped utilization must go first");
+  }
+  __testHooks.setAccountRuntimeState(f.key, {
+    quota: baseQuota([scoped("Fable", 0.99)]) as never,
+  });
+  __testHooks.setAccountRuntimeState(e.key, {
+    quota: baseQuota([scoped("Fable", 0.5)]) as never,
+  });
+  if (order([e, f], "claude-fable-5-20260115") !== "e,f") {
+    return fail("scoped routing: saturated scoped cap must be demoted");
+  }
+
+  // Match guards: a bare vendor scope matches nothing; versions do not leak.
+  __testHooks.resetAllRuntimeState();
+  const g = mk("g");
+  const h = mk("h");
+  __testHooks.setAccountRuntimeState(g.key, {
+    quota: baseQuota([scoped("Claude", 1.0, "rejected")]) as never,
+  });
+  __testHooks.setAccountRuntimeState(h.key, { quota: baseQuota() as never });
+  if (order([g, h], "claude-sonnet-4-5-20250929") !== "g,h") {
+    return fail('scoped routing: bare "Claude" scope must not gate models');
+  }
+  __testHooks.setAccountRuntimeState(g.key, {
+    quota: baseQuota([scoped("Claude Opus 4.6", 1.0, "rejected")]) as never,
+  });
+  if (order([g, h], "claude-opus-4-6-20260115") !== "h,g") {
+    return fail("scoped routing: version-specific cap must gate its version");
+  }
+  if (order([g, h], "claude-opus-4-5-20250101") !== "g,h") {
+    return fail("scoped routing: version cap must not leak to other versions");
+  }
+
+  // A stale snapshot must be ignored for scoped decisions too.
+  __testHooks.resetAllRuntimeState();
+  const i = mk("i");
+  const j = mk("j");
+  __testHooks.setAccountRuntimeState(i.key, {
+    quota: {
+      ...baseQuota([scoped("Fable", 1.0, "rejected")]),
+      lastUpdated: now - 20 * 60 * 1000,
+    } as never,
+  });
+  __testHooks.setAccountRuntimeState(j.key, { quota: baseQuota() as never });
+  if (order([i, j], "claude-fable-5-20260115") !== "i,j") {
+    return fail("scoped routing: stale scoped snapshot must be ignored");
+  }
+
+  __testHooks.resetAllRuntimeState();
+  log(
+    "scoped quota routing: exclusion + fill-first + guards + staleness passed",
+    "green",
+  );
+  return true;
+}
+
+// ============================================================================
+// Tests: organization entitlement rejections rotate instead of failing
+// ============================================================================
+
+/** The body Anthropic returns when an org has disabled Claude Code OAuth. */
+const ENTITLEMENT_403_BODY = JSON.stringify({
+  type: "error",
+  error: {
+    type: "permission_error",
+    message:
+      "OAuth authentication is currently not allowed for this organization.",
+    details: { error_code: "oauth_not_allowed_for_organization" },
+  },
+});
+
+async function testEntitlementDetectors(): Promise<boolean | null> {
+  const { __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  const { isAccountEntitlementError, isDurableEntitlementBlock } = __testHooks;
+
+  const cases: Array<{
+    what: string;
+    status: number;
+    body: string;
+    rotate: boolean;
+    persist: boolean;
+  }> = [
+    {
+      what: "org-disabled 403",
+      status: 403,
+      body: ENTITLEMENT_403_BODY,
+      rotate: true,
+      persist: true,
+    },
+    {
+      // Rotation is cheap and reversible, so an unrecognised permission_error
+      // still rotates; persisting it would disable an account on a guess.
+      what: "unknown permission_error",
+      status: 403,
+      body: JSON.stringify({
+        type: "error",
+        error: { type: "permission_error", message: "nope" },
+      }),
+      rotate: true,
+      persist: false,
+    },
+    {
+      what: "malformed request",
+      status: 400,
+      body: JSON.stringify({
+        type: "error",
+        error: { type: "invalid_request_error", message: "bad" },
+      }),
+      rotate: false,
+      persist: false,
+    },
+    {
+      what: "rate limit",
+      status: 429,
+      body: JSON.stringify({
+        type: "error",
+        error: { type: "rate_limit_error", message: "slow down" },
+      }),
+      rotate: false,
+      persist: false,
+    },
+    {
+      what: "non-JSON 403",
+      status: 403,
+      body: "<html>",
+      rotate: false,
+      persist: false,
+    },
+    {
+      what: "404",
+      status: 404,
+      body: ENTITLEMENT_403_BODY,
+      rotate: false,
+      persist: false,
+    },
+  ];
+
+  for (const c of cases) {
+    if (isAccountEntitlementError(c.status, c.body) !== c.rotate) {
+      log(`entitlement detector: wrong rotate verdict for ${c.what}`, "red");
+      return false;
+    }
+    if (isDurableEntitlementBlock(c.status, c.body) !== c.persist) {
+      log(`entitlement detector: wrong persist verdict for ${c.what}`, "red");
+      return false;
+    }
+  }
+  log(`entitlement detectors: ${cases.length} cases passed`, "green");
+  return true;
+}
+
+async function testEntitlementRotation(): Promise<boolean | null> {
+  const { __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  __testHooks.resetAllRuntimeState();
+
+  // A synthetic key so the shared token store is never asked to disable a real
+  // account; markDisabled is a no-op for a provider it does not know.
+  const account = {
+    key: "anthropic:entitlement@test",
+    label: "entitlement@test",
+    token: "t",
+    type: "oauth" as const,
+    refreshToken: "r",
+  };
+  const noop = (): void => undefined;
+
+  const result = await __testHooks.handleAnthropicNonOkResponse({
+    response: new Response(ENTITLEMENT_403_BODY, {
+      status: 403,
+      headers: { "content-type": "application/json" },
+    }),
+    account: account as never,
+    accountState: {
+      consecutiveRefreshFailures: 0,
+      permanentlyDisabled: false,
+    } as never,
+    enabledAccounts: [account] as never,
+    orderedAccounts: [account] as never,
+    requestStartTime: Date.now(),
+    fetchStartMs: Date.now(),
+    attemptNumber: 1,
+    logAttempt: noop as never,
+    logProxyBody: noop as never,
+    logFinalRequest: noop as never,
+    lastError: undefined,
+    authFailureMessage: null,
+    sawTransientFailure: false,
+    invalidRequestFailure: null,
+    entitlementFailure: null,
+  });
+
+  if (result.continueLoop !== true || result.response !== undefined) {
+    return await failRoutingCase(
+      "entitlement rotation: must rotate, not return a terminal response",
+    );
+  }
+  if (result.invalidRequestFailure !== null) {
+    // Setting it would suppress provider fallback and outrank a later 429.
+    return await failRoutingCase(
+      "entitlement rotation: must not record an invalid-request failure",
+    );
+  }
+  if (result.authFailureMessage !== null) {
+    return await failRoutingCase(
+      "entitlement rotation: must not surface an auth failure",
+    );
+  }
+  if (
+    result.entitlementFailure?.accounts.length !== 1 ||
+    result.entitlementFailure.errorCode !== "oauth_not_allowed_for_organization"
+  ) {
+    return await failRoutingCase(
+      "entitlement rotation: entitlement failure not recorded",
+    );
+  }
+
+  __testHooks.resetAllRuntimeState();
+  log(
+    "entitlement rotation: rotates and records without poisoning state",
+    "green",
+  );
+  return true;
+}
+
+async function testEntitlementTerminalResponse(): Promise<boolean | null> {
+  const { __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  const noop = (): void => undefined;
+  const result = __testHooks.buildClaudeAnthropicFailureResponse({
+    tracer: undefined,
+    requestStartTime: Date.now(),
+    // An auth failure is present too: the entitlement diagnosis is the more
+    // specific one and must win, or the user is told to re-login pointlessly.
+    authFailureMessage: "re-authenticate please",
+    authCooldownMessage: null,
+    invalidRequestFailure: null,
+    entitlementFailure: {
+      status: 403,
+      accounts: ["a@test", "b@test"],
+      message:
+        "OAuth authentication is currently not allowed for this organization.",
+      errorCode: "oauth_not_allowed_for_organization",
+    },
+    scopedExhaustion: null,
+    sawNetworkError: false,
+    sawTransientFailure: false,
+    sawRateLimit: false,
+    lastError: undefined,
+    fallbackFailureMessage: undefined,
+    // The pool must be fully accounted for by the block: the rung deliberately
+    // stands down when only some accounts were blocked, so the other accounts'
+    // real failures are not masked behind a do-not-retry 403.
+    orderedAccounts: [
+      { key: "anthropic:a", label: "a@test", token: "t", type: "oauth" },
+      { key: "anthropic:b", label: "b@test", token: "t", type: "oauth" },
+    ] as never,
+    buildLoggedClaudeError: ((
+      status: number,
+      message: string,
+      errorType?: string,
+    ) => ({ status, message, errorType })) as never,
+    logProxyBody: noop as never,
+    logFinalRequest: noop as never,
+  }) as { status?: number; message?: string; errorType?: string };
+
+  if (result.status !== 403 || result.errorType !== "permission_error") {
+    log("entitlement terminal: expected a 403 permission_error", "red");
+    return false;
+  }
+  if (
+    !result.message?.includes("organization entitlement policy") ||
+    !result.message.includes("neurolink auth enable")
+  ) {
+    log("entitlement terminal: message lacks the cause or the remedy", "red");
+    return false;
+  }
+  log(
+    "entitlement terminal: 403 outranks the auth rung and names the fix",
+    "green",
+  );
+  return true;
+}
+
+// ============================================================================
+// Tests: cooldowns cannot outlast what their reason can mean
+// ============================================================================
+
+async function testCooldownReasonCeilings(): Promise<boolean | null> {
+  const { __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  const now = TEST_NOW;
+  const nowSec = Math.floor(now / 1000);
+
+  // A 5-hour window reporting a reset 9 days out is not believable; without a
+  // per-reason ceiling this parked accounts for days under reason "session".
+  const sessionPlan = __testHooks.planCooldownFor429(
+    makeQuota({
+      sessionStatus: "rejected",
+      sessionResetAt: nowSec + 9 * 24 * 3600,
+    }) as never,
+    0,
+    now,
+  );
+  const sessionHours = (sessionPlan.coolingUntil - now) / 3600000;
+  if (sessionPlan.reason !== "session" || sessionHours > 5.5) {
+    log(
+      `cooldown ceiling: session plan exceeded its window (${sessionHours.toFixed(1)}h)`,
+      "red",
+    );
+    return false;
+  }
+
+  // A genuine weekly cooldown must survive intact.
+  const weeklyPlan = __testHooks.planCooldownFor429(
+    makeQuota({
+      weeklyStatus: "rejected",
+      weeklyResetAt: nowSec + 6 * 24 * 3600,
+    }) as never,
+    0,
+    now,
+  );
+  const weeklyDays = (weeklyPlan.coolingUntil - now) / 86400000;
+  if (weeklyPlan.reason !== "weekly" || weeklyDays < 5.9) {
+    log(
+      `cooldown ceiling: weekly plan was truncated (${weeklyDays.toFixed(1)}d)`,
+      "red",
+    );
+    return false;
+  }
+
+  log("cooldown ceilings: session capped, weekly preserved", "green");
+  return true;
+}
+
+async function testQuotaRefreshReleasesRecoveredCooldown(): Promise<
+  boolean | null
+> {
+  const { __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  const now = TEST_NOW;
+  const nowSec = Math.floor(now / 1000);
+  const state = {
+    coolingUntil: now + 6 * 24 * 3600 * 1000,
+    coolingReason: "weekly",
+  } as never;
+
+  const stillExhausted = __testHooks.reconcileCooldownFromQuota(
+    state,
+    makeQuota({
+      weeklyStatus: "rejected",
+      weeklyResetAt: nowSec + 6 * 24 * 3600,
+      lastUpdated: now,
+    }) as never,
+    now,
+  );
+  if (
+    stillExhausted !== null ||
+    !(state as { coolingUntil?: number }).coolingUntil
+  ) {
+    log("quota refresh: rejected weekly window must remain cooling", "red");
+    return false;
+  }
+
+  const recovered = __testHooks.reconcileCooldownFromQuota(
+    state,
+    makeQuota({
+      weeklyStatus: "allowed",
+      weeklyUsed: 0.05,
+      weeklyResetAt: nowSec + 7 * 24 * 3600,
+      lastUpdated: now + 1,
+    }) as never,
+    now + 1,
+  );
+  if (
+    recovered?.kind !== "cleared" ||
+    (state as { coolingUntil?: number }).coolingUntil !== undefined ||
+    (state as { coolingReason?: string }).coolingReason !== undefined
+  ) {
+    log("quota refresh: allowed weekly window did not release cooldown", "red");
+    return false;
+  }
+
+  const transientState = {
+    coolingUntil: now + 30_000,
+    coolingReason: "transient",
+  } as never;
+  const transientUpdate = __testHooks.reconcileCooldownFromQuota(
+    transientState,
+    makeQuota({
+      weeklyStatus: "allowed",
+      weeklyUsed: 0.05,
+      lastUpdated: now + 2,
+    }) as never,
+    now + 2,
+  );
+  if (
+    transientUpdate !== null ||
+    (transientState as { coolingUntil?: number }).coolingUntil === undefined
+  ) {
+    log("quota refresh: must not clear an unrelated transient cooldown", "red");
+    return false;
+  }
+
+  log(
+    "quota refresh: fresh weekly recovery releases only its cooldown",
+    "green",
+  );
+  return true;
+}
+
+async function testPersistedCooldownClamp(): Promise<boolean | null> {
+  const { initAccountCooldown, loadAccountCooldowns } =
+    await import("../src/lib/proxy/accountCooldown.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-cooldown-"));
+  const file = path.join(dir, "account-cooldowns.json");
+  try {
+    // Reproduces a real on-disk entry: a "session" cooldown running 206 hours,
+    // written before per-reason ceilings existed. It must heal on load rather
+    // than needing an operator to clear it.
+    const updatedAt = TEST_NOW - 24 * 3600 * 1000;
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        "anthropic:stuck": {
+          coolingUntil: updatedAt + 206 * 3600 * 1000,
+          reason: "session",
+          updatedAt,
+        },
+        "anthropic:legit": {
+          coolingUntil: updatedAt + 6 * 24 * 3600 * 1000,
+          reason: "weekly",
+          updatedAt,
+        },
+      }),
+    );
+    initAccountCooldown(file);
+    const loaded = await loadAccountCooldowns();
+    if (!loaded["anthropic:stuck"] || !loaded["anthropic:legit"]) {
+      log("persisted cooldown clamp: an entry was dropped on load", "red");
+      return false;
+    }
+
+    const stuckHours =
+      (loaded["anthropic:stuck"].coolingUntil - updatedAt) / 3600000;
+    if (stuckHours > 5.5) {
+      log(
+        `persisted cooldown clamp: session entry still spans ${stuckHours.toFixed(1)}h`,
+        "red",
+      );
+      return false;
+    }
+    const legitDays =
+      (loaded["anthropic:legit"].coolingUntil - updatedAt) / 86400000;
+    if (legitDays < 5.9) {
+      log(
+        "persisted cooldown clamp: weekly entry must not be shortened",
+        "red",
+      );
+      return false;
+    }
+    log(
+      "persisted cooldown clamp: stale session entry healed on load",
+      "green",
+    );
+    return true;
+  } finally {
+    // Leave the module pointed somewhere that still exists: initAccountCooldown
+    // mutates module-level state, so a later cooldown write in this process
+    // would otherwise target the directory removed below.
+    initAccountCooldown(
+      path.join(os.tmpdir(), "neurolink-cooldown-discard.json"),
+    );
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ============================================================================
+// Tests: cleanup must not delete credentials that still work
+// ============================================================================
+
+async function testCleanupRetainsUsableCredentials(): Promise<boolean | null> {
+  const { readFileSync } = await import("fs");
+  const src = readFileSync(
+    path.join(process.cwd(), "src/cli/commands/auth.ts"),
+    "utf-8",
+  );
+
+  // `auth cleanup --force` hard-deletes disabled entries. The partition must be
+  // expressed as "reasons that mean the credential is broken", so an operator's
+  // free-text `auth disable --reason` is retained. Written as an allowlist of
+  // recoverable reasons instead, any unlisted reason silently becomes a delete —
+  // which destroyed a real credential during development.
+  if (!src.includes("BROKEN_CREDENTIAL_DISABLE_REASONS")) {
+    log("cleanup guard: expected the broken-credential reason set", "red");
+    return false;
+  }
+  if (!src.includes("!BROKEN_CREDENTIAL_DISABLE_REASONS.has(reason)")) {
+    log("cleanup guard: retention must be the negated membership test", "red");
+    return false;
+  }
+  for (const reason of [
+    "missing_refresh_token",
+    "refresh_invalid",
+    "refresh_failed",
+  ]) {
+    if (!src.includes(`"${reason}"`)) {
+      log(`cleanup guard: deletable reason ${reason} is not enumerated`, "red");
+      return false;
+    }
+  }
+  log("cleanup guard: only broken credentials are deletable", "green");
+  return true;
+}
+
+// ============================================================================
+// Tests: model-scoped windows come from live response headers
+// ============================================================================
+
+/** The unified header family Anthropic returns on a Fable response. */
+function fableResponseHeaders(nowSec: number): Record<string, string> {
+  return {
+    "anthropic-ratelimit-unified-5h-utilization": "0.2",
+    "anthropic-ratelimit-unified-5h-status": "allowed",
+    "anthropic-ratelimit-unified-5h-reset": String(nowSec + 3600),
+    "anthropic-ratelimit-unified-7d-utilization": "0.3",
+    "anthropic-ratelimit-unified-7d-status": "allowed",
+    "anthropic-ratelimit-unified-7d-reset": String(nowSec + 5 * 24 * 3600),
+    "anthropic-ratelimit-unified-7d_oi-utilization": "0.9",
+    "anthropic-ratelimit-unified-7d_oi-status": "allowed",
+    "anthropic-ratelimit-unified-7d_oi-reset": String(nowSec + 4 * 24 * 3600),
+    "anthropic-ratelimit-unified-overage-status": "rejected",
+    "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled",
+    "anthropic-ratelimit-unified-representative-claim": "five_hour",
+  };
+}
+
+async function testScopedQuotaHeaderParsing(): Promise<boolean | null> {
+  const { parseQuotaHeaders, mergeQuotaSnapshot } =
+    await import("../src/lib/proxy/accountQuota.js");
+  const now = TEST_NOW;
+  const nowSec = Math.floor(now / 1000);
+  const headers = fableResponseHeaders(nowSec);
+
+  const quota = parseQuotaHeaders(headers, {
+    model: "claude-fable-5-20260115",
+    now,
+  });
+  if (!quota) {
+    log("scoped header parsing: expected a quota snapshot", "red");
+    return false;
+  }
+  const scopedWindows = (quota.windows ?? []).filter(
+    (w) => w.headerWindow === "7d_oi",
+  );
+  if (scopedWindows.length !== 1) {
+    log("scoped header parsing: expected exactly one scoped window", "red");
+    return false;
+  }
+  const [window] = scopedWindows;
+  // Tagged by family, not the dated wire id, so a new snapshot date still matches.
+  if (
+    window.scopeModel !== "claude-fable-5" ||
+    window.kind !== "weekly_scoped" ||
+    window.source !== "headers" ||
+    window.updatedAt !== now
+  ) {
+    log("scoped header parsing: window shape is wrong", "red");
+    return false;
+  }
+  if (
+    quota.overageDisabledReason !== "org_level_disabled" ||
+    quota.representativeClaim !== "five_hour"
+  ) {
+    log("scoped header parsing: overage/claim fields were dropped", "red");
+    return false;
+  }
+  // Anthropic sends no `unified-fallback` header, so this stays "unknown" and
+  // the legacy back-compat branch of isQuotaOverageAvailable stays inert. Making
+  // it reachable would stop cooling accounts that park correctly today.
+  if (quota.fallbackStatus !== "unknown") {
+    log("scoped header parsing: fallbackStatus default must not change", "red");
+    return false;
+  }
+  // The header does not say which model it scopes, so an untagged capture must
+  // not invent one.
+  const untagged = parseQuotaHeaders(headers, { now });
+  if (!untagged) {
+    log("scoped header parsing: untagged headers must still parse", "red");
+    return false;
+  }
+  if ((untagged.windows ?? []).length !== 0) {
+    log("scoped header parsing: must not emit a window without a model", "red");
+    return false;
+  }
+  // An Opus response carries no scoped family at all.
+  const opusHeaders = { ...headers };
+  delete opusHeaders["anthropic-ratelimit-unified-7d_oi-utilization"];
+  delete opusHeaders["anthropic-ratelimit-unified-7d_oi-status"];
+  delete opusHeaders["anthropic-ratelimit-unified-7d_oi-reset"];
+  const opusQuota = parseQuotaHeaders(opusHeaders, {
+    model: "claude-opus-5",
+    now,
+  });
+  if (!opusQuota) {
+    log("scoped header parsing: unscoped headers must still parse", "red");
+    return false;
+  }
+  if ((opusQuota.windows ?? []).length !== 0) {
+    log("scoped header parsing: unscoped response must yield no window", "red");
+    return false;
+  }
+
+  // The merge is what keeps scoped routing alive: a later Opus response carries
+  // no scoped window, and must not erase the Fable one.
+  const merged = mergeQuotaSnapshot(quota, opusQuota);
+  if (
+    (merged.windows ?? []).filter((w) => w.headerWindow === "7d_oi").length !==
+    1
+  ) {
+    log("scoped header parsing: merge dropped the scoped window", "red");
+    return false;
+  }
+
+  // A new model snapshot describes the same cap, so it must update the existing
+  // window rather than append one per release and grow the array forever.
+  const laterSnapshot = parseQuotaHeaders(headers, {
+    model: "claude-fable-5-20260320",
+    now: now + 1000,
+  });
+  if (!laterSnapshot) {
+    log("scoped header parsing: later snapshot must parse", "red");
+    return false;
+  }
+  const afterUpgrade = mergeQuotaSnapshot(merged, laterSnapshot);
+  const scopedAfter = (afterUpgrade.windows ?? []).filter(
+    (w) => w.headerWindow === "7d_oi",
+  );
+  if (scopedAfter.length !== 1 || scopedAfter[0].updatedAt !== now + 1000) {
+    log(
+      "scoped header parsing: snapshot bump must replace, not accumulate",
+      "red",
+    );
+    return false;
+  }
+
+  log("scoped header parsing: 7d_oi captured, tagged, and preserved", "green");
+  return true;
+}
+
+async function testScopedExhaustionGate(): Promise<boolean | null> {
+  const { __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  __testHooks.resetAllRuntimeState();
+  const now = TEST_NOW;
+  const nowSec = Math.floor(now / 1000);
+  const mk = (label: string) => ({
+    key: `anthropic:${label}`,
+    label,
+    token: "t",
+    type: "oauth" as const,
+  });
+  const quotaWith = (used: number, status: string, ageMs = 0) => ({
+    ...makeQuota({ overageStatus: "rejected" }),
+    lastUpdated: now - ageMs,
+    windows: [
+      {
+        kind: "weekly_scoped",
+        group: "weekly",
+        used,
+        status,
+        resetsAt: nowSec + 3 * 24 * 3600,
+        scopeModel: "claude-fable-5",
+        source: "headers",
+        updatedAt: now - ageMs,
+      },
+    ],
+  });
+
+  const spent = mk("spent");
+  const fresh = mk("fresh");
+  __testHooks.setAccountRuntimeState(spent.key, {
+    quota: quotaWith(1, "rejected") as never,
+  });
+  __testHooks.setAccountRuntimeState(fresh.key, {
+    quota: quotaWith(0.2, "allowed") as never,
+  });
+
+  // With headroom available elsewhere, the spent account is excluded outright —
+  // ordering alone would still send the request there when it sorts first.
+  const withHeadroom = __testHooks.evaluateScopedExhaustion(
+    [spent, fresh] as never,
+    "claude-fable-5-20260115",
+    now,
+  );
+  if (
+    withHeadroom.eligible.length !== 1 ||
+    withHeadroom.eligible[0].label !== "fresh" ||
+    withHeadroom.exhaustion !== null
+  ) {
+    return await failRoutingCase(
+      "scoped gate: a spent account must be excluded when headroom exists",
+    );
+  }
+
+  // Every account spent: report it rather than making a doomed upstream call.
+  const allSpent = __testHooks.evaluateScopedExhaustion(
+    [spent] as never,
+    "claude-fable-5-20260115",
+    now,
+  );
+  if (
+    allSpent.eligible.length !== 0 ||
+    allSpent.exhaustion?.scopeModel !== "claude-fable-5" ||
+    allSpent.exhaustion.accounts.length !== 1
+  ) {
+    return await failRoutingCase(
+      "scoped gate: full exhaustion must be reported",
+    );
+  }
+
+  // Another model is unaffected — this is a per-model cap, not a cooldown.
+  const otherModel = __testHooks.evaluateScopedExhaustion(
+    [spent] as never,
+    "claude-opus-5",
+    now,
+  );
+  if (otherModel.eligible.length !== 1 || otherModel.exhaustion !== null) {
+    return await failRoutingCase(
+      "scoped gate: other models must stay eligible",
+    );
+  }
+
+  // Stale evidence must never take the pool down.
+  __testHooks.setAccountRuntimeState(spent.key, {
+    quota: quotaWith(1, "rejected", 30 * 60 * 1000) as never,
+  });
+  const stale = __testHooks.evaluateScopedExhaustion(
+    [spent] as never,
+    "claude-fable-5-20260115",
+    now,
+  );
+  if (stale.eligible.length !== 1 || stale.exhaustion !== null) {
+    return await failRoutingCase(
+      "scoped gate: a stale window must not exclude an account",
+    );
+  }
+
+  // A scoped rejection is per-model, so it must never park the account.
+  if (
+    __testHooks.getAccountRuntimeState(spent.key)?.coolingUntil !== undefined
+  ) {
+    return await failRoutingCase(
+      "scoped gate: scoped exhaustion must not set a cooldown",
+    );
+  }
+
+  // A window persisted without `status` must not crash the gate. The quota file
+  // is JSON.parse'd with no validation, and this runs before the account loop —
+  // a throw here 502s every request until the file is deleted by hand.
+  __testHooks.setAccountRuntimeState(spent.key, {
+    quota: {
+      ...makeQuota({}),
+      lastUpdated: now,
+      windows: [
+        {
+          kind: "weekly_scoped",
+          scopeModel: "claude-fable-5",
+          resetsAt: nowSec + 3600,
+          updatedAt: now,
+        },
+      ],
+    } as never,
+  });
+  const malformed = __testHooks.evaluateScopedExhaustion(
+    [spent] as never,
+    "claude-fable-5-20260115",
+    now,
+  );
+  if (malformed.eligible.length !== 1) {
+    return await failRoutingCase(
+      "scoped gate: a window without a status must not exclude",
+    );
+  }
+
+  __testHooks.resetAllRuntimeState();
+  log("scoped gate: excludes, reports, and never empties the pool", "green");
+  return true;
+}
+
+async function testScopedSortNeedsBothWindows(): Promise<boolean | null> {
+  const { __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  __testHooks.resetAllRuntimeState();
+  const now = TEST_NOW;
+  const nowSec = Math.floor(now / 1000);
+  const mk = (label: string) => ({
+    key: `anthropic:${label}`,
+    label,
+    token: "t",
+    type: "oauth" as const,
+  });
+
+  // Only the account that has served a model gets that model's scoped window.
+  // If the fill-first rung compared a real utilization against the "absent"
+  // sentinel, the account holding a window would always win — funnelling every
+  // request for that model onto whichever account happened to serve it first,
+  // and inverting the weekly fill-first order.
+  const scopedLight = mk("scopedlight");
+  const unscopedHeavy = mk("unscopedheavy");
+  __testHooks.setAccountRuntimeState(scopedLight.key, {
+    quota: {
+      ...makeQuota({ weeklyUsed: 0.05, weeklyResetAt: nowSec + 6 * 24 * 3600 }),
+      lastUpdated: now,
+      windows: [
+        {
+          kind: "weekly_scoped",
+          group: "weekly",
+          used: 0.1,
+          status: "allowed",
+          resetsAt: nowSec + 3 * 24 * 3600,
+          scopeModel: "claude-fable-5",
+          source: "headers",
+          updatedAt: now,
+        },
+      ],
+    } as never,
+  });
+  __testHooks.setAccountRuntimeState(unscopedHeavy.key, {
+    quota: {
+      ...makeQuota({ weeklyUsed: 0.95, weeklyResetAt: nowSec + 6 * 24 * 3600 }),
+      lastUpdated: now,
+    } as never,
+  });
+
+  const order = __testHooks
+    .orderAccountsByQuota(
+      [scopedLight, unscopedHeavy] as never,
+      now,
+      undefined,
+      undefined,
+      undefined,
+      "claude-fable-5-20260115",
+    )
+    .map((x: { label: string }) => x.label)
+    .join(",");
+  if (order !== "unscopedheavy,scopedlight") {
+    log(
+      "scoped sort: a one-sided scoped window must not override weekly fill-first",
+      "red",
+    );
+    __testHooks.resetAllRuntimeState();
+    return false;
+  }
+
+  __testHooks.resetAllRuntimeState();
+  log(
+    "scoped sort: fill-first preserved when only one side is scoped",
+    "green",
+  );
+  return true;
+}
+
+async function testApiKeyPermissionErrorKeepsItsDiagnosis(): Promise<
+  boolean | null
+> {
+  const { __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  __testHooks.resetAllRuntimeState();
+
+  // Anthropic answers an under-privileged API key with permission_error too.
+  // Routing that into the OAuth entitlement branch would tell the operator to
+  // ask an admin to re-enable Claude Code OAuth — meaningless for an API key.
+  const account = {
+    key: "anthropic:env",
+    label: "env",
+    token: "sk-test",
+    type: "api_key" as const,
+  };
+  const noop = (): void => undefined;
+  const result = await __testHooks.handleAnthropicNonOkResponse({
+    response: new Response(
+      JSON.stringify({
+        type: "error",
+        error: {
+          type: "permission_error",
+          message: "Your API key does not have permission to use the resource.",
+        },
+      }),
+      { status: 403, headers: { "content-type": "application/json" } },
+    ),
+    account: account as never,
+    accountState: {
+      consecutiveRefreshFailures: 0,
+      permanentlyDisabled: false,
+    } as never,
+    enabledAccounts: [account] as never,
+    orderedAccounts: [account] as never,
+    requestStartTime: Date.now(),
+    fetchStartMs: Date.now(),
+    attemptNumber: 1,
+    logAttempt: noop as never,
+    logProxyBody: noop as never,
+    logFinalRequest: noop as never,
+    lastError: undefined,
+    authFailureMessage: null,
+    sawTransientFailure: false,
+    invalidRequestFailure: null,
+    entitlementFailure: null,
+  });
+
+  if (result.entitlementFailure !== null) {
+    return await failRoutingCase(
+      "api_key 403: must not be recorded as an entitlement block",
+    );
+  }
+  if (!result.authFailureMessage) {
+    return await failRoutingCase(
+      "api_key 403: must keep its api-key authentication diagnosis",
+    );
+  }
+
+  __testHooks.resetAllRuntimeState();
+  log("api_key 403: keeps its own diagnosis", "green");
+  return true;
+}
+
+async function testEntitlementNeedsWholePool(): Promise<boolean | null> {
+  const { __testHooks } =
+    await import("../src/lib/server/routes/claudeProxyRoutes.js");
+  const noop = (): void => undefined;
+  const build = (accountCount: number): { status?: number } =>
+    __testHooks.buildClaudeAnthropicFailureResponse({
+      tracer: undefined,
+      requestStartTime: Date.now(),
+      authFailureMessage: null,
+      authCooldownMessage: null,
+      invalidRequestFailure: null,
+      entitlementFailure: {
+        status: 403,
+        accounts: ["a@test"],
+        message: "not allowed for this organization",
+        errorCode: "oauth_not_allowed_for_organization",
+      },
+      scopedExhaustion: null,
+      sawNetworkError: true,
+      sawTransientFailure: true,
+      sawRateLimit: false,
+      lastError: "connection reset",
+      fallbackFailureMessage: undefined,
+      orderedAccounts: Array.from({ length: accountCount }, (_, i) => ({
+        key: `anthropic:a${i}`,
+        label: `a${i}`,
+        token: "t",
+        type: "oauth" as const,
+      })) as never,
+      buildLoggedClaudeError: ((status: number) => ({ status })) as never,
+      logProxyBody: noop as never,
+      logFinalRequest: noop as never,
+    }) as { status?: number };
+
+  // One blocked account among many that failed for real reasons must not mask
+  // them behind a 403 — a 403 tells the client not to retry, and retrying is
+  // exactly right for a transport failure.
+  if (build(4).status !== 502) {
+    log(
+      "entitlement scope: a partial block must not win over real failures",
+      "red",
+    );
+    return false;
+  }
+  if (build(1).status !== 403) {
+    log("entitlement scope: a fully blocked pool must report 403", "red");
+    return false;
+  }
+  log("entitlement scope: 403 only when it explains the whole pool", "green");
+  return true;
+}
+
+async function testQuotaMergePreservesProviderConfig(): Promise<
+  boolean | null
+> {
+  const { mergeQuotaSnapshot } =
+    await import("../src/lib/proxy/accountQuota.js");
+  // Each source reports a different half of the extra-usage picture, so a plain
+  // overwrite makes whether an exhausted account gets parked depend on which
+  // source happened to write last.
+  const fromUsageApi = {
+    ...makeQuota({}),
+    lastUpdated: TEST_NOW,
+    source: "usage-api",
+    overageEnabled: true,
+  };
+  const fromHeaders = {
+    ...makeQuota({}),
+    lastUpdated: TEST_NOW + 1000,
+    source: "headers",
+    overageDisabledReason: "org_level_disabled",
+  };
+
+  const afterHeaders = mergeQuotaSnapshot(
+    fromUsageApi as never,
+    fromHeaders as never,
+  );
+  if (afterHeaders.overageEnabled !== true) {
+    log(
+      "quota merge: usage-api extra-usage flag must survive a header capture",
+      "red",
+    );
+    return false;
+  }
+  const afterRefresh = mergeQuotaSnapshot(afterHeaders, fromUsageApi as never);
+  if (afterRefresh.overageDisabledReason !== "org_level_disabled") {
+    log(
+      "quota merge: header-only overage reason must survive a refresh",
+      "red",
+    );
+    return false;
+  }
+  log("quota merge: provider configuration survives both directions", "green");
+  return true;
+}
 
 async function testWeeklyExpiryOrdering(): Promise<boolean | null> {
   const { __testHooks } =
@@ -1775,7 +7702,7 @@ async function runWeeklyExpiryOrderingCases(
       .join(",");
   const setQuota = (l: string, over: Record<string, number | string>): void =>
     __testHooks.setAccountRuntimeState(`anthropic:${l}`, {
-      quota: makeQuota(over) as never,
+      quota: makeQuota({ lastUpdated: now, ...over }) as never,
     });
   const fail = (msg: string): false => {
     log(msg, "red");
@@ -2377,6 +8304,13 @@ async function testCliPrimaryRoundtrip(): Promise<boolean | null> {
 // Test Registration
 // ============================================================================
 
+/**
+ * Categories that never touch the spawned proxy — they drive exported helpers
+ * directly. A launchd-managed daemon makes the live cases unrunnable but says
+ * nothing about these, and skipping them hides real regressions.
+ */
+const IN_PROCESS_CATEGORIES = new Set(["proxy-config", "proxy-primary"]);
+
 const tests: TestFunction[] = [
   // Infrastructure (proxy lifecycle)
   { name: "Proxy Startup", fn: testProxyStartup, category: "proxy-infra" },
@@ -2426,6 +8360,400 @@ const tests: TestFunction[] = [
     category: "proxy-primary",
   },
   {
+    name: "Quota: model-scoped caps gate routing",
+    fn: testScopedQuotaRouting,
+    category: "proxy-primary",
+  },
+  {
+    name: "Quota: scoped windows parsed from live headers",
+    fn: testScopedQuotaHeaderParsing,
+    category: "proxy-primary",
+  },
+  {
+    name: "Quota: scoped exhaustion gates eligibility",
+    fn: testScopedExhaustionGate,
+    category: "proxy-primary",
+  },
+  {
+    name: "Quota: scoped sort needs a window on both sides",
+    fn: testScopedSortNeedsBothWindows,
+    category: "proxy-primary",
+  },
+  {
+    name: "Quota: merge preserves provider configuration",
+    fn: testQuotaMergePreservesProviderConfig,
+    category: "proxy-primary",
+  },
+  {
+    name: "OpenCode: config dir is XDG on all platforms",
+    fn: testOpenCodeConfigDirIsXdgOnAllPlatforms,
+    category: "proxy-config",
+  },
+  {
+    name: "OpenCode: writer reports whether it wrote",
+    fn: testOpenCodeWriterReportsWhetherItWrote,
+    category: "proxy-config",
+  },
+  {
+    name: "OpenCode: writer output is loadable by OpenCode",
+    fn: testOpenCodeWriterOutputIsLoadable,
+    category: "proxy-config",
+  },
+  {
+    name: "OpenCode: legacy in-file snapshot migrates and heals",
+    fn: testOpenCodeMigratesLegacyInFileSnapshot,
+    category: "proxy-config",
+  },
+  {
+    name: "Gemini CLI: restore respects a user repoint",
+    fn: testGeminiRestoreRespectsAUserRepoint,
+    category: "proxy-config",
+  },
+  {
+    name: "Gemini CLI: a CRLF .env round-trips byte-exactly",
+    fn: testGeminiRoundTripsCrlfExactly,
+    category: "proxy-config",
+  },
+  {
+    name: "Gemini CLI: duplicate managed keys are collapsed",
+    fn: testGeminiCollapsesDuplicateManagedKeys,
+    category: "proxy-config",
+  },
+  {
+    name: "Gemini CLI: .env writer round-trips exactly",
+    fn: testGeminiEnvWriterRoundTrip,
+    category: "proxy-config",
+  },
+  {
+    name: "OpenCode: a malformed snapshot never deletes user config",
+    fn: testOpenCodeMalformedSnapshotIsIgnored,
+    category: "proxy-config",
+  },
+  {
+    name: "Gemini CLI: a malformed snapshot never loses user variables",
+    fn: testGeminiMalformedSnapshotIsIgnored,
+    category: "proxy-config",
+  },
+  {
+    name: "Gemini CLI: restore keeps edits made after apply",
+    fn: testGeminiRestoreKeepsPostApplyEdits,
+    category: "proxy-config",
+  },
+  {
+    name: "OpenCode: snapshot is scoped per config directory",
+    fn: testOpenCodeSnapshotIsScopedPerConfigDir,
+    category: "proxy-config",
+  },
+  {
+    name: "Gemini CLI: apply refuses when the snapshot is unusable",
+    fn: testGeminiApplyRefusesOnUnusableSnapshot,
+    category: "proxy-config",
+  },
+  {
+    name: "OpenCode: a partial legacy record is never restored from",
+    fn: testOpenCodePartialLegacyRecordIsNotRestoredFrom,
+    category: "proxy-config",
+  },
+  {
+    name: "OpenCode: this config's snapshot outranks the global fallback",
+    fn: testOpenCodePrefersInFileSnapshotOverGlobalFallback,
+    category: "proxy-config",
+  },
+  {
+    name: "OpenCode: an interrupted migration keeps the true original",
+    fn: testOpenCodeInterruptedMigrationKeepsTrueOriginal,
+    category: "proxy-config",
+  },
+  {
+    name: "OpenCode: clearing one root keeps another root's legacy snapshot",
+    fn: testOpenCodeClearKeepsOtherRootsLegacySnapshot,
+    category: "proxy-config",
+  },
+  {
+    name: "Gemini CLI: clear without a snapshot keeps the user's key",
+    fn: testGeminiClearWithoutSnapshotKeepsTheKey,
+    category: "proxy-config",
+  },
+  {
+    name: "Gemini CLI: a stale snapshot is re-captured, not replayed",
+    fn: testGeminiRecapturesStaleSnapshot,
+    category: "proxy-config",
+  },
+  {
+    name: "OpenCode: clear restores the user's own config",
+    fn: testOpenCodeClearRestoresUserConfig,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: Qwen restore leaves a user-edited credential",
+    fn: testQwenRestoreLeavesUserEditedAuth,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: Claude restore leaves a user-edited value",
+    fn: testClaudeRestoreLeavesUserEditedValue,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: OpenCode restore leaves a user-edited block",
+    fn: testOpenCodeRestoreLeavesUserEditedBlock,
+    category: "proxy-config",
+  },
+  {
+    name: "Codex: model discovery route answers the CLI",
+    fn: testCodexModelsDiscovery,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: uninstall restores every client config",
+    fn: testUninstallRestoresClientConfigs,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: OpenCode re-snapshots after an unclean exit",
+    fn: testOpenCodeReSnapshotsAfterUncleanExit,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: Claude re-snapshots after an unclean exit",
+    fn: testClaudeReSnapshotsAfterUncleanExit,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: Qwen re-snapshots after an unclean exit",
+    fn: testQwenReSnapshotsAfterUncleanExit,
+    category: "proxy-config",
+  },
+  {
+    name: "Analyze: a re-logged request merges instead of overwriting",
+    fn: testAnalyzeMergesDoubleWrittenRequest,
+    category: "proxy-config",
+  },
+  {
+    name: "Analyze: usage survives a completion after the window edge",
+    fn: testAnalyzeKeepsUsageAcrossWindowEdge,
+    category: "proxy-config",
+  },
+  {
+    name: "Ledger: a re-logged request is not double counted",
+    fn: testLedgerDedupesRepeatedRequestId,
+    category: "proxy-config",
+  },
+  {
+    name: "Ledger: a token-less later record cannot erase usage",
+    fn: testLedgerKeepsMaxTokensAcrossRecords,
+    category: "proxy-config",
+  },
+  {
+    name: "Ledger: each engine's usage lands on its own key",
+    fn: testLedgerKeysCodexRowsByEngine,
+    category: "proxy-config",
+  },
+  {
+    name: "Ledger: costs at published rates and names unpriced models",
+    fn: testLedgerCostsAndFlagsUnpriced,
+    category: "proxy-config",
+  },
+  {
+    name: "Ledger: a partially written line is not consumed",
+    fn: testLedgerIgnoresPartialTrailingLine,
+    category: "proxy-config",
+  },
+  {
+    name: "Ledger: distinct requests sharing a client id stay separate",
+    fn: testLedgerSeparatesDistinctRequestsSharingAnId,
+    category: "proxy-config",
+  },
+  {
+    name: "Accounts: every row is classified by kind",
+    fn: testAccountsRowsAreClassifiedByKind,
+    category: "proxy-config",
+  },
+  {
+    name: "Accounts: the configured primary account is marked",
+    fn: testAccountsMarksThePrimaryAccount,
+    category: "proxy-config",
+  },
+  {
+    name: "Accounts: quota windows reach consumers normalised",
+    fn: testAccountsQuotaWindowsAreNormalised,
+    category: "proxy-config",
+  },
+  {
+    name: "Accounts: route joins quota, stats and usage with a labelled basis",
+    fn: testAccountsRouteShape,
+    category: "proxy-config",
+  },
+  {
+    name: "Accounts: a removed login is omitted, a disabled one stays unrouted",
+    fn: testAccountsOmitsRemovedLoginsKeepsDisabledOnes,
+    category: "proxy-config",
+  },
+  {
+    name: "Accounts: a Codex login sharing an email keeps its own row",
+    fn: testAccountsKeepsCodexDistinctFromSameLabelAnthropic,
+    category: "proxy-config",
+  },
+  {
+    name: "Limits: a snapshot enumerates both engines' logins",
+    fn: testLimitsSnapshotEnumeratesBothEngines,
+    category: "proxy-config",
+  },
+  {
+    name: "Analyze: exact rates are not reported as inferred",
+    fn: testAnalyzePricingProvenance,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: Claude restore refuses without a snapshot",
+    fn: testClaudeRestoreRefusesWithoutSnapshot,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: Claude configurator probes before writing",
+    fn: testClaudeConfiguratorDetectsInstall,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: Codex configurator probes before writing",
+    fn: testCodexConfiguratorDetectsInstall,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: Codex apply/restore round-trips a real config",
+    fn: testCodexConfiguratorRoundTrip,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: config writes are atomic under a concurrent reader",
+    fn: testClientConfigWritesAreAtomic,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: atomic writes preserve config permissions",
+    fn: testClientConfigWritesPreservePermissions,
+    category: "proxy-config",
+  },
+  // Gemini CLI door: GOOGLE_GEMINI_BASE_URL round-trip through
+  // /v1beta/models/:model:generateContent (SKIPs without a Google account;
+  // FAILs only on 404 or a malformed 200)
+  {
+    name: "Gemini Door: generateContent",
+    fn: testGeminiDoorGenerateContent,
+    category: "proxy-api",
+  },
+
+  // Account Management,
+  {
+    name: "Ledger: usage splits by calling CLI and reconciles",
+    fn: testLedgerSplitsUsageByClient,
+    category: "proxy-config",
+  },
+  {
+    name: "Tracking: every inbound door reaches the tracking middleware",
+    fn: testEveryDoorIsTracked,
+    category: "proxy-api",
+  },
+  {
+    name: "Gemini Door: multi-turn history reaches the provider intact",
+    fn: testGeminiMultiTurnHistoryReachesProvider,
+    category: "proxy-api",
+  },
+  {
+    name: "Gemini Door: continuing from a model turn reaches the provider",
+    fn: testGeminiModelFinalTurnReachesProvider,
+    category: "proxy-api",
+  },
+  {
+    name: "Attribution: the request log records the calling CLI",
+    fn: testPerClientAttribution,
+  },
+  {
+    name: "Attribution: every configured client is attributable or documented",
+    fn: testEveryConfiguredClientIsAttributable,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: Qwen apply/restore round-trips a real settings file",
+    fn: testQwenConfiguratorRoundTrip,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: Copilot reports when its script is not sourced",
+    fn: testCopilotReportsWhenItsScriptIsNotSourced,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: Copilot env script sets a model id",
+    fn: testCopilotEnvScriptSetsAModelId,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: Copilot emits a sourceable env script",
+    fn: testCopilotConfiguratorWritesEnvFile,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: roster and apply order are pinned",
+    fn: testProxyClientRoster,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: applyAll reports each client independently",
+    fn: testApplyAllReportsPerClient,
+    category: "proxy-config",
+  },
+  {
+    name: "Proxy clients: registry exposes the full configurator contract",
+    fn: testProxyClientRegistryShape,
+    category: "proxy-config",
+  },
+  {
+    name: "Entitlement: detector tiers",
+    fn: testEntitlementDetectors,
+    category: "proxy-primary",
+  },
+  {
+    name: "Entitlement: 403 rotates instead of failing the request",
+    fn: testEntitlementRotation,
+    category: "proxy-primary",
+  },
+  {
+    name: "Entitlement: terminal 403 names cause and remedy",
+    fn: testEntitlementTerminalResponse,
+    category: "proxy-primary",
+  },
+  {
+    name: "Entitlement: api_key 403 keeps its own diagnosis",
+    fn: testApiKeyPermissionErrorKeepsItsDiagnosis,
+    category: "proxy-primary",
+  },
+  {
+    name: "Entitlement: 403 only when it explains the whole pool",
+    fn: testEntitlementNeedsWholePool,
+    category: "proxy-primary",
+  },
+  {
+    name: "Cooldown: per-reason ceilings",
+    fn: testCooldownReasonCeilings,
+    category: "proxy-primary",
+  },
+  {
+    name: "Cooldown: fresh quota recovery releases stale weekly state",
+    fn: testQuotaRefreshReleasesRecoveredCooldown,
+    category: "proxy-primary",
+  },
+  {
+    name: "Cooldown: stale persisted entry clamped on load",
+    fn: testPersistedCooldownClamp,
+    category: "proxy-primary",
+  },
+  {
+    name: "Cleanup: only broken credentials are deletable",
+    fn: testCleanupRetainsUsableCredentials,
+    category: "proxy-primary",
+  },
+  {
     name: "Quota: saveAccountQuota merges across restarts",
     fn: testSaveAccountQuotaMerges,
     category: "proxy-primary",
@@ -2443,7 +8771,10 @@ const tests: TestFunction[] = [
   {
     name: "Primary: /status fallback (no primary configured)",
     fn: testStatusPrimaryAccountFallback,
-    category: "proxy-primary",
+    // Reads /status over HTTP, so it needs the spawned proxy — it must stay
+    // outside IN_PROCESS_CATEGORIES or a launchd-managed environment turns its
+    // skip into a failed fetch.
+    category: "proxy-infra",
   },
   {
     name: "Primary: CLI set-primary/get-primary/clear-primary roundtrip",
@@ -2505,6 +8836,22 @@ const tests: TestFunction[] = [
 // Test Runner
 // ============================================================================
 
+// 180s rather than the shared 240s default, because the proxy under test is
+// one this repo builds and spawns rather than a remote endpoint that deserves
+// the benefit of the doubt.
+//
+// That is not the whole picture and the earlier wording here was wrong: nine
+// cases gate on `hasValidCredentials()` and, when it is true, do reach
+// Anthropic through the spawned proxy. So a breach is USUALLY a defect and
+// occasionally a slow upstream. 180s is still comfortably above a live
+// round-trip; a case that legitimately needs longer should carry its own bound
+// rather than have this one raised for everyone.
+//
+// `withCaseTimeout` rejects, and the message was checked against
+// isExpectedProviderError() so it reports as a FAILURE rather than being
+// swallowed as a skip.
+const CASE_TIMEOUT_MS = 180_000;
+
 async function runAllTests(): Promise<void> {
   if (!fs.existsSync("dist") || !fs.existsSync("dist/cli/index.js")) {
     log("Build artifacts not found. Run: pnpm run build:cli", "red");
@@ -2523,13 +8870,17 @@ async function runAllTests(): Promise<void> {
       if (
         proxyLaunchdManaged &&
         test.name !== "Proxy Startup" &&
-        test.category !== "proxy-config"
+        !IN_PROCESS_CATEGORIES.has(test.category ?? "")
       ) {
         recordTest(test.name, false, true, "launchd-managed proxy detected");
         continue;
       }
       try {
-        const result = await test.fn();
+        const result = await withCaseTimeout(
+          test.name,
+          test.fn,
+          CASE_TIMEOUT_MS,
+        );
         recordTest(
           test.name,
           result === true,
@@ -2539,6 +8890,19 @@ async function runAllTests(): Promise<void> {
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         recordTest(test.name, false, false, msg);
+
+        // A case bound is not an ordinary failure: Promise.race cannot cancel, so
+        // the abandoned case is still running. Continuing would run the loop's
+        // cleanup and inter-case delay underneath live work, and record every
+        // remaining case as "not run". Stop at the first one.
+        if (isCaseTimeout(error)) {
+          log(
+            `\n\u{1F6D1} ABORTING: "${test.name}" was abandoned by its timeout and is still executing. ` +
+              `Remaining cases are NOT run — this process no longer has clean state.`,
+            "red",
+          );
+          break;
+        }
       }
       if (test.category === "proxy-api") {
         await new Promise((r) => setTimeout(r, 2000));
@@ -2546,8 +8910,7 @@ async function runAllTests(): Promise<void> {
     }
   } finally {
     await stopProxy();
-    restoreProxyState();
-    restoreClaudeSettings();
+    fs.rmSync(TEST_HOME, { recursive: true, force: true });
   }
 }
 

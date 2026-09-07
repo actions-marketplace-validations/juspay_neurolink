@@ -25,6 +25,88 @@ export type FileType =
 export type OfficeDocumentType = "docx" | "pptx" | "xlsx";
 
 /**
+ * Outcome of a vision-compatibility pass over one image.
+ *
+ * See `adapters/imageFormatSupport.ts` — `converted` is false both when the
+ * source format was already universally accepted and when no decoder could
+ * read it, so callers must not treat it as a success flag.
+ */
+export type VisionImageConversion = {
+  readonly buffer: Buffer;
+  readonly mimeType: string;
+  /** True when the bytes were re-encoded; false when they were left alone. */
+  readonly converted: boolean;
+};
+
+/**
+ * Outcome of an audio-compatibility pass over one file.
+ *
+ * See `adapters/audioFormatSupport.ts`. As with images, `converted` is false
+ * both when the container was already acceptable and when nothing could
+ * re-encode it, so it is not a success flag — the caller decides what to do
+ * from the resulting `mimeType`.
+ */
+export type AudioConversionResult = {
+  readonly buffer: Buffer;
+  readonly mimeType: string;
+  /** True when the bytes were re-encoded; false when they were left alone. */
+  readonly converted: boolean;
+};
+
+/**
+ * One audio file destined for native delivery to a provider.
+ *
+ * Carries the bytes rather than a path because the decision to send audio is
+ * made per provider, after detection has already read the file — re-reading it
+ * from disk at dispatch time would be a second read of something already in
+ * memory.
+ */
+export type MultimodalAudioEntry = {
+  /** Raw audio bytes, as detected. */
+  buffer: Buffer;
+  /** Display name; may be a full path, so log only its basename. */
+  filename: string;
+  /** Detected MIME type of `buffer`. */
+  mimeType: string;
+};
+
+/**
+ * Broad category a file format belongs to, as a human would name it.
+ *
+ * Distinct from {@link FileType}, which is the *routing* type the detector
+ * emits. The two deliberately differ where one processor handles several
+ * formats: an .odt has `modality: "document"` but `fileType: "docx"`, and a
+ * .svg has `modality: "image"` but `fileType: "svg"` because it is sanitised as
+ * markup rather than sent to a vision API.
+ */
+export type FileModality =
+  | "image"
+  | "audio"
+  | "video"
+  | "document"
+  | "data"
+  | "archive";
+
+/**
+ * One format in the canonical file-type registry.
+ *
+ * `extensions[0]` and `mimeTypes[0]` are canonical; the remaining entries are
+ * aliases accepted on input. See `processors/config/fileTypeRegistry.ts`.
+ */
+export type FileFormatEntry = {
+  /** Human-readable format name, used in registry-conflict errors. */
+  readonly label: string;
+  /** Extensions with leading dots, lowercase; first is canonical. */
+  readonly extensions: readonly string[];
+  /** MIME types, lowercase; first is canonical. */
+  readonly mimeTypes: readonly string[];
+  /** Routing type the detector emits for this format. */
+  readonly fileType: FileType;
+  /** Category a human would put this format in. */
+  readonly modality: FileModality;
+};
+
+/**
  * File with metadata — allows callers to pass filename alongside a Buffer.
  *
  * This is the recommended way for applications (e.g. Slack bots) to pass
@@ -456,6 +538,17 @@ export type FileDetectorOptions = {
    * hint (the lazy FileReferenceRegistry path has its own hint-handling).
    */
   mimetypeHint?: string;
+  /**
+   * Caller-provided filename hint, the companion to {@link mimetypeHint}.
+   *
+   * The unified file path unwraps a `FileWithMetadata` to its `buffer` before
+   * detection runs, so the object's `filename` is gone by the time extension
+   * resolution looks for one — and TAR in particular cannot be identified any
+   * other way, because its "ustar" marker sits at byte 257 rather than at
+   * offset 0. Passing the name alongside the bytes keeps `.odp`, `.rtf` and
+   * `.tar` routed to the processors that can actually read them.
+   */
+  filenameHint?: string;
 };
 
 /**

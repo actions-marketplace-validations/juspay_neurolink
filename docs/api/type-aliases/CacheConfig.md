@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **CacheConfig** = `object`
 
-Defined in: [types/config.ts:235](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L235)
+Defined in: [types/config.ts:332](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L332)
 
 Cache configuration
 
@@ -18,7 +18,7 @@ Cache configuration
 
 > `optional` **enabled?**: `boolean`
 
-Defined in: [types/config.ts:236](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L236)
+Defined in: [types/config.ts:333](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L333)
 
 ---
 
@@ -26,7 +26,7 @@ Defined in: [types/config.ts:236](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **ttlMs?**: `number`
 
-Defined in: [types/config.ts:237](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L237)
+Defined in: [types/config.ts:334](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L334)
 
 ---
 
@@ -34,7 +34,7 @@ Defined in: [types/config.ts:237](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **strategy?**: `"memory"` \| `"writeThrough"` \| `"cacheAside"`
 
-Defined in: [types/config.ts:238](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L238)
+Defined in: [types/config.ts:335](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L335)
 
 ---
 
@@ -42,7 +42,7 @@ Defined in: [types/config.ts:238](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **maxSize?**: `number`
 
-Defined in: [types/config.ts:239](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L239)
+Defined in: [types/config.ts:336](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L336)
 
 ---
 
@@ -50,7 +50,7 @@ Defined in: [types/config.ts:239](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **persistToDisk?**: `boolean`
 
-Defined in: [types/config.ts:240](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L240)
+Defined in: [types/config.ts:337](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L337)
 
 ---
 
@@ -58,4 +58,4 @@ Defined in: [types/config.ts:240](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **diskPath?**: `string`
 
-Defined in: [types/config.ts:241](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L241)
+Defined in: [types/config.ts:338](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L338)

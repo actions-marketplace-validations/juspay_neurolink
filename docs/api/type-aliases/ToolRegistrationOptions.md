@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ToolRegistrationOptions** = `object`
 
-Defined in: [types/tools.ts:178](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L178)
+Defined in: [types/tools.ts:215](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L215)
 
 Options for tool registration via registerTool()
 
@@ -32,7 +32,7 @@ sdk.registerTool("myTool", tool);
 
 > `optional` **timeout?**: `number`
 
-Defined in: [types/tools.ts:181](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L181)
+Defined in: [types/tools.ts:218](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L218)
 
 Per-tool execution timeout in milliseconds. Only applied when explicitly set.
 When omitted, the SDK's global default (30s) is used.
@@ -43,8 +43,36 @@ When omitted, the SDK's global default (30s) is used.
 
 > `optional` **maxRetries?**: `number`
 
-Defined in: [types/tools.ts:185](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tools.ts#L185)
+Defined in: [types/tools.ts:222](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L222)
 
 Maximum retry attempts on failure. Only applied when explicitly set.
 When omitted, the SDK's global default (2 retries) is used.
 Set to 0 to disable retries for this tool.
+
+---
+
+### totalTimeoutMs?
+
+> `optional` **totalTimeoutMs?**: `number`
+
+Defined in: [types/tools.ts:225](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L225)
+
+Ceiling on the whole execution across every attempt and the delays
+between them. When omitted, `timeout * (maxRetries + 1)` is used.
+
+---
+
+### cacheable?
+
+> `optional` **cacheable?**: `boolean`
+
+Defined in: [types/tools.ts:236](https://github.com/juspay/neurolink/blob/release/src/lib/types/tools.ts#L236)
+
+Whether this tool's result may be served from the tool-result cache
+(default true).
+
+Set to `false` for a tool whose result is NOT a function of its arguments
+— anything reading or mutating live state. The cache is keyed by tool name
+plus arguments, so a stateful tool called twice with the same arguments
+replays its first answer for the whole TTL: a checklist that never updates,
+a queue that hands out the same item twice.

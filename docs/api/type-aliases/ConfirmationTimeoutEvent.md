@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ConfirmationTimeoutEvent** = `object`
 
-Defined in: [types/hitl.ts:184](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/hitl.ts#L184)
+Defined in: [types/hitl.ts:184](https://github.com/juspay/neurolink/blob/release/src/lib/types/hitl.ts#L184)
 
 Event payload for confirmation timeouts
 Emitted when user doesn't respond within timeout period
@@ -19,7 +19,7 @@ Emitted when user doesn't respond within timeout period
 
 > **type**: `"hitl:timeout"`
 
-Defined in: [types/hitl.ts:185](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/hitl.ts#L185)
+Defined in: [types/hitl.ts:185](https://github.com/juspay/neurolink/blob/release/src/lib/types/hitl.ts#L185)
 
 ---
 
@@ -27,7 +27,7 @@ Defined in: [types/hitl.ts:185](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **payload**: `object`
 
-Defined in: [types/hitl.ts:186](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/hitl.ts#L186)
+Defined in: [types/hitl.ts:186](https://github.com/juspay/neurolink/blob/release/src/lib/types/hitl.ts#L186)
 
 #### confirmationId
 

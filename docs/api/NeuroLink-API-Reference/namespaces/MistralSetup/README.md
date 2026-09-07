@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../../../README.md)
+[**NeuroLink API Reference**](../../../README.md)
 
 ---
 
@@ -10,4 +10,4 @@ Mistral setup configuration types
 
 ## Type Aliases
 
-- [SetupArgs](type-aliases/SetupArgs.md)
+- [MistralSetupArgs](type-aliases/MistralSetupArgs.md)

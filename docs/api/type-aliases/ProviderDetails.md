@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ProviderDetails** = `object`
 
-Defined in: [types/conversation.ts:647](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L647)
+Defined in: [types/conversation.ts:764](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L764)
 
 ## Properties
 
@@ -16,7 +16,7 @@ Defined in: [types/conversation.ts:647](https://github.com/juspay/neurolink/blob
 
 > **provider**: `string`
 
-Defined in: [types/conversation.ts:648](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L648)
+Defined in: [types/conversation.ts:765](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L765)
 
 ---
 
@@ -24,4 +24,4 @@ Defined in: [types/conversation.ts:648](https://github.com/juspay/neurolink/blob
 
 > **model**: `string`
 
-Defined in: [types/conversation.ts:649](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L649)
+Defined in: [types/conversation.ts:766](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L766)

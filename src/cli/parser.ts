@@ -1,4 +1,12 @@
 import chalk from "chalk";
+// `@types/yargs` is pinned to the v17 line while the runtime `yargs` dependency
+// is v18 — a real, currently unfixable skew. DefinitelyTyped has no v18 types
+// package, and yargs 18's package.json `exports` map gives the main entry no
+// `types` condition, so there is no way to get types straight from the
+// runtime package either. `@types/yargs` therefore stays load-bearing here
+// until DefinitelyTyped (or yargs itself) ships v18-compatible types. This
+// file is the canonical place for that note, not the only import site —
+// yargs is imported across roughly two dozen files in this codebase.
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 import packageJson from "../../package.json" with { type: "json" };
@@ -23,11 +31,16 @@ import {
   proxyUninstallCommand,
 } from "./commands/proxy.js";
 import { proxyAnalyzeCommand } from "./commands/proxyAnalyze.js";
+import { proxyShareCommand } from "./commands/proxyShare.js";
+import { proxyPeerCommand } from "./commands/proxyPeer.js";
+import { proxyExposeCommand } from "./commands/proxyExpose.js";
 import { proxyReplayCommand } from "./commands/proxyReplay.js";
 import { EvaluateCommandFactory } from "./commands/evaluate.js";
 import { TaskCommandFactory } from "./commands/task.js";
 import { AutoresearchCommandFactory } from "./commands/autoresearch.js";
 import { voiceServerCommand } from "./commands/voiceServer.js";
+import { DocsCommandFactory } from "./commands/docs.js";
+import { UsageCommandFactory } from "./commands/usage.js";
 
 // Enhanced CLI with Professional UX
 export function initializeCliParser() {
@@ -173,6 +186,10 @@ export function initializeCliParser() {
 
       // Generate Command (Primary) - Using CLICommandFactory
       .command(CLICommandFactory.createGenerateCommand())
+      // Docs MCP Server Command
+      .command(DocsCommandFactory.createDocsCommand())
+
+      .command(UsageCommandFactory.createUsageCommands())
 
       // Stream Text Command - Using CLICommandFactory
       .command(CLICommandFactory.createStreamCommand())
@@ -257,6 +274,9 @@ export function initializeCliParser() {
           yargs
             .command(proxyStartCommand)
             .command(proxyStatusCommand)
+            .command(proxyShareCommand)
+            .command(proxyPeerCommand)
+            .command(proxyExposeCommand)
             .command(proxyAnalyzeCommand)
             .command(proxyReplayCommand)
             .command(proxyTelemetryCommand)
@@ -266,7 +286,7 @@ export function initializeCliParser() {
             .command(proxyUninstallCommand)
             .demandCommand(
               1,
-              "Please specify a proxy subcommand: start, status, analyze, replay <export|compare>, telemetry <setup|start|stop|status|logs|import-dashboard>, setup, guard, install, or uninstall",
+              "Please specify a proxy subcommand: start, status, share <create|provision|url|list|status|pause|resume|revoke|topup|set|link|rotate|level|note|notes|receipts|delete>, peer <add|request|sync|receipts|net|redeem|list|status|test|remove|pause|resume|set>, expose, analyze, replay <export|compare>, telemetry <setup|start|stop|status|logs|import-dashboard>, setup, guard, install, or uninstall",
             ),
         handler: () => {},
       })

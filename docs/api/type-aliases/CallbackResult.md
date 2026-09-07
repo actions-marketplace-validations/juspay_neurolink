@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **CallbackResult** = `object`
 
-Defined in: [types/subscription.ts:958](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L958)
+Defined in: [types/subscription.ts:1041](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1041)
 
 Callback server result containing the authorization code
 
@@ -18,7 +18,7 @@ Callback server result containing the authorization code
 
 > **code**: `string`
 
-Defined in: [types/subscription.ts:960](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L960)
+Defined in: [types/subscription.ts:1043](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1043)
 
 Authorization code from OAuth callback
 
@@ -28,6 +28,6 @@ Authorization code from OAuth callback
 
 > `optional` **state?**: `string`
 
-Defined in: [types/subscription.ts:962](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/subscription.ts#L962)
+Defined in: [types/subscription.ts:1045](https://github.com/juspay/neurolink/blob/release/src/lib/types/subscription.ts#L1045)
 
 State parameter for CSRF verification

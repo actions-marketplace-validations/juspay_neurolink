@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **SessionMemory** = `object`
 
-Defined in: [types/conversation.ts:123](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L123)
+Defined in: [types/conversation.ts:158](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L158)
 
 Complete memory for a conversation session
 ULTRA-OPTIMIZED: Direct ChatMessage[] storage - zero conversion overhead
@@ -19,7 +19,7 @@ ULTRA-OPTIMIZED: Direct ChatMessage[] storage - zero conversion overhead
 
 > **sessionId**: `string`
 
-Defined in: [types/conversation.ts:125](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L125)
+Defined in: [types/conversation.ts:160](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L160)
 
 Unique session identifier
 
@@ -29,7 +29,7 @@ Unique session identifier
 
 > `optional` **userId?**: `string`
 
-Defined in: [types/conversation.ts:128](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L128)
+Defined in: [types/conversation.ts:163](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L163)
 
 User identifier (optional)
 
@@ -39,7 +39,7 @@ User identifier (optional)
 
 > `optional` **title?**: `string`
 
-Defined in: [types/conversation.ts:131](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L131)
+Defined in: [types/conversation.ts:166](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L166)
 
 Auto-generated conversation title (created on first user message)
 
@@ -49,7 +49,7 @@ Auto-generated conversation title (created on first user message)
 
 > **messages**: [`ChatMessage`](ChatMessage.md)[]
 
-Defined in: [types/conversation.ts:134](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L134)
+Defined in: [types/conversation.ts:169](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L169)
 
 Direct message storage - ready for immediate AI consumption
 
@@ -59,7 +59,7 @@ Direct message storage - ready for immediate AI consumption
 
 > **createdAt**: `number`
 
-Defined in: [types/conversation.ts:141](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L141)
+Defined in: [types/conversation.ts:176](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L176)
 
 When this session was created.
 Format: Unix epoch milliseconds (number).
@@ -71,7 +71,7 @@ Example: 1735689600000 for January 1, 2025, 00:00:00 UTC.
 
 > **lastActivity**: `number`
 
-Defined in: [types/conversation.ts:148](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L148)
+Defined in: [types/conversation.ts:183](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L183)
 
 When this session was last active.
 Format: Unix epoch milliseconds (number).
@@ -83,7 +83,7 @@ Updated on every message addition or session interaction.
 
 > `optional` **summarizedUpToMessageId?**: `string`
 
-Defined in: [types/conversation.ts:151](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L151)
+Defined in: [types/conversation.ts:186](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L186)
 
 Pointer to last summarized message ID (NEW - for token-based memory)
 
@@ -93,7 +93,7 @@ Pointer to last summarized message ID (NEW - for token-based memory)
 
 > `optional` **summarizedMessage?**: `string`
 
-Defined in: [types/conversation.ts:154](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L154)
+Defined in: [types/conversation.ts:189](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L189)
 
 Stored summary message that condenses conversation history up to summarizedUpToMessageId
 
@@ -103,7 +103,7 @@ Stored summary message that condenses conversation history up to summarizedUpToM
 
 > `optional` **tokenThreshold?**: `number`
 
-Defined in: [types/conversation.ts:157](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L157)
+Defined in: [types/conversation.ts:192](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L192)
 
 Per-session token threshold override (NEW - for token-based memory)
 
@@ -113,7 +113,7 @@ Per-session token threshold override (NEW - for token-based memory)
 
 > `optional` **lastTokenCount?**: `number`
 
-Defined in: [types/conversation.ts:160](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L160)
+Defined in: [types/conversation.ts:195](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L195)
 
 Cached token count for performance (NEW - for token-based memory)
 
@@ -123,7 +123,7 @@ Cached token count for performance (NEW - for token-based memory)
 
 > `optional` **lastCountedAt?**: `number`
 
-Defined in: [types/conversation.ts:163](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L163)
+Defined in: [types/conversation.ts:198](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L198)
 
 When token count was last calculated (NEW - for token-based memory)
 
@@ -133,7 +133,7 @@ When token count was last calculated (NEW - for token-based memory)
 
 > `optional` **lastApiTokenCount?**: `object`
 
-Defined in: [types/conversation.ts:166](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L166)
+Defined in: [types/conversation.ts:201](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L201)
 
 API-reported token count from last request (most accurate)
 
@@ -163,7 +163,7 @@ API-reported token count from last request (most accurate)
 
 > `optional` **metadata?**: `object`
 
-Defined in: [types/conversation.ts:175](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L175)
+Defined in: [types/conversation.ts:210](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L210)
 
 Optional session metadata
 

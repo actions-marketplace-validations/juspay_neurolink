@@ -21,14 +21,14 @@ import type { MCPToolAnnotations } from "./mcp.js";
 import type { Logger } from "./utilities.js";
 import type { HITLExecutionState } from "./hitl.js";
 
-// Tool + schema primitives. Today these resolve through the upstream generation
-// library; consumers should import via the package barrel.
-import type { Tool } from "ai";
+// Tool + schema primitives. Declared locally in ./aiCompat.js; this file stays
+// the public path for them so the barrel keeps exporting exactly one binding
+// per name (two `export *` sources for the same name silently drop it).
+import type { Tool } from "./aiCompat.js";
 export type {
   Tool,
   ToolSet,
   ToolChoice,
-  ToolCallOptions,
   ToolExecuteFunction,
   ToolApprovalRequest,
   ToolApprovalResponse,
@@ -37,7 +37,7 @@ export type {
   Schema,
   FlexibleSchema,
   InferSchema,
-} from "ai";
+} from "./aiCompat.js";
 
 /**
  * Commonly used Zod schema type aliases for cleaner type declarations
@@ -128,6 +128,12 @@ export type ToolInfo = {
   /** Per-tool timeout in milliseconds, set at registration time */
   timeoutMs?: number;
   maxRetries?: number;
+  /**
+   * Ceiling on the WHOLE execution — every attempt plus the delays between
+   * them. Declared explicitly rather than left to the index signature below,
+   * which would type it `unknown` and silently defeat the default.
+   */
+  totalTimeoutMs?: number;
   [key: string]: unknown; // Generic extensibility
 };
 
@@ -148,6 +154,13 @@ export type ToolImplementation = {
   /** Per-tool timeout in milliseconds, set at registration time */
   timeoutMs?: number;
   maxRetries?: number;
+  /**
+   * Ceiling on the WHOLE execution — every attempt plus the delays between
+   * them — in milliseconds. `timeoutMs` bounds one attempt; without this, a
+   * tool that reliably hangs burns `timeoutMs * (maxRetries + 1)`.
+   * Defaults to exactly that product, so behaviour is unchanged unless set.
+   */
+  totalTimeoutMs?: number;
 };
 
 /**
@@ -176,6 +189,13 @@ export type ToolExecutionOptions = {
    */
   timeoutMs?: number;
   maxRetries?: number;
+  /**
+   * Ceiling on the WHOLE execution — every attempt plus the delays between
+   * them. `timeout` bounds one attempt. Defaults to
+   * `timeout * (maxRetries + 1)`, which is what the retry loop already spent,
+   * so supplying nothing changes nothing.
+   */
+  totalTimeoutMs?: number;
 };
 
 /**
@@ -200,6 +220,20 @@ export type ToolRegistrationOptions = {
    *  When omitted, the SDK's global default (2 retries) is used.
    *  Set to 0 to disable retries for this tool. */
   maxRetries?: number;
+  /** Ceiling on the whole execution across every attempt and the delays
+   *  between them. When omitted, `timeout * (maxRetries + 1)` is used. */
+  totalTimeoutMs?: number;
+  /**
+   * Whether this tool's result may be served from the tool-result cache
+   * (default true).
+   *
+   * Set to `false` for a tool whose result is NOT a function of its arguments
+   * — anything reading or mutating live state. The cache is keyed by tool name
+   * plus arguments, so a stateful tool called twice with the same arguments
+   * replays its first answer for the whole TTL: a checklist that never updates,
+   * a queue that hands out the same item twice.
+   */
+  cacheable?: boolean;
 };
 
 /**

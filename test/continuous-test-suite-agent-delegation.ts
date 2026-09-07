@@ -1,490 +1,822 @@
 #!/usr/bin/env tsx
-
 /**
- * Continuous Test Suite — Host-Loop Delegation (N5)
+ * Continuous Test Suite: Async Delegation (N2)
  *
- * Per-turn cap counting, depth withholding, the process-wide pool with queue
- * timeout, open-handle conflicts scoped to host + session, and the recovery
- * text every refusal must carry.
+ * Drives the shipped surface only — `NeuroLink` from `../dist/index.js`:
+ *   registerDelegationTools() / spawnDelegate() / collectDelegates() /
+ *   cancelDelegates() as the host API, and
+ *   executeTool("delegate_task" | "collect_results" | "tasks_list" |
+ *   "retrieve_context", …) as the exact path a model tool call takes.
  *
- * Migrated from test/agentDelegation.test.ts — see CLAUDE.md: suites run via
- * tsx, not a Vitest runner.
+ * The claim under test is a TIMING claim — "results come back in the order
+ * workers FINISH, not the order they were spawned" — and a live model cannot
+ * be made to prove it: two calls to a real provider finish in whatever order
+ * the provider feels like. So the mechanical cases run every worker against a
+ * loopback chat server that answers `DELAY:<ms>` after exactly that many
+ * milliseconds (see helpers/mockChatServer.ts). That is a real NeuroLink
+ * instance, a real isolated-agent run, a real HTTP round trip and the real
+ * delegation pool — only the model's latency is ours to choose, which is the
+ * one thing the assertion is about.
  *
- * Run with: npx tsx test/continuous-test-suite-agent-delegation.ts
+ * Covered: opt-in registration, spawn-returns-immediately, out-of-order
+ * completion under `any` and `all`, claimed-exactly-once, pool saturation
+ * queueing rather than rejecting, abort, poll semantics, session scoping,
+ * every refusal, the checklist's delegate counters (N2.3's notification
+ * channel), and byte-exact read-back of each banked worker report (N3).
+ * One live case delegates through a real model and SKIPs without credentials.
+ *
+ * Run: pnpm run test:agent-delegation [--provider=vertex]
  */
 
+// The repo's tracked .mcp-config.json declares a `filesystem` server started
+// via `npx -y @modelcontextprotocol/server-filesystem`, with autoDiscovery and
+// autoRegister on, so every NeuroLink this suite builds tries to start it and
+// waits the full 60s MCP client timeout when it cannot. That is not merely
+// slow here: measured credential-free, this suite took 356s and reported one
+// FAILURE — "a finished worker must show as ready without being collected" —
+// because the stalls perturbed the very timing the case asserts on. With this
+// set it is 41s and 19/19. test:hitl and test:multimodal:sdk set it the same
+// way; test:proxy sets it only in the environment of the CLI subprocesses it
+// spawns, not for its own instances.
+process.env.NEUROLINK_SKIP_MCP = "true";
+
 import {
-  acquireDelegationSlot,
-  beginDelegationTurn,
-  registerAgentTool,
-  resetDelegationPoolForTests,
-  runWithNestedDelegationDepth,
-} from "../src/lib/agent/agentToolRegistrar.js";
+  defineSuite,
+  assert,
+  assertEqual,
+  assertIncludes,
+  Skip,
+} from "./helpers/harness.js";
 import {
-  runIsolatedAgent,
-  stopIsolatedAgent,
-} from "../src/lib/agent/isolatedAgentRunner.js";
-import type { NeuroLink } from "../src/lib/neurolink.js";
+  startPacedChatServer,
+  type PacedChatServer,
+} from "./helpers/mockChatServer.js";
+import { assertDistFresh } from "./helpers/distFreshness.js";
+import { NeuroLink } from "../dist/index.js";
 import type {
-  GenerateOptions,
-  GenerateResult,
-  IsolatedAgentDefinition,
+  ChecklistToolResult,
+  DelegateCollectResult,
+  DelegateHandle,
+  DelegateOutcome,
+  DelegateSpawnToolResult,
 } from "../src/lib/types/index.js";
-import { assert, assertEqual, defineSuite } from "./helpers/harness.js";
-import { spy } from "./helpers/stubs.js";
 
-const { test, runSuite } = defineSuite("Agent Delegation (N5)");
+// Fail loudly rather than silently testing a stale build (see distFreshness.ts).
+assertDistFresh();
 
-type RegisteredTool = {
-  name: string;
-  description: string;
-  inputSchema: Record<string, unknown>;
-  execute: (params: unknown, context?: unknown) => Promise<unknown>;
-};
+const { test, runSuite, opts, section } = defineSuite("Agent Delegation", {
+  defaultProvider: "vertex",
+});
 
-type WorkerRecord = { setToolContext: ReturnType<typeof spy> };
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-function makeDelegationHost(args?: {
-  toolContext?: Record<string, unknown>;
-  workerBehavior?: (opts: GenerateOptions) => Partial<GenerateResult>;
-  workerDelayMs?: number;
-}): {
-  host: NeuroLink;
-  tools: Map<string, RegisteredTool>;
-  workers: WorkerRecord[];
-} {
-  const tools = new Map<string, RegisteredTool>();
-  // Vitest read the factory's return value off `.mock.results`; keep the
-  // created workers explicitly instead so the assertions stay direct.
-  const workers: WorkerRecord[] = [];
-  const behavior =
-    args?.workerBehavior ??
-    (() => ({ content: "worker done", stopReason: "completed" as const }));
+type Host = InstanceType<typeof NeuroLink>;
 
-  const host = {
-    registerTool: (name: string, tool: RegisteredTool) => {
-      tools.set(name, tool);
-    },
-    getToolContext: () => args?.toolContext,
-    createWorkerInstance: () => {
-      const setToolContext = spy((_ctx: unknown) => undefined);
-      workers.push({ setToolContext });
-      return {
-        setToolContext: setToolContext.fn,
-        dispose: async () => undefined,
-        generate: async (opts: GenerateOptions) => {
-          if (args?.workerDelayMs) {
-            await new Promise((r) => setTimeout(r, args.workerDelayMs));
-          }
-          return {
-            content: "",
-            provider: "fake",
-            model: "fake",
-            usage: { input: 1, output: 1, total: 2 },
-            ...behavior(opts),
-          } as GenerateResult;
-        },
-      };
-    },
-  } as unknown as NeuroLink;
+/** The registry wraps every tool result: `{ success, data, usage, metadata }`. */
+type ToolEnvelope = { success?: boolean; data?: unknown };
+type Refusal = { isError: true; error: string };
 
-  return { host, tools, workers };
+function unwrap(envelope: unknown): unknown {
+  const record = envelope as ToolEnvelope | undefined;
+  return record && typeof record === "object" && "data" in record
+    ? record.data
+    : envelope;
 }
 
-const def: IsolatedAgentDefinition = {
-  id: "code_researcher",
-  name: "Code Researcher",
-  description: "investigates code",
-  instructions: "Investigate.",
-};
-
-/** The pool is process-global; every test must start from a clean one. */
-const reset = (slots?: number): void => resetDelegationPoolForTests(slots);
-
-// ---------------------------------------------------------------------------
-// registerAgentTool
-// ---------------------------------------------------------------------------
-
-await test("registers under the definition id by default, with a task schema", () => {
-  reset();
-  const { host, tools } = makeDelegationHost();
-  const { name } = registerAgentTool(host, def);
-
-  assertEqual(
-    name,
-    "code_researcher",
-    "the definition id becomes the tool name",
-  );
-  const tool = tools.get(name);
+function asRefusal(envelope: unknown): Refusal {
+  const payload = unwrap(envelope);
   assert(
-    (tool?.description ?? "").includes("Code Researcher"),
-    "the description must name the agent",
+    !!payload && typeof payload === "object" && "isError" in payload,
+    "expected a refusal, got a successful result",
   );
-  assertEqual(
-    (tool?.inputSchema as { type?: string })?.type,
-    "object",
-    "the schema must be an object schema",
-  );
-  assertEqual(
-    JSON.stringify((tool?.inputSchema as { required?: string[] })?.required),
-    JSON.stringify(["task"]),
-    "task must be the required field",
-  );
-});
+  return payload as Refusal;
+}
 
-await test("rejects duplicate registrations on the same instance", () => {
-  reset();
-  const { host } = makeDelegationHost();
-  registerAgentTool(host, def);
+function asObject<T>(envelope: unknown, what: string): T {
+  const payload = unwrap(envelope);
+  assert(
+    !!payload && typeof payload === "object" && !("isError" in payload),
+    `expected ${what}, got a refusal or an unexpected shape`,
+  );
+  return payload as T;
+}
 
-  let caught: unknown;
+/**
+ * The delegation pool is process-wide and only ever RISES, so no test may
+ * raise it: one raise would silently disable the saturation case that runs
+ * later. Every host here registers with the default capacity.
+ */
+const POOL_CAPACITY = 4;
+
+let sessionCounter = 0;
+
+/** A registered host wired to the paced server, plus a session id of its own. */
+function newHost(server: PacedChatServer): { host: Host; sessionId: string } {
+  const host = new NeuroLink({
+    credentials: {
+      openai: { apiKey: "sk-mock-local-server", baseURL: server.baseURL },
+    },
+  });
+  host.registerDelegationTools();
+  host.registerTaskTools();
+  sessionCounter += 1;
+  return { host, sessionId: `delegation-suite-${sessionCounter}` };
+}
+
+/**
+ * Spawn a worker whose model answer lands after exactly `delayMs`.
+ *
+ * `provider`/`model` are pinned so the worker talks to the loopback server and
+ * not to whatever provider the environment happens to have configured — a
+ * paced test that silently reached a real model would prove nothing.
+ */
+function spawnPaced(
+  host: Host,
+  sessionId: string,
+  tag: string,
+  delayMs: number,
+): Promise<DelegateHandle> {
+  return host.spawnDelegate({
+    task: `TAG:${tag} DELAY:${delayMs} - investigate and report.`,
+    label: tag,
+    sessionId,
+    provider: "openai",
+    model: "gpt-4o-mini",
+    maxSteps: 1,
+  });
+}
+
+function labels(outcomes: DelegateOutcome[]): string {
+  return outcomes.map((outcome) => outcome.label).join(",");
+}
+
+async function toolNames(host: Host): Promise<string[]> {
+  const tools = await host.getAllAvailableTools();
+  return tools
+    .map((tool: { name: string }) => tool.name)
+    .filter(
+      (name: string) => name === "delegate_task" || name === "collect_results",
+    )
+    .sort();
+}
+
+function callTool(
+  host: Host,
+  name: string,
+  params: unknown,
+  sessionId: string,
+): Promise<unknown> {
+  return host.executeTool(name, params, { authContext: { sessionId } });
+}
+
+async function counters(
+  host: Host,
+  sessionId: string,
+): Promise<ChecklistToolResult> {
+  return asObject<ChecklistToolResult>(
+    await callTool(host, "tasks_list", {}, sessionId),
+    "a checklist result",
+  );
+}
+
+const delay = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/** One server for the whole suite: it holds no state between requests. */
+let server: PacedChatServer;
+
+// ---------------------------------------------------------------------------
+// Suite
+// ---------------------------------------------------------------------------
+
+await runSuite(async () => {
+  server = await startPacedChatServer();
   try {
-    registerAgentTool(host, def);
-  } catch (error) {
-    caught = error;
-  }
-  assert(
-    caught instanceof Error && /already registered/.test(caught.message),
-    `a second registration must be rejected, got: ${String(caught)}`,
-  );
-});
+    section("Registration (opt-in, additive)");
 
-// ---------------------------------------------------------------------------
-// Per-turn delegation caps
-// ---------------------------------------------------------------------------
-
-await test("counts per top-level generate and refuses with recovery text at the cap", async () => {
-  reset();
-  const { host, tools } = makeDelegationHost();
-  registerAgentTool(host, def, { maxDelegationsPerTurn: 2 });
-  const tool = tools.get("code_researcher")!;
-
-  const scope = beginDelegationTurn(host, {});
-  assert(scope !== null, "a top-level generate must open a delegation turn");
-  await scope!.run(async () => {
-    const first = (await tool.execute({ task: "a" })) as { status?: string };
-    const second = (await tool.execute({ task: "b" })) as { status?: string };
-    assertEqual(first.status, "completed", "the first delegation is allowed");
-    assertEqual(second.status, "completed", "the second reaches the cap");
-
-    const third = (await tool.execute({ task: "c" })) as {
-      isError?: boolean;
-      error?: string;
-    };
-    assertEqual(third.isError, true, "the third must be refused");
-    // A refusal that does not tell the model what to do instead just gets
-    // retried, so the recovery wording is the point of the test.
-    assert(
-      (third.error ?? "").includes("Do not call code_researcher again"),
-      "the refusal must tell the model to stop calling the tool",
-    );
-    assert(
-      (third.error ?? "").includes("synthesize from the investigations"),
-      "…and what to do instead",
-    );
-  });
-
-  // A NEW turn resets the counter.
-  const scope2 = beginDelegationTurn(host, {});
-  await scope2!.run(async () => {
-    const again = (await tool.execute({ task: "d" })) as { status?: string };
-    assertEqual(again.status, "completed", "a fresh turn starts from zero");
-  });
-});
-
-await test("nested scopes share the top-level turn's counters", async () => {
-  reset();
-  const { host } = makeDelegationHost();
-  registerAgentTool(host, def, { maxDelegationsPerTurn: 1 });
-  const outer = beginDelegationTurn(host, {});
-  await outer!.run(async () => {
-    // A re-entrant generate calls beginDelegationTurn again; it must return
-    // null so the inner call shares this turn's counters rather than getting
-    // a fresh allowance.
-    assertEqual(
-      beginDelegationTurn(host, {}),
-      null,
-      "a nested turn must not open a second budget",
-    );
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Depth withholding
-// ---------------------------------------------------------------------------
-
-await test("withholds depth-limited agent tools from the request via excludeTools", () => {
-  reset();
-  const { host } = makeDelegationHost({ toolContext: { agentDepth: 1 } });
-  registerAgentTool(host, def, { maxDepth: 1 });
-  const scope = beginDelegationTurn(host, { maxSteps: 3 });
-
-  assert(
-    ((scope!.options as GenerateOptions).excludeTools ?? []).includes(
-      "code_researcher",
-    ),
-    "at the depth limit the tool must not even be offered",
-  );
-});
-
-await test("leaves the tool available below the depth limit", () => {
-  reset();
-  const { host } = makeDelegationHost({ toolContext: { agentDepth: 0 } });
-  registerAgentTool(host, def, { maxDepth: 1 });
-  const scope = beginDelegationTurn(host, { maxSteps: 3 });
-
-  assert(
-    !((scope!.options as GenerateOptions).excludeTools ?? []).includes(
-      "code_researcher",
-    ),
-    "below the limit the tool must stay offered",
-  );
-});
-
-await test("execute refuses at the depth limit as defense in depth", async () => {
-  reset();
-  const { host, tools } = makeDelegationHost({
-    toolContext: { agentDepth: 2 },
-  });
-  registerAgentTool(host, def, { maxDepth: 2 });
-
-  const result = (await tools
-    .get("code_researcher")!
-    .execute({ task: "x" })) as {
-    isError?: boolean;
-    error?: string;
-  };
-  assertEqual(result.isError, true, "withholding is not enough on its own");
-  assert(
-    (result.error ?? "").includes("depth limit"),
-    "the refusal must name the depth limit",
-  );
-});
-
-await test("the delegated worker receives agentDepth + 1 in its tool context", async () => {
-  reset();
-  const { host, tools, workers } = makeDelegationHost({
-    toolContext: { agentDepth: 0 },
-  });
-  registerAgentTool(host, def, { maxDepth: 3 });
-  await tools.get("code_researcher")!.execute({ task: "x" });
-
-  assertEqual(workers.length, 1, "one delegation creates one worker");
-  const contexts = workers[0].setToolContext.calls.map((c) => c[0]);
-  assert(
-    contexts.some((ctx) => (ctx as { agentDepth?: number })?.agentDepth === 1),
-    `the worker must be told it is one level deeper, got: ${JSON.stringify(contexts)}`,
-  );
-});
-
-// ---------------------------------------------------------------------------
-// Process-wide delegation pool
-// ---------------------------------------------------------------------------
-
-await test("bounds concurrency and refuses with recovery text on queue timeout", async () => {
-  reset(1);
-  const { host, tools } = makeDelegationHost({ workerDelayMs: 200 });
-  registerAgentTool(host, def, { poolQueueTimeoutMs: 30 });
-  const tool = tools.get("code_researcher")!;
-
-  const busy = tool.execute({ task: "long" });
-  // Give the first call time to take the only slot.
-  await new Promise((r) => setTimeout(r, 20));
-  const refused = (await tool.execute({ task: "queued" })) as {
-    isError?: boolean;
-    error?: string;
-  };
-
-  assertEqual(refused.isError, true, "the queued call must time out");
-  assert(
-    (refused.error ?? "").includes("delegation slots are busy"),
-    "the refusal must explain the pool is saturated",
-  );
-  assert(
-    (refused.error ?? "").includes("synthesize"),
-    "…and give the model a way forward",
-  );
-  await busy;
-});
-
-await test("released slots grant queued waiters", async () => {
-  reset(1);
-  const releaseFirst = await acquireDelegationSlot(1_000);
-  const secondPromise = acquireDelegationSlot(1_000);
-  releaseFirst();
-  const releaseSecond = await secondPromise;
-  releaseSecond();
-  // Reaching here at all is the assertion: a waiter that is never granted
-  // would hang until the harness's per-test timeout.
-  assert(true, "the queued waiter was granted the released slot");
-});
-
-// ---------------------------------------------------------------------------
-// Open-handle conflicts (host + session scoped)
-// ---------------------------------------------------------------------------
-
-await test("refuses only the SAME host + sessionId; other sessions proceed", async () => {
-  reset();
-  const { host, tools } = makeDelegationHost({
-    workerBehavior: () => ({ content: "leg", stopReason: "step-cap" }),
-  });
-  registerAgentTool(host, def, { leg: { budgetMs: 5_000 } });
-  const tool = tools.get("code_researcher")!;
-
-  // Session A opens a leashed handle…
-  const first = (await tool.execute(
-    { task: "start" },
-    { sessionId: "thread-A" },
-  )) as { status?: string; handle?: string };
-  assertEqual(first.status, "in_progress", "a leashed run stays open");
-  assert(Boolean(first.handle), "an open run must return a handle");
-
-  // …so session A's next delegation is refused with the handle hint…
-  const refused = (await tool.execute(
-    { task: "again" },
-    { sessionId: "thread-A" },
-  )) as { isError?: boolean; error?: string };
-  assertEqual(refused.isError, true, "the same session must be refused");
-  assert(
-    (refused.error ?? "").includes("continue it via its handle"),
-    "the refusal must point at the open handle",
-  );
-
-  // …but session B, a different conversation, is NOT refused.
-  const otherSession = (await tool.execute(
-    { task: "unrelated" },
-    { sessionId: "thread-B" },
-  )) as { status?: string; handle?: string };
-  assertEqual(
-    otherSession.status,
-    "in_progress",
-    "a different session must not be blocked by session A's handle",
-  );
-
-  await stopIsolatedAgent(host, first.handle!);
-  await stopIsolatedAgent(host, otherSession.handle!);
-});
-
-await test("a handle on a DIFFERENT host never causes a refusal", async () => {
-  reset();
-  const { host: hostA } = makeDelegationHost({
-    workerBehavior: () => ({ content: "leg", stopReason: "step-cap" }),
-  });
-  const leg = await runIsolatedAgent(hostA, def, "start", {
-    leg: { budgetMs: 5_000 },
-    toolContext: { sessionId: "thread-A" },
-  });
-  assertEqual(leg.status, "in_progress", "host A holds an open handle");
-
-  const { host: hostB, tools } = makeDelegationHost();
-  registerAgentTool(hostB, def);
-  const result = (await tools
-    .get("code_researcher")!
-    .execute({ task: "go" }, { sessionId: "thread-A" })) as { status?: string };
-
-  assertEqual(
-    result.status,
-    "completed",
-    "the same sessionId on another host must be unaffected",
-  );
-  await stopIsolatedAgent(hostA, leg.handle!);
-});
-
-// ---------------------------------------------------------------------------
-// Refusals do not consume the per-turn cap
-// ---------------------------------------------------------------------------
-
-await test("a depth-refused call leaves the cap intact for a later valid call", async () => {
-  reset();
-  const { host, tools } = makeDelegationHost();
-  registerAgentTool(host, def, { maxDelegationsPerTurn: 1, maxDepth: 1 });
-  const tool = tools.get("code_researcher")!;
-
-  const scope = beginDelegationTurn(host, {});
-  await scope!.run(async () => {
-    // Refused on depth (the execution context carries agentDepth 1)…
-    const refused = (await tool.execute(
-      { task: "nested" },
-      { agentDepth: 1 },
-    )) as { isError?: boolean; error?: string };
-    assertEqual(refused.isError, true, "the nested call is refused");
-    assert(
-      (refused.error ?? "").includes("depth limit"),
-      "refused for depth, not for the cap",
-    );
-
-    // …and the single per-turn delegation is still available.
-    const allowed = (await tool.execute({ task: "top" })) as {
-      status?: string;
-    };
-    assertEqual(
-      allowed.status,
-      "completed",
-      "a refusal must not have spent the turn's one delegation",
-    );
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Nested delegations bypass the pool
-// ---------------------------------------------------------------------------
-
-await test("a depth>0 delegation proceeds while the pool is fully held", async () => {
-  reset(1);
-  const { host, tools } = makeDelegationHost({ workerDelayMs: 150 });
-  registerAgentTool(host, def, { poolQueueTimeoutMs: 30 });
-  const tool = tools.get("code_researcher")!;
-
-  const outerBusy = tool.execute({ task: "outer" });
-  await new Promise((r) => setTimeout(r, 20));
-
-  // The outer delegation holds the only slot. A nested call must not queue
-  // behind it, or the two would deadlock against each other.
-  const nested = (await tool.execute({ task: "inner" }, { agentDepth: 1 })) as {
-    status?: string;
-  };
-  assertEqual(
-    nested.status,
-    "completed",
-    "the nested call must bypass the pool",
-  );
-  await outerBusy;
-});
-
-await test("runWithNestedDelegationDepth makes inner delegations nested", async () => {
-  // Simulates AgentNetwork's composition: the network's tool holds a pool slot
-  // and the agent's own generate delegates via a registered agent tool. The
-  // inner call must take the nested path (pool bypass) AND still hit depth
-  // limits, with no execution-context agentDepth anywhere.
-  reset(1);
-  const { host, tools } = makeDelegationHost();
-  registerAgentTool(host, def, { poolQueueTimeoutMs: 30, maxDepth: 2 });
-  const tool = tools.get("code_researcher")!;
-
-  const scope = beginDelegationTurn(host, {});
-  await scope!.run(async () => {
-    // The outer network delegation holds the only slot for its duration…
-    const releaseOuter = await acquireDelegationSlot(1_000);
-    try {
-      // …and the agent's inner delegation, one level deeper, bypasses it.
-      const inner = (await runWithNestedDelegationDepth(() =>
-        tool.execute({ task: "inner" }),
-      )) as { status?: string };
-      assertEqual(inner.status, "completed", "one level deeper is allowed");
-
-      // Two levels deeper hits maxDepth and is refused with recovery text.
-      const tooDeep = (await runWithNestedDelegationDepth(() =>
-        runWithNestedDelegationDepth(() => tool.execute({ task: "too deep" })),
-      )) as { isError?: boolean; error?: string };
-      assertEqual(tooDeep.isError, true, "two levels deeper is refused");
-      assert(
-        (tooDeep.error ?? "").includes("depth limit"),
-        "the refusal must name the depth limit",
+    await test("delegation tools are absent until registerDelegationTools()", async () => {
+      const bare = new NeuroLink();
+      assertEqual(
+        (await toolNames(bare)).join(","),
+        "",
+        "a fresh instance must expose no delegation tools",
       );
-    } finally {
-      releaseOuter();
-    }
-  });
-});
+    });
 
-await runSuite();
+    await test("registration exposes both tools and is idempotent", async () => {
+      const { host } = newHost(server);
+      assertEqual(
+        (await toolNames(host)).join(","),
+        "collect_results,delegate_task",
+      );
+      host.registerDelegationTools();
+      host.registerDelegationTools();
+      assertEqual(
+        (await toolNames(host)).join(","),
+        "collect_results,delegate_task",
+        "re-registering must not duplicate or throw",
+      );
+    });
+
+    section("Spawn returns before the worker runs");
+
+    await test("spawnDelegate hands back a handle while the worker is still working", async () => {
+      const { host, sessionId } = newHost(server);
+      const startedAt = Date.now();
+      const handle = await spawnPaced(host, sessionId, "SLOWSPAWN", 3_000);
+      const elapsed = Date.now() - startedAt;
+
+      assert(handle.workerId.length > 0, "a spawn must name its worker");
+      assertEqual(
+        handle.queued,
+        false,
+        "the first worker takes a free pool slot",
+      );
+      assert(
+        elapsed < 1_000,
+        `spawn must not wait for the worker (returned after ${elapsed}ms, worker takes 3000ms)`,
+      );
+      assertEqual(
+        (await counters(host, sessionId)).delegatesPending,
+        1,
+        "the worker must be visible as outstanding while it runs",
+      );
+
+      const collected = await host.collectDelegates({ mode: "all", sessionId });
+      assertEqual(collected.completed.length, 1);
+    });
+
+    section("Out-of-order completion");
+
+    await test("four workers spawned slowest-first come back fastest-first", async () => {
+      const { host, sessionId } = newHost(server);
+      // Deliberately reversed: spawn order and finish order are opposites, so
+      // "results happen to be in spawn order" cannot pass this.
+      const spawnOrder: Array<[string, number]> = [
+        ["D-3600", 3_600],
+        ["C-2400", 2_400],
+        ["B-1200", 1_200],
+        ["A-0100", 100],
+      ];
+      for (const [tag, ms] of spawnOrder) {
+        await spawnPaced(host, sessionId, tag, ms);
+      }
+
+      const collected = await host.collectDelegates({
+        mode: "all",
+        sessionId,
+        waitMs: 120_000,
+      });
+      assertEqual(
+        collected.completed.length,
+        4,
+        "every worker must be claimed",
+      );
+      assertEqual(
+        labels(collected.completed),
+        "A-0100,B-1200,C-2400,D-3600",
+        "collection order must follow completion, not spawn order",
+      );
+      assertEqual(collected.pending, 0);
+      assertEqual(collected.ready, 0);
+      assertEqual(collected.timedOut, false);
+      for (const outcome of collected.completed) {
+        assertEqual(
+          outcome.ok,
+          true,
+          `${outcome.label} should have produced evidence`,
+        );
+        assertIncludes(outcome.summary, `WORKER-REPORT ${outcome.label}`);
+      }
+    });
+
+    await test("`any` returns the first finisher, then the next, each exactly once", async () => {
+      const { host, sessionId } = newHost(server);
+      await spawnPaced(host, sessionId, "LATE", 2_600);
+      await spawnPaced(host, sessionId, "EARLY", 100);
+
+      const first = await host.collectDelegates({
+        mode: "any",
+        sessionId,
+        waitMs: 120_000,
+      });
+      assertEqual(
+        labels(first.completed),
+        "EARLY",
+        "the fastest worker lands first",
+      );
+      assertEqual(first.pending, 1, "the slow worker is still outstanding");
+
+      const second = await host.collectDelegates({
+        mode: "any",
+        sessionId,
+        waitMs: 120_000,
+      });
+      assertEqual(labels(second.completed), "LATE");
+      assertEqual(second.pending, 0);
+
+      const third = await host.collectDelegates({
+        mode: "any",
+        sessionId,
+        waitMs: 0,
+      });
+      assertEqual(
+        third.completed.length,
+        0,
+        "an outcome claimed once must never be handed out again",
+      );
+      assertEqual(
+        third.timedOut,
+        false,
+        "nothing outstanding is not a timeout",
+      );
+    });
+
+    await test("a named worker is collected on its own", async () => {
+      const { host, sessionId } = newHost(server);
+      const slow = await spawnPaced(host, sessionId, "NAMED-SLOW", 2_400);
+      await spawnPaced(host, sessionId, "NAMED-FAST", 100);
+
+      const collected = await host.collectDelegates({
+        workerId: slow.workerId,
+        sessionId,
+        waitMs: 120_000,
+      });
+      assertEqual(labels(collected.completed), "NAMED-SLOW");
+      assertEqual(
+        collected.ready,
+        1,
+        "the faster worker finished and is still waiting to be claimed",
+      );
+      await host.collectDelegates({ mode: "all", sessionId, waitMs: 60_000 });
+    });
+
+    section("Counters are the completion notification (N2.3)");
+
+    await test("tasks_list reports pending, then ready, then nothing", async () => {
+      const { host, sessionId } = newHost(server);
+      await spawnPaced(host, sessionId, "COUNTED", 1_500);
+
+      const running = await counters(host, sessionId);
+      assertEqual(running.delegatesPending, 1);
+      assertEqual(running.delegatesReady, 0);
+
+      // No polling machinery: the model learns a worker landed from a tool it
+      // was going to call anyway.
+      const settled = await host.collectDelegates({
+        mode: "all",
+        sessionId,
+        waitMs: 0,
+        // Deliberately a poll, repeated, so this asserts the counter flips
+        // without any collect having waited for it.
+      });
+      assertEqual(settled.completed.length, 0, "a zero wait must not block");
+
+      // Repeated identical calls: `tasks_list` takes no arguments, so a cached
+      // result would replay the first answer forever and the model would never
+      // learn that a worker landed.
+      let ready = 0;
+      for (let attempt = 0; attempt < 60 && ready === 0; attempt++) {
+        await delay(250);
+        ready = (await counters(host, sessionId)).delegatesReady;
+      }
+      assertEqual(
+        ready,
+        1,
+        "a finished worker must show as ready without being collected",
+      );
+
+      const claimed = await host.collectDelegates({
+        mode: "all",
+        sessionId,
+        waitMs: 0,
+      });
+      assertEqual(claimed.completed.length, 1);
+      const empty = await counters(host, sessionId);
+      assertEqual(empty.delegatesPending, 0);
+      assertEqual(empty.delegatesReady, 0);
+    });
+
+    section("Every report is banked in full (N3)");
+
+    await test("the worker's full report reads back through retrieve_context", async () => {
+      const { host, sessionId } = newHost(server);
+      // A task long enough that the report cannot fit in a preview: the point
+      // of banking is that the conversation gets a POINTER, so a report that
+      // happened to fit would prove nothing.
+      const filler = "context-line ".repeat(400);
+      await host.spawnDelegate({
+        task: `TAG:BANKED DELAY:100 - investigate and report.\n${filler}`,
+        label: "BANKED",
+        sessionId,
+        provider: "openai",
+        model: "gpt-4o-mini",
+        maxSteps: 1,
+      });
+      const collected = await host.collectDelegates({
+        mode: "all",
+        sessionId,
+        waitMs: 120_000,
+      });
+      const outcome = collected.completed[0];
+      assert(outcome !== undefined, "a worker must have been collected");
+      assert(
+        outcome.report.artifactId.length > 0,
+        "the report must actually have been banked",
+      );
+      assertIncludes(outcome.report.readBackHint, "retrieve_context");
+      assertEqual(outcome.report.kind, "worker-report");
+
+      // The model's own read-back path, not a host shortcut.
+      const page = asObject<{ content?: string; totalSize?: number }>(
+        await host.executeTool("retrieve_context", {
+          artifactId: outcome.report.artifactId,
+          offset: 0,
+          limit: 200_000,
+        }),
+        "an artifact page",
+      );
+      const content = page.content ?? "";
+      assertEqual(
+        content.length,
+        page.totalSize ?? -1,
+        "one page must have covered the whole report",
+      );
+      assertIncludes(content, "## Task");
+      assertIncludes(content, "TAG:BANKED");
+      assertIncludes(content, "WORKER-REPORT BANKED");
+      assertIncludes(content, "## Tool executions");
+      assertEqual(
+        Buffer.byteLength(content, "utf-8"),
+        outcome.report.sizeBytes,
+        "the banked file must be byte-for-byte what the reference describes",
+      );
+      assert(
+        content.length > outcome.report.preview.length * 2,
+        "the conversation must get a pointer, not the whole report",
+      );
+      assertEqual(
+        content.startsWith(outcome.report.preview.replace(/…$/, "")),
+        true,
+        "the preview must be a head slice of the banked report, not a summary of it",
+      );
+    });
+
+    section("Pool saturation queues, never rejects");
+
+    await test(`${POOL_CAPACITY + 2} workers against ${POOL_CAPACITY} slots all finish`, async () => {
+      const { host, sessionId } = newHost(server);
+      const handles: DelegateHandle[] = [];
+      for (let i = 0; i < POOL_CAPACITY + 2; i++) {
+        handles.push(await spawnPaced(host, sessionId, `POOL-${i}`, 600));
+      }
+      const queued = handles.filter((handle) => handle.queued).length;
+      assertEqual(
+        queued,
+        2,
+        `two spawns past a ${POOL_CAPACITY}-slot pool must queue, not be refused`,
+      );
+
+      const collected = await host.collectDelegates({
+        mode: "all",
+        sessionId,
+        waitMs: 180_000,
+      });
+      assertEqual(
+        collected.completed.length,
+        POOL_CAPACITY + 2,
+        "a queued worker must still run once a slot frees",
+      );
+      assertEqual(
+        collected.completed.filter((outcome) => outcome.ok).length,
+        POOL_CAPACITY + 2,
+        "queueing must not degrade a worker's result",
+      );
+    });
+
+    section("Abort");
+
+    await test("cancelDelegates kills in-flight workers and they stay collectable", async () => {
+      const { host, sessionId } = newHost(server);
+      await spawnPaced(host, sessionId, "DOOMED-1", 30_000);
+      await spawnPaced(host, sessionId, "DOOMED-2", 30_000);
+      await delay(500);
+
+      const startedAt = Date.now();
+      const cancelled = await host.cancelDelegates();
+      const elapsed = Date.now() - startedAt;
+      assertEqual(cancelled, 2, "both in-flight workers must be cancelled");
+      assert(
+        elapsed < 20_000,
+        `cancel must not wait out the worker (took ${elapsed}ms of a 30000ms worker)`,
+      );
+
+      const collected = await host.collectDelegates({
+        mode: "all",
+        sessionId,
+        waitMs: 30_000,
+      });
+      assertEqual(
+        collected.completed.length,
+        2,
+        "a cancelled worker must still report back — silence would strand the supervisor",
+      );
+      for (const outcome of collected.completed) {
+        assertEqual(
+          outcome.ok,
+          false,
+          "a cancelled worker did not finish its job",
+        );
+        assertIncludes(outcome.error ?? "", "cancelled");
+        assert(
+          outcome.report.artifactId.length > 0,
+          "even a cancelled worker banks what it had",
+        );
+      }
+    });
+
+    await test("an aborted parent signal cancels the worker it spawned", async () => {
+      const { host, sessionId } = newHost(server);
+      const controller = new AbortController();
+      await host.spawnDelegate({
+        task: "TAG:PARENT-ABORT DELAY:30000 - investigate and report.",
+        label: "PARENT-ABORT",
+        sessionId,
+        provider: "openai",
+        model: "gpt-4o-mini",
+        maxSteps: 1,
+        abortSignal: controller.signal,
+      });
+      await delay(500);
+      controller.abort();
+
+      const collected = await host.collectDelegates({
+        mode: "all",
+        sessionId,
+        waitMs: 30_000,
+      });
+      assertEqual(collected.completed.length, 1);
+      assertEqual(collected.completed[0]?.ok, false);
+    });
+
+    section("Waiting, polling and scoping");
+
+    await test("waitMs 0 polls: nothing yet, then everything", async () => {
+      const { host, sessionId } = newHost(server);
+      await spawnPaced(host, sessionId, "POLLED", 1_800);
+
+      const polled = await host.collectDelegates({
+        mode: "any",
+        sessionId,
+        waitMs: 0,
+      });
+      assertEqual(polled.completed.length, 0);
+      assertEqual(polled.pending, 1);
+      assertEqual(
+        polled.timedOut,
+        true,
+        "outstanding work after the wait is exactly what timedOut reports",
+      );
+
+      const waited = await host.collectDelegates({
+        mode: "any",
+        sessionId,
+        waitMs: 120_000,
+      });
+      assertEqual(labels(waited.completed), "POLLED");
+      assertEqual(waited.timedOut, false);
+    });
+
+    await test("one session never collects another session's worker", async () => {
+      const { host, sessionId } = newHost(server);
+      const other = `${sessionId}-other`;
+      const mine = await spawnPaced(host, sessionId, "MINE", 100);
+      await spawnPaced(host, other, "THEIRS", 100);
+
+      const theirs = await host.collectDelegates({
+        mode: "all",
+        sessionId: other,
+        waitMs: 120_000,
+      });
+      assertEqual(labels(theirs.completed), "THEIRS");
+
+      const ours = await host.collectDelegates({
+        mode: "all",
+        sessionId,
+        waitMs: 120_000,
+      });
+      assertEqual(labels(ours.completed), "MINE");
+      assertEqual(ours.completed[0]?.workerId, mine.workerId);
+    });
+
+    section("Refusals (recovery instruction included)");
+
+    await test("an empty task is refused with the fix named", async () => {
+      const { host, sessionId } = newHost(server);
+      const refused = asRefusal(
+        await callTool(host, "delegate_task", { task: "   " }, sessionId),
+      );
+      assertIncludes(refused.error, "task");
+      assertEqual(
+        (await counters(host, sessionId)).delegatesPending,
+        0,
+        "a refused spawn must not leave a phantom worker outstanding",
+      );
+    });
+
+    await test("the depth ceiling refuses further delegation", async () => {
+      const { host, sessionId } = newHost(server);
+      // What a worker's own delegate_task call looks like: the execution
+      // context carries the depth this registrar stamped on it.
+      host.setToolContext({ sessionId, agentDepth: 1 });
+      const refused = asRefusal(
+        await callTool(
+          host,
+          "delegate_task",
+          { task: "spawn a grandchild" },
+          sessionId,
+        ),
+      );
+      assertIncludes(refused.error, "depth limit reached");
+      assertIncludes(
+        refused.error,
+        "yourself with your own tools",
+        "a refusal must say what to do instead",
+      );
+      assertEqual((await counters(host, sessionId)).delegatesPending, 0);
+    });
+
+    await test("an unknown workerId refusal names the outstanding workers", async () => {
+      const { host, sessionId } = newHost(server);
+      const live = await spawnPaced(host, sessionId, "REAL", 100);
+      const refused = asRefusal(
+        await callTool(
+          host,
+          "collect_results",
+          { workerId: "w-nope" },
+          sessionId,
+        ),
+      );
+      assertIncludes(refused.error, "w-nope");
+      assertIncludes(
+        refused.error,
+        live.workerId,
+        "the refusal must list the ids that would have worked",
+      );
+      await host.collectDelegates({ mode: "all", sessionId, waitMs: 60_000 });
+
+      const exhausted = asRefusal(
+        await callTool(
+          host,
+          "collect_results",
+          { workerId: live.workerId },
+          sessionId,
+        ),
+      );
+      assertIncludes(
+        exhausted.error,
+        "already been collected",
+        "collecting a claimed worker must say so, not hang",
+      );
+    });
+
+    section("The model-facing tool path");
+
+    await test("delegate_task and collect_results work through executeTool", async () => {
+      const { host, sessionId } = newHost(server);
+      const spawned = asObject<DelegateSpawnToolResult>(
+        await callTool(
+          host,
+          "delegate_task",
+          {
+            task: "TAG:TOOLPATH DELAY:200 - investigate and report.",
+            scope: "the auth module only",
+            context: "the supervisor is reviewing a pull request",
+            model: "gpt-4o-mini",
+          },
+          sessionId,
+        ),
+        "a spawn result",
+      );
+      assert(spawned.workerId.length > 0, "the tool must return a worker id");
+      assertEqual(spawned.pending + spawned.ready, 1);
+
+      const collected = asObject<DelegateCollectResult>(
+        await callTool(
+          host,
+          "collect_results",
+          { mode: "all", waitMs: 120_000 },
+          sessionId,
+        ),
+        "a collect result",
+      );
+      assertEqual(collected.completed.length, 1);
+      const outcome = collected.completed[0];
+      assert(outcome !== undefined, "the tool must hand back the outcome");
+      assertEqual(outcome.workerId, spawned.workerId);
+      assertIncludes(outcome.report.readBackHint, outcome.report.artifactId);
+
+      // The scope and context handed down must have reached the worker's
+      // system prompt, or "delegate with a scope" is a lie.
+      const sent = server.getAllRequestBodies().join("\n");
+      assertIncludes(sent, "the auth module only");
+      assertIncludes(sent, "the supervisor is reviewing a pull request");
+    });
+
+    await test("two identical collect_results calls claim two different workers", async () => {
+      // The tool-result cache is keyed by tool name + arguments + session, and
+      // both of these calls are identical in all three. `collect_results` hands
+      // each outcome out exactly once, so a cached second call would replay the
+      // FIRST worker and quietly lose the second one forever.
+      const { host, sessionId } = newHost(server);
+      await spawnPaced(host, sessionId, "CACHE-A", 100);
+      await spawnPaced(host, sessionId, "CACHE-B", 100);
+
+      const params = { mode: "any", waitMs: 120_000 };
+      const first = asObject<DelegateCollectResult>(
+        await callTool(host, "collect_results", params, sessionId),
+        "a collect result",
+      );
+      const second = asObject<DelegateCollectResult>(
+        await callTool(host, "collect_results", params, sessionId),
+        "a collect result",
+      );
+      assertEqual(first.completed.length, 1);
+      assertEqual(second.completed.length, 1);
+      assert(
+        first.completed[0]?.workerId !== second.completed[0]?.workerId,
+        "the same worker was handed out twice — the second call was served from cache",
+      );
+      assertEqual(
+        [first.completed[0]?.label, second.completed[0]?.label]
+          .sort()
+          .join(","),
+        "CACHE-A,CACHE-B",
+        "both workers must be accounted for",
+      );
+    });
+
+    section("Live model");
+
+    await test("a real model delegates and collects", async () => {
+      if (!opts.provider) {
+        throw new Skip("no provider configured");
+      }
+      const host = new NeuroLink();
+      host.registerDelegationTools();
+      const sessionId = "delegation-live";
+      host.setToolContext({ sessionId });
+
+      const token = "OSPREY-8823";
+      let content: string;
+      try {
+        const spawn = await host.generate({
+          input: {
+            text:
+              "Use delegate_task exactly once to start a background worker whose task is: " +
+              `"Reply with the single token ${token} and nothing else." ` +
+              "Then reply with the workerId you were given, and nothing else. " +
+              "Do not call collect_results in this turn.",
+          },
+          provider: opts.provider,
+          ...(opts.model ? { model: opts.model } : {}),
+          maxSteps: 4,
+          timeout: 120_000,
+        });
+        content = spawn.content;
+      } catch (error) {
+        throw new Skip(
+          `provider "${opts.provider}" unavailable: ${
+            error instanceof Error ? error.message.slice(0, 160) : String(error)
+          }`,
+        );
+      }
+      assert(
+        /w\d+/.test(content),
+        "the model should have reported a worker id",
+      );
+
+      const collected = await host.collectDelegates({
+        mode: "all",
+        sessionId,
+        waitMs: 180_000,
+      });
+      assertEqual(
+        collected.completed.length,
+        1,
+        "the worker the model spawned must be collectable by the host",
+      );
+      const outcome = collected.completed[0];
+      assert(outcome !== undefined, "an outcome must have been claimed");
+      const report = await host.readArtifact(outcome.report.artifactId);
+      assert(
+        (report ?? "").includes(token),
+        "the banked report must carry what the worker was told to produce",
+      );
+    });
+  } finally {
+    await server?.close();
+  }
+});

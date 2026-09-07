@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ElicitationProtocolAdapterConfig** = `object`
 
-Defined in: [types/mcp.ts:1391](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L1391)
+Defined in: [types/mcp.ts:1410](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L1410)
 
 Protocol adapter configuration
 
@@ -18,7 +18,7 @@ Protocol adapter configuration
 
 > `optional` **manager?**: [`ElicitationManager`](../classes/ElicitationManager.md)
 
-Defined in: [types/mcp.ts:1392](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L1392)
+Defined in: [types/mcp.ts:1411](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L1411)
 
 ---
 
@@ -26,7 +26,7 @@ Defined in: [types/mcp.ts:1392](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > `optional` **defaultTimeout?**: `number`
 
-Defined in: [types/mcp.ts:1393](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L1393)
+Defined in: [types/mcp.ts:1412](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L1412)
 
 ---
 
@@ -34,7 +34,7 @@ Defined in: [types/mcp.ts:1393](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > `optional` **enableLogging?**: `boolean`
 
-Defined in: [types/mcp.ts:1394](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L1394)
+Defined in: [types/mcp.ts:1413](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L1413)
 
 ---
 
@@ -42,4 +42,4 @@ Defined in: [types/mcp.ts:1394](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > `optional` **customHandler?**: [`ElicitationProtocolHandler`](ElicitationProtocolHandler.md)
 
-Defined in: [types/mcp.ts:1395](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L1395)
+Defined in: [types/mcp.ts:1414](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L1414)

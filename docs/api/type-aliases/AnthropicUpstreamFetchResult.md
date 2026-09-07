@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **AnthropicUpstreamFetchResult** = `object`
 
-Defined in: [types/proxy.ts:684](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L684)
+Defined in: [types/proxy.ts:1099](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1099)
 
 ## Properties
 
@@ -16,7 +16,7 @@ Defined in: [types/proxy.ts:684](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **continueLoop**: `boolean`
 
-Defined in: [types/proxy.ts:685](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L685)
+Defined in: [types/proxy.ts:1100](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1100)
 
 ---
 
@@ -24,7 +24,34 @@ Defined in: [types/proxy.ts:685](https://github.com/juspay/neurolink/blob/ff50c1
 
 > `optional` **retrySameAccount?**: `boolean`
 
-Defined in: [types/proxy.ts:686](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L686)
+Defined in: [types/proxy.ts:1101](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1101)
+
+---
+
+### transportScope?
+
+> `optional` **transportScope?**: [`ProxyNetworkTransportScope`](ProxyNetworkTransportScope.md)
+
+Defined in: [types/proxy.ts:1102](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1102)
+
+---
+
+### errorCode?
+
+> `optional` **errorCode?**: `string`
+
+Defined in: [types/proxy.ts:1103](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1103)
+
+---
+
+### connectPhase?
+
+> `optional` **connectPhase?**: `boolean`
+
+Defined in: [types/proxy.ts:1106](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1106)
+
+The transport failure happened while connecting, before any request
+byte was sent, so retrying it cannot duplicate provider work.
 
 ---
 
@@ -32,9 +59,57 @@ Defined in: [types/proxy.ts:686](https://github.com/juspay/neurolink/blob/ff50c1
 
 > `optional` **retryAfterMs?**: `number`
 
-Defined in: [types/proxy.ts:688](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L688)
+Defined in: [types/proxy.ts:1108](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1108)
 
 When set, the caller should wait this many ms before retrying (from upstream retry-after).
+
+---
+
+### cooldownPlan?
+
+> `optional` **cooldownPlan?**: [`AccountCooldownPlan`](AccountCooldownPlan.md)
+
+Defined in: [types/proxy.ts:1110](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1110)
+
+Set on a genuine 429: how long / why to cool this account before rotating.
+
+---
+
+### quota?
+
+> `optional` **quota?**: [`AccountQuota`](AccountQuota.md)
+
+Defined in: [types/proxy.ts:1112](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1112)
+
+Quota snapshot parsed from the response headers (429 or success), if present.
+
+---
+
+### terminalError?
+
+> `optional` **terminalError?**: `object`
+
+Defined in: [types/proxy.ts:1116](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1116)
+
+A terminal upstream rejection already captured and classified by the
+fetch layer. The route must finalize it directly instead of feeding it
+through the generic non-OK handler a second time.
+
+#### status
+
+> **status**: `number`
+
+#### body
+
+> **body**: `string`
+
+#### headers
+
+> **headers**: `Record`\<`string`, `string`\>
+
+#### errorType
+
+> **errorType**: `"construction_rejection"`
 
 ---
 
@@ -42,7 +117,7 @@ When set, the caller should wait this many ms before retrying (from upstream ret
 
 > `optional` **response?**: `Response`
 
-Defined in: [types/proxy.ts:689](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L689)
+Defined in: [types/proxy.ts:1122](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1122)
 
 ---
 
@@ -50,7 +125,7 @@ Defined in: [types/proxy.ts:689](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **lastError**: `unknown`
 
-Defined in: [types/proxy.ts:690](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L690)
+Defined in: [types/proxy.ts:1123](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1123)
 
 ---
 
@@ -58,7 +133,7 @@ Defined in: [types/proxy.ts:690](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **sawRateLimit**: `boolean`
 
-Defined in: [types/proxy.ts:691](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L691)
+Defined in: [types/proxy.ts:1124](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1124)
 
 ---
 
@@ -66,7 +141,7 @@ Defined in: [types/proxy.ts:691](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **sawNetworkError**: `boolean`
 
-Defined in: [types/proxy.ts:692](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L692)
+Defined in: [types/proxy.ts:1125](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1125)
 
 ---
 
@@ -74,4 +149,4 @@ Defined in: [types/proxy.ts:692](https://github.com/juspay/neurolink/blob/ff50c1
 
 > `optional` **upstreamSpan?**: `Span`
 
-Defined in: [types/proxy.ts:693](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L693)
+Defined in: [types/proxy.ts:1126](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1126)

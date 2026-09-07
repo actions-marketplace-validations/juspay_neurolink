@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -6,7 +6,7 @@
 
 # Class: WorkflowError
 
-Defined in: [types/workflow.ts:510](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/workflow.ts#L510)
+Defined in: [types/workflow.ts:510](https://github.com/juspay/neurolink/blob/release/src/lib/types/workflow.ts#L510)
 
 Workflow execution error class
 
@@ -20,7 +20,7 @@ Workflow execution error class
 
 > **new WorkflowError**(`message`, `details`): `WorkflowError`
 
-Defined in: [types/workflow.ts:513](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/workflow.ts#L513)
+Defined in: [types/workflow.ts:513](https://github.com/juspay/neurolink/blob/release/src/lib/types/workflow.ts#L513)
 
 #### Parameters
 
@@ -46,4 +46,4 @@ Defined in: [types/workflow.ts:513](https://github.com/juspay/neurolink/blob/ff5
 
 > `readonly` **details**: [`WorkflowErrorDetails`](../type-aliases/WorkflowErrorDetails.md)
 
-Defined in: [types/workflow.ts:511](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/workflow.ts#L511)
+Defined in: [types/workflow.ts:511](https://github.com/juspay/neurolink/blob/release/src/lib/types/workflow.ts#L511)

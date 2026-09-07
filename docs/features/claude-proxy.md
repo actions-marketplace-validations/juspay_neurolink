@@ -351,6 +351,127 @@ neurolink proxy telemetry import-dashboard # Re-import the dashboard without res
 
 These commands use the repo-owned assets under `scripts/observability/` and the dashboard JSON at `docs/assets/dashboards/neurolink-proxy-observability-dashboard.json`.
 
+### `neurolink proxy analyze`
+
+Read the proxy's own request and attempt logs and report what actually happened:
+per-account success and failure counts, retry-recovered requests, terminal error
+categories, and routing decisions.
+
+```bash
+neurolink proxy analyze                       # summarise the retained window
+neurolink proxy analyze --logs-dir <path>     # a specific log directory
+```
+
+Reported counts are bounded by log retention. When the request and attempt
+windows are not comparable, the command says so rather than printing a
+recovered-after-retry figure it cannot stand behind.
+
+### `neurolink proxy replay <export|compare>`
+
+Reconstruct a captured request for debugging, or send it directly upstream to
+compare proxied and direct behaviour.
+
+```bash
+neurolink proxy replay export --request-id <id> --output bundle.json
+neurolink proxy replay compare --bundle bundle.json --execute
+```
+
+`compare` reaches a provider, so it requires the explicit `--execute` flag.
+Captured bodies are redacted; supply `--body-file` when a full body is needed,
+and `--header-env` to inject a credential from an environment variable rather
+than a literal.
+
+### `neurolink proxy share <action>`
+
+Lend spare pool capacity to a peer, with the terms enforced on every request.
+See [Proxy Peer Sharing](/docs/features/proxy-peer-sharing) for the full guide.
+
+```bash
+neurolink proxy share url https://proxy.example.com   # record this node's address
+neurolink proxy share url                             # show it
+neurolink proxy share url get                         # bare value, for scripts
+neurolink proxy share url --clear                     # forget it
+neurolink proxy share create --peer <name> --preset spare
+neurolink proxy share list | status [--peer <name>]
+neurolink proxy share pause  --peer <name>            # stops at their next request
+neurolink proxy share resume --peer <name>
+neurolink proxy share set    --peer <name> --reserve 40 --max-slice 5h=15
+neurolink proxy share topup  --peer <name> --coins 200
+neurolink proxy share rotate --peer <name>            # new token, same controls
+neurolink proxy share revoke --peer <name>
+neurolink proxy share delete --peer <name>
+neurolink proxy share level  --peer <name> --to complete
+neurolink proxy share provision --peer <name> --from-account <account-label>
+neurolink proxy share provision --peer <name> --code <code>   # finish it
+neurolink proxy share receipts --peer <name>          # what you charged them
+neurolink proxy share note --coins 200 --ttl 30d      # mint a transferable note
+neurolink proxy share notes                           # notes minted, and spent
+```
+
+`share provision` is a **split-PKCE** flow: the borrower runs
+`neurolink proxy peer request` first and keeps the verifier, you authorize in
+your browser and relay a single-use code. You never hold a token for the
+credential you mint. See
+[Proxy peer sharing](/docs/features/proxy-peer-sharing).
+
+Controls, all applied together:
+
+| Flag                                           | Meaning                                                       |
+| ---------------------------------------------- | ------------------------------------------------------------- |
+| `--reserve 30`                                 | Keep 30% headroom on **each** account for yourself            |
+| `--max-slice 20`                               | Borrower may take at most 20% of the **pool**, however spread |
+| `--max-slice-per-account 20`                   | Apply that ceiling to each account independently instead      |
+| `--spillover 12h<60@25`                        | Lend only near a reset, when little of the window was used    |
+| `--models sonnet haiku`                        | Restrict which model tiers the share covers                   |
+| `--accounts <label>`                           | Restrict which of your accounts are lendable                  |
+| `--rate 20/min --concurrency 2`                | Request and in-flight ceilings                                |
+| `--schedule 21-9`                              | Hours the share is open (wraps midnight)                      |
+| `--expires 7d`                                 | Grant lifetime                                                |
+| `--ledger coins --coins 500 --refill 100/week` | Meter it instead of leaving it open                           |
+
+Presets fill these in: `spare` (reserve + pool slice), `spillover`, `metered`,
+`open`. Any explicit flag overrides the preset.
+
+### `neurolink proxy peer <action>`
+
+Borrow capacity from someone else's pool. Peers are consulted **only after every
+local account is spent**, ahead of the provider fallback chain.
+
+```bash
+neurolink proxy peer add --name <lender> --link "neurolink://share/...#<token>"
+neurolink proxy peer add --name <lender> --url https://proxy.example.com --token <token>
+neurolink proxy peer request --name <lender>                  # ask to be provisioned
+neurolink proxy peer request --name <lender> --claim          # collect and install
+neurolink proxy peer list | status [--json]
+neurolink proxy peer test  --name <lender>                   # free reachability probe
+neurolink proxy peer sync  [--name <lender>]                 # force a check-in
+neurolink proxy peer receipts --name <lender>                # check what you were charged
+neurolink proxy peer net      --name <lender>                # net reciprocal use
+neurolink proxy peer redeem   --name <lender> --coin-note <note>
+neurolink proxy peer set   --name <lender> --priority 5
+neurolink proxy peer pause | resume | remove --name <lender>
+```
+
+### `neurolink proxy expose`
+
+Publish this node through a `cloudflared` tunnel, for operators without an
+address of their own. With no `--port` it picks the gate-only **share
+listener** — the port that requires a grant on every request — and refuses to
+open a tunnel to anything that serves untokened requests.
+
+```bash
+neurolink proxy expose                          # the share listener
+neurolink proxy expose --port 3000              # or a port you name
+neurolink proxy expose --named <tunnel-name>    # stable URL across restarts
+```
+
+The share listener starts on its own once at least one grant is active, on
+`--share-port` (default: proxy port + 1). Your own client keeps using the main
+port untokened.
+
+If you already front the proxy with your own domain, skip this and record the
+address with `neurolink proxy share url <url>` instead.
+
 ### `neurolink auth login anthropic`
 
 Authenticate with Anthropic. Supports multi-account pooling via `--add --label`.
@@ -417,19 +538,113 @@ neurolink auth refresh anthropic
 
 ### `neurolink auth cleanup`
 
-Remove expired and disabled accounts from the token store.
+Remove accounts from the token store whose credentials no longer work.
 
 ```bash
 neurolink auth cleanup           # Interactive: prompts before removing
 neurolink auth cleanup --force   # Remove without prompting
 ```
 
-### `neurolink auth enable`
+Only accounts the proxy gave up on are deleted — expired entries with no refresh
+token, and accounts disabled for `missing_refresh_token`, `refresh_invalid` or
+`refresh_failed`. An account you disabled yourself, or one blocked by an
+organization policy, still holds a valid login, so cleanup keeps it and tells you
+to use `auth enable` or `auth remove` instead.
 
-Re-enable a previously disabled account (e.g., one disabled after repeated refresh failures).
+### `neurolink auth enable` / `neurolink auth disable`
+
+Take an account out of the proxy pool, or put it back. Disabling keeps the
+credentials; the proxy re-reads the token store on every request, so it takes
+effect on the next one without a restart.
 
 ```bash
-neurolink auth enable work       # Re-enable the account labeled "work"
+neurolink auth disable anthropic:work --reason "org disabled oauth"
+neurolink auth enable anthropic:work
+```
+
+The proxy also disables an account automatically when Anthropic refuses it on an
+organization entitlement policy (`403 permission_error`), after rotating the
+request to a healthy account. Re-enable it once an admin restores access.
+
+### `neurolink auth cooldown <action> [account]`
+
+Inspect or release the per-account cooldowns the proxy persists after rate limits
+and auth failures. `action` is `list` or `clear`.
+
+```bash
+neurolink auth cooldown list
+neurolink auth cooldown clear anthropic:work
+neurolink auth cooldown clear --all
+```
+
+A running proxy caches cooldowns for its process lifetime, so restart it for a
+clear to take effect on an instance that is already serving.
+
+### `neurolink auth overage [action]`
+
+Show or set whether the pool may keep serving on paid extra usage once an
+account's subscription window is spent. Writes `routing.use-overage` to the proxy
+config, which a running proxy picks up automatically. `action` is `status`
+(the default), `auto`, `always` or `never`.
+
+```bash
+neurolink auth overage                # current policy and per-account status
+neurolink auth overage auto|always|never
+neurolink auth overage never          # stop at the subscription limit
+```
+
+Only `never` overrides the provider. Nothing here can enable extra usage that
+Anthropic reports as disabled — `status` names the reason when it is, for example
+`org_level_disabled`.
+
+### `neurolink auth set-primary` / `get-primary` / `clear-primary`
+
+Pin routing to a preferred account, read the current pin, or remove it. The
+primary is a preference, not a guarantee: a saturated or cooling primary is still
+passed over.
+
+```bash
+neurolink auth set-primary <account-label>
+neurolink auth get-primary
+neurolink auth clear-primary
+```
+
+### `neurolink auth health`
+
+Report per-account credential health — token validity, expiry, disabled state
+and the reason for it.
+
+```bash
+neurolink auth health
+neurolink auth health --format json
+```
+
+### `neurolink auth logout <provider>` / `neurolink auth remove <provider>`
+
+`logout` clears stored tokens for a provider but keeps the account entry.
+`remove` deletes the entry entirely.
+
+```bash
+neurolink auth logout anthropic
+neurolink auth remove anthropic
+```
+
+### `neurolink auth validate <token>`
+
+Check a token against the provider without storing it — useful when diagnosing
+whether a credential or the routing around it is at fault.
+
+```bash
+neurolink auth validate <token>
+```
+
+### `neurolink auth providers`
+
+List the providers the auth subsystem supports and which of them have stored
+credentials.
+
+```bash
+neurolink auth providers
 ```
 
 ## Multi-Account Setup
@@ -461,19 +676,59 @@ When `routing.account-allowlist` is configured, this discovery happens only with
 
 Within the account pool, the proxy uses **fill-first** routing: it always tries the first non-cooling account and only switches on failure. This avoids unnecessary identity switches that could confuse Claude Code's session state.
 
+### Model-scoped weekly limits
+
+Some plans cap a specific model separately from the overall weekly window — a
+Fable-only weekly allowance, for instance. Anthropic reports that cap as its own
+header family (`anthropic-ratelimit-unified-7d_oi-*`), sent **only** on responses
+for the model it applies to, so the proxy learns about it from live traffic
+rather than needing a refresh.
+
+Routing treats a spent model-scoped cap as per-model, never per-account:
+
+- An account whose cap for the requested model is spent is skipped for **that
+  model only**. It stays fully available for every other model, and no cooldown
+  is set — cooling is account-wide and would wrongly withhold a healthy account.
+- Among accounts that do have headroom, the one closest to spending its
+  allowance is preferred, so the pool finishes an allowance rather than spreading
+  across all of them. This rung only applies when both candidates report a window
+  for the model.
+- If **every** account has spent the cap, the request is not attempted. The
+  client gets a `429` naming the model, the real reset time, and that other
+  models remain available — switch model, or add an account with headroom.
+- A scoped window older than the quota freshness budget is ignored, so stale or
+  mis-parsed data can never take the pool down. Routing falls back to attempting
+  the request.
+
+`neurolink auth list` shows any scoped window under its account, and
+`GET /limits` returns the full `windows[]` array.
+
 ### Cooldown and backoff
 
 When an account encounters an error, it enters a cooldown period based on the error type:
 
-| Failure                                                | Cooldown                                          | Behavior                                         |
-| ------------------------------------------------------ | ------------------------------------------------- | ------------------------------------------------ |
-| Authoritative unified, 5-hour, or 7-day rejection      | Upstream reset or `Retry-After`, capped at 8 days | Persist cooldown and rotate immediately          |
-| Transient burst 429                                    | Upstream delay, capped at 15 minutes              | At most 2 same-account retries, then rotate      |
-| Refresh credential rejection (`400`/`401`/`403`/`404`) | Disabled until explicit login                     | Rotate without retrying an invalid refresh token |
-| Refresh network, `429`, or `5xx`                       | 30 seconds to 5 minutes                           | Persist auth cooldown and rotate                 |
-| Upstream `5xx` or network error                        | Bounded same-account retries                      | Rotate after retry budget                        |
+| Failure                                                | Cooldown                                           | Behavior                                         |
+| ------------------------------------------------------ | -------------------------------------------------- | ------------------------------------------------ |
+| Authoritative unified, 5-hour, or 7-day rejection      | Upstream reset or `Retry-After`, capped per reason | Persist cooldown and rotate immediately          |
+| Transient burst 429                                    | Upstream delay, capped at 15 minutes               | At most 2 same-account retries, then rotate      |
+| Refresh credential rejection (`400`/`401`/`403`/`404`) | Disabled until explicit login                      | Rotate without retrying an invalid refresh token |
+| Refresh network, `429`, or `5xx`                       | 30 seconds to 5 minutes                            | Persist auth cooldown and rotate                 |
+| Upstream `5xx` or network error                        | Bounded same-account retries                       | Rotate after retry budget                        |
 
 Cooldown updates are extend-only: a late concurrent response cannot shorten a longer known reset window.
+
+Each cooldown is also capped by what its reason can mean — a `session` cooldown
+describes a 5-hour window, so it can never run for days no matter what reset the
+upstream reports. The cap is applied when the cooldown is written and again when
+it is read back from disk, so an entry written by an older build heals itself on
+load and logs that it did:
+
+```
+[proxy] cooldown clamp: anthropic:work session entry healed from 206.0h to 5.3h — the stored wait exceeded what "session" can mean
+```
+
+Use `neurolink auth cooldown list` to see what is currently parked, and
+`neurolink auth cooldown clear <account>` to release one.
 
 ## Error Handling
 

@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ParsedClaudeError** = `object`
 
-Defined in: [types/proxy.ts:1226](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1226)
+Defined in: [types/proxy.ts:3033](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L3033)
 
 Parsed shape of a Claude API error body.
 
@@ -18,7 +18,7 @@ Parsed shape of a Claude API error body.
 
 > `optional` **errorType?**: `string`
 
-Defined in: [types/proxy.ts:1227](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1227)
+Defined in: [types/proxy.ts:3034](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L3034)
 
 ---
 
@@ -26,4 +26,15 @@ Defined in: [types/proxy.ts:1227](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **message?**: `string`
 
-Defined in: [types/proxy.ts:1228](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L1228)
+Defined in: [types/proxy.ts:3035](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L3035)
+
+---
+
+### errorCode?
+
+> `optional` **errorCode?**: `string`
+
+Defined in: [types/proxy.ts:3038](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L3038)
+
+`error.details.error_code`, e.g. "oauth_not_allowed_for_organization".
+Absent on payloads that carry no details object.

@@ -36,28 +36,283 @@ const CRITICAL_SECURITY_RULES = [
   "private-key",
 ];
 
-// Configuration: Packages to temporarily ignore in vulnerability scanning
-// TODO: Address these vulnerabilities in a separate security update
-const IGNORED_VULNERABLE_PACKAGES = [
-  "jsondiffpatch", // XSS in ai dependency - tracked separately
-  "ai", // File upload bypass - planned upgrade
-  // undici/lodash/lodash-es removed: now patched via pnpm.overrides.
-  // The @opentelemetry/* advisories below come ONLY from a stale @juspay/neurolink@9.37.0
-  // that pnpm auto-installs to satisfy @juspay/hippocampus's neurolink peer. That old
-  // neurolink directly depends on the vulnerable OTEL; the latest published neurolink
-  // (>=9.70.x) removed those deps. They are a dev-install artifact and do NOT reach
-  // consumers of the published package (peer deps are not bundled).
-  //
-  // UPSTREAM IS FIXED: @juspay/hippocampus@0.1.7 raised its neurolink peer to ">=9.70.0"
-  // (this change bumps the dependency to it). The entries remain only because of a pnpm
-  // resolver bug: pnpm keeps resolving the peer to 9.37.0 even though that violates the
-  // published ">=9.70.0" range — reproduced through --force, --fix-lockfile, dedupe,
-  // pnpm update, and a full lockfile regen. These entries clear automatically once pnpm
-  // resolves the peer correctly. Upstream: https://github.com/juspay/hippocampus (v0.1.7)
-  "@opentelemetry/sdk-node",
-  "@opentelemetry/auto-instrumentations-node",
-  "@opentelemetry/exporter-prometheus",
-];
+// Configuration: production advisories accepted as risk, keyed by package with
+// a severity ceiling.
+//
+// Why a ceiling rather than a list of advisory ids: a package such as undici or
+// ip-address accumulates several advisories for the same underlying weakness,
+// and every new one used to hard-fail the build until a human pasted its id in
+// here. That is not a review decision, it is a tax — and it fired mid-release
+// on fast-uri 1145636.
+//
+// The ceiling is set to the highest severity actually observed for that package
+// at the time of the snapshot below. A further advisory in the same package at
+// or below that severity is accepted and logged; one that arrives ABOVE the
+// ceiling still fails the build. So the model stays quiet for more of the same
+// and still speaks up when a package gets materially worse.
+//
+// Every accepted advisory is printed with its id and title on each run, so a
+// new one inside an existing ceiling is visible in the log even though it does
+// not block. Re-seed from `pnpm audit --prod --json` when this goes stale.
+//
+// Snapshot taken 2026-08-22 against `pnpm audit --prod --json`: 16 actionable
+// (moderate+) advisories across 9 packages. `--prod` structurally excludes dev
+// -only trees.
+type AdvisorySeverity = "low" | "moderate" | "high" | "critical";
+
+const SEVERITY_RANK: Record<string, number> = {
+  info: 0,
+  low: 0,
+  moderate: 1,
+  high: 2,
+  critical: 3,
+};
+
+const ACCEPTED_RISK_PACKAGES: Record<
+  string,
+  { maxSeverity: AdvisorySeverity; reason: string }
+> = {
+  uuid: {
+    maxSeverity: "moderate",
+    reason:
+      "deep transitive via @anthropic-ai/vertex-sdk, bullmq and exceljs — no single direct dependency to bump",
+  },
+  "form-data": {
+    maxSeverity: "high",
+    reason:
+      "transitive via optional @livekit/agents (voice feature only), not on the default request path",
+  },
+  "@opentelemetry/core": {
+    maxSeverity: "moderate",
+    reason: "transitive via the optional livekit OTEL exporter chain",
+  },
+  "adm-zip": {
+    maxSeverity: "high",
+    reason:
+      "transitive via optional @livekit/agents-plugin-livekit onnxruntime-node",
+  },
+  sharp: {
+    maxSeverity: "high",
+    reason:
+      "optionalDependency for image handling — not required at runtime for most consumers",
+  },
+  "find-my-way": {
+    maxSeverity: "high",
+    reason: "transitive via the optional fastify server adapter",
+  },
+  undici: {
+    maxSeverity: "high",
+    reason:
+      "direct dep; patched releases fit the existing >=7.24.0 <8.0.0 range and land via lockfile bumps",
+  },
+  "ip-address": {
+    maxSeverity: "high",
+    reason: "transitive via express-rate-limit (SSRF-bypass family)",
+  },
+  "image-size": {
+    maxSeverity: "high",
+    reason:
+      "transitive via pptxgenjs — upstream has published no patched version yet",
+  },
+};
+
+/**
+ * Run a git command, or return undefined. Never throws, never prints.
+ *
+ * Every release comparison below is a diagnostic bolted to a build that is
+ * already failing, so a missing ref, a shallow clone or no git at all must mean
+ * no hint rather than a second failure.
+ */
+function git(command: string): string | undefined {
+  try {
+    return execSync(command, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 10_000,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Make `origin/release` resolvable, once per process.
+ *
+ * Without this the whole diagnostic is dead code in exactly the place it exists
+ * to help. `actions/checkout@v4` defaults to `fetch-depth: 1`, so a CI checkout
+ * has the commit under test and no other branch — `origin/release` does not
+ * resolve, every lookup below returns undefined, and the contributor sees the
+ * same bare "Unaccepted advisory" this change set out to replace.
+ *
+ * A depth-1 fetch of one branch is cheap and is skipped entirely when the ref
+ * is already present, which is the local case. Memoised so N advisories do not
+ * trigger N fetches.
+ */
+let releaseRefChecked = false;
+let releaseRefAvailable = false;
+function ensureReleaseRef(): boolean {
+  if (releaseRefChecked) {
+    return releaseRefAvailable;
+  }
+  releaseRefChecked = true;
+  releaseRefAvailable =
+    git("git rev-parse --verify --quiet origin/release") !== undefined ||
+    (git(
+      "git fetch --depth=1 origin release:refs/remotes/origin/release",
+    ) !== undefined &&
+      git("git rev-parse --verify --quiet origin/release") !== undefined);
+  return releaseRefAvailable;
+}
+
+/**
+ * Whether `release` accepts a package that the running branch does not.
+ *
+ * The accepted-risk table lives in this file, so it moves with `release` like
+ * any other source. A branch cut before an entry was added fails on an advisory
+ * that `release` has already reviewed and accepted — and the failure text says
+ * only "is not an accepted-risk package", which is true of the branch and
+ * useless to whoever is reading it. That happened to two contributor PRs in one
+ * week; both spent days looking for a fault in their own code. `fast-uri`
+ * 1145636 is the worked example, and this file's own comments already reference
+ * it.
+ *
+ * Reads the table out of `origin/release` rather than parsing it: the literal
+ * is extracted by brace matching and the package looked for as a KEY. A plain
+ * substring search would be wrong — package names appear in the prose of other
+ * entries' `reason` fields and in the comments above, `fast-uri` included.
+ *
+ * Returns undefined on any failure. This is a diagnostic attached to a build
+ * that is already failing; it must never be the reason one fails, so a missing
+ * ref, a shallow clone, or no git at all just means no hint.
+ */
+function releaseAcceptsPackage(moduleName: string): string | undefined {
+  if (!ensureReleaseRef()) {
+    return undefined;
+  }
+  try {
+    const released = git("git show origin/release:scripts/security-check.ts");
+    if (released === undefined) {
+      return undefined;
+    }
+    const start = released.indexOf("const ACCEPTED_RISK_PACKAGES");
+    if (start === -1) {
+      return undefined;
+    }
+    const open = released.indexOf("{", released.indexOf("= {", start));
+    if (open === -1) {
+      return undefined;
+    }
+    let depth = 0;
+    let end = -1;
+    for (let i = open; i < released.length; i++) {
+      if (released[i] === "{") {
+        depth++;
+      } else if (released[i] === "}") {
+        depth--;
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+      }
+    }
+    if (end === -1) {
+      return undefined;
+    }
+    const table = released.slice(open, end + 1);
+    // Key position only: start of line, optionally quoted, followed by `: {`.
+    const escaped = moduleName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const key = new RegExp(
+      `^\\s*(["']?)${escaped}\\1\\s*:\\s*\\{([\\s\\S]*?)^\\s*\\}`,
+      "m",
+    );
+    const found = table.match(key);
+    if (!found) {
+      return undefined;
+    }
+    const ceiling = found[2].match(/maxSeverity:\s*["']([a-z]+)["']/);
+    return ceiling ? ceiling[1] : "unknown";
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether `release` pins a package out of its vulnerable range via an override
+ * that this branch does not have.
+ *
+ * This is the case that actually bites, and it is NOT the accepted-risk one.
+ * `fast-uri` 1145636 broke two contributor PRs, and `fast-uri` is not in the
+ * accepted-risk table at all — `release` fixed it in `aec7f8ac` by adding a
+ * `pnpm.overrides` entry (`fast-uri@<3.1.5: ">=3.1.5 <4"`) that lifts the
+ * dependency past the advisory, so the advisory simply is not in `release`'s
+ * tree. A branch cut before that commit still resolves the vulnerable version
+ * and fails, through no fault of its own.
+ *
+ * Compares against `origin/release`'s package.json, which is a JSON parse
+ * rather than a source scrape and so is reliable. Silent on any failure, for
+ * the same reason as `releaseAcceptsPackage`.
+ */
+function releaseOverridesPackage(moduleName: string): string | undefined {
+  if (!ensureReleaseRef()) {
+    return undefined;
+  }
+  try {
+    const localPkg = JSON.parse(
+      fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8"),
+    );
+    const releasedRaw = git("git show origin/release:package.json");
+    if (releasedRaw === undefined) {
+      return undefined;
+    }
+    const releasedPkg = JSON.parse(releasedRaw);
+    const pick = (p: Record<string, unknown>): Record<string, string> => ({
+      ...((p.pnpm as { overrides?: Record<string, string> } | undefined)
+        ?.overrides ?? {}),
+      ...((p.overrides as Record<string, string> | undefined) ?? {}),
+    });
+    const localOv = pick(localPkg);
+    const releaseOv = pick(releasedPkg);
+    // Override keys carry a range suffix (`fast-uri@<3.1.5`), so match on the
+    // package name before the `@` that separates it — allowing for scoped names.
+    const nameOf = (k: string): string => {
+      const at = k.lastIndexOf("@");
+      return at > 0 ? k.slice(0, at) : k;
+    };
+    const inRelease = Object.entries(releaseOv).find(
+      ([k]) => nameOf(k) === moduleName,
+    );
+    if (!inRelease) {
+      return undefined;
+    }
+    // ANY local override counts, not just an identical one. A branch that pins
+    // this package to a different range has made a deliberate decision about
+    // it, and telling its author "release pins this and your branch does not"
+    // would be flatly untrue — the branch does pin it, differently. Staleness
+    // is only a defensible claim when the branch has no opinion at all.
+    const inLocal = Object.entries(localOv).find(
+      ([k]) => nameOf(k) === moduleName,
+    );
+    if (inLocal) {
+      return undefined;
+    }
+    return `${inRelease[0]}: ${inRelease[1]}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/** How many commits `origin/release` is ahead, when that is knowable. */
+function commitsBehindRelease(): number | undefined {
+  if (!ensureReleaseRef()) {
+    return undefined;
+  }
+  const out = git("git rev-list --count HEAD..origin/release");
+  if (out === undefined) {
+    return undefined;
+  }
+  const n = Number.parseInt(out.trim(), 10);
+  return Number.isFinite(n) ? n : undefined;
+}
 
 type SecurityIssue = {
   level: string;
@@ -65,6 +320,17 @@ type SecurityIssue = {
   message: string;
   details: Record<string, unknown> | null;
   timestamp: string;
+};
+
+type PnpmAdvisory = {
+  id: number;
+  severity: string;
+  module_name: string;
+  title: string;
+};
+
+type PnpmAuditJson = {
+  advisories?: Record<string, PnpmAdvisory>;
 };
 
 type GitleaksFinding = {
@@ -80,6 +346,43 @@ type SecurityResults = {
   licenses: { status: string; details: unknown[] };
   bestPractices: { status: string; details: unknown[] };
 };
+
+/**
+ * Ceiling for an external scanner subprocess (gitleaks, ripgrep).
+ *
+ * What this catches is a scanner that wedges, which without a bound takes the
+ * entire CI job down silently, since spawnSync blocks the event loop and
+ * produces no output while stuck.
+ *
+ * On the headroom, measured rather than assumed: gitleaks is invoked with
+ * `--no-git` (see gitleaksArgs below), so it scans the working tree and does
+ * NOT walk history — repo age and commit count do not enter into its runtime.
+ * The whole of this script, gitleaks and `pnpm audit` and license checks
+ * together, completes in about 1.4s here. 120s is therefore ~85x the observed
+ * cost of everything, not a tight fit around one scanner.
+ *
+ * It is still overridable, because that headroom is measured on one repository
+ * and a much larger working tree, a cold CI runner fetching the binary, or a
+ * future switch away from `--no-git` could all move it:
+ *
+ *   NEUROLINK_SCANNER_TIMEOUT_MS=300000 pnpm run validate:security
+ *
+ * A non-numeric or non-positive value is ignored in favour of the default,
+ * since a bound of zero would fail every scan instantly and an unbounded one
+ * reintroduces the hang this exists to prevent.
+ */
+const SCANNER_TIMEOUT_DEFAULT_MS = 120_000;
+const SCANNER_TIMEOUT_MS = (() => {
+  const raw = process.env.NEUROLINK_SCANNER_TIMEOUT_MS;
+  if (raw === undefined) {
+    return SCANNER_TIMEOUT_DEFAULT_MS;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0
+    ? parsed
+    : SCANNER_TIMEOUT_DEFAULT_MS;
+})();
+
 
 class SecurityValidator {
   errors: SecurityIssue[];
@@ -135,94 +438,252 @@ class SecurityValidator {
   }
 
   // 1. Dependency Vulnerability Scanning
+  //
+  // Parses `pnpm audit --prod --json` and checks each advisory against the
+  // per-package ceiling in ACCEPTED_RISK_PACKAGES.
+  //
+  // Two earlier designs are worth not repeating. The first ran plain-text
+  // `pnpm audit` and computed a single boolean over the *entire* output: if
+  // any one of a handful of allowlisted package *names* appeared anywhere in
+  // the text, the whole check passed — regardless of how many other,
+  // unrelated advisories were open. That let a build with 15 open
+  // high-severity production advisories report PASS because one unrelated,
+  // genuinely-ignorable OTEL package also appeared in the table.
+  //
+  // The second keyed acceptance to individual advisory ids. Correct, but it
+  // made every newly-published advisory a hard build failure until a human
+  // pasted its id in — which fired mid-release on fast-uri 1145636 and had to
+  // be unblocked by hand. The ceiling model keeps the per-package review
+  // decision while letting more-of-the-same through, and still fails on
+  // anything that exceeds the severity a package was accepted at.
+  //
+  // `--prod` excludes dev-only trees, so this only evaluates advisories that
+  // can reach a real consumer of the published package.
   async checkDependencyVulnerabilities(): Promise<void> {
     this.log("Scanning dependencies for vulnerabilities...", "blue");
 
+    let output: string;
     try {
-      // Try pnpm audit first (faster and more accurate)
-      try {
-        execSync("pnpm audit --audit-level=moderate", {
-          encoding: "utf8",
-          stdio: "pipe",
-        });
-
-        // If pnpm audit succeeds with no output, no vulnerabilities found
-        this.log("No known vulnerabilities found", "green");
-        this.results.dependencies.status = "passed";
-      } catch (pnpmError: unknown) {
-        // pnpm audit exits with non-zero when vulnerabilities found
-        const execErr = pnpmError as {
-          stdout?: string;
-          message?: string;
-        };
-        const output = execErr.stdout || execErr.message || "";
-
-        // Check if vulnerabilities are from ignored packages
-        const isIgnoredPackage = IGNORED_VULNERABLE_PACKAGES.some(
-          (pkg) =>
-            output.includes(`│ Package             │ ${pkg}`) ||
-            output.includes(`Package: ${pkg}`),
+      // pnpm audit exits non-zero whenever advisories are found — that is
+      // expected and not itself a tool failure, so capture stdout on both
+      // the success and the error path rather than treating a throw as
+      // "the scan could not run".
+      output = execSync("pnpm audit --prod --json", {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        // `pnpm audit` talks to the registry, so this is the one call in this
+        // file that can hang on something outside the machine. It matters more
+        // than it looks: CI runs `pnpm run validate:security` DIRECTLY (ci.yml,
+        // "🔒 Security Validation"), not through build-validations.ts, so the
+        // process-group bound added there does not cover this path at all.
+        // Unbounded, an unreachable registry hangs the job to its own limit.
+        //
+        // 1s measured locally against a 120s ceiling. SIGKILL because execSync's
+        // timeout otherwise sends SIGTERM and keeps waiting.
+        timeout: SCANNER_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+      });
+    } catch (pnpmError: unknown) {
+      const execErr = pnpmError as {
+        stdout?: string;
+        code?: string;
+        signal?: string;
+      };
+      // `pnpm audit` exits non-zero when it FINDS advisories, so landing here is
+      // the normal path and `stdout` carries the real report. A timeout lands
+      // here too, and the branches below already fail closed on the empty and
+      // unparseable output it leaves. What they cannot do is SAY it was a
+      // timeout — they would report "produced no output", which sends whoever
+      // reads it looking for a broken pnpm rather than a slow registry.
+      if (execErr.code === "ETIMEDOUT" || execErr.signal === "SIGKILL") {
+        this.addIssue(
+          "error",
+          "dependencies",
+          `pnpm audit exceeded ${SCANNER_TIMEOUT_MS / 1000}s and was killed — the vulnerability scan did not complete, so its result cannot be trusted (registry unreachable or slow?)`,
         );
-
-        if (isIgnoredPackage) {
-          const ignoredList = IGNORED_VULNERABLE_PACKAGES.join(", ");
-          this.log(
-            `Found vulnerabilities in temporarily ignored packages: ${ignoredList}`,
-            "cyan",
-          );
-          this.log(
-            "No critical vulnerabilities (ignored packages excluded)",
-            "green",
-          );
-          this.results.dependencies.status = "passed";
-          return;
-        }
-
-        // Check if it contains moderate/high/critical vulnerabilities
-        if (
-          output.includes("moderate") ||
-          output.includes("high") ||
-          output.includes("critical")
-        ) {
-          // Count moderate+ severity issues
-          const moderateMatches = (output.match(/moderate/gi) || []).length;
-          const highMatches = (output.match(/high/gi) || []).length;
-          const criticalMatches = (output.match(/critical/gi) || []).length;
-
-          if (highMatches > 0 || criticalMatches > 0) {
-            this.addIssue(
-              "error",
-              "dependencies",
-              `Found ${highMatches + criticalMatches} high/critical severity vulnerabilities`,
-            );
-            this.results.dependencies.status = "failed";
-          } else if (moderateMatches > 0) {
-            this.addIssue(
-              "warning",
-              "dependencies",
-              `Found ${moderateMatches} moderate vulnerabilities`,
-            );
-            this.results.dependencies.status = "warning";
-          } else {
-            this.log("No known vulnerabilities found", "green");
-            this.results.dependencies.status = "passed";
-          }
-        } else {
-          // If no specific vulnerabilities mentioned, assume it passed
-          this.log("No known vulnerabilities found", "green");
-          this.results.dependencies.status = "passed";
-        }
+        this.results.dependencies.status = "failed";
+        return;
       }
-    } catch (error: unknown) {
+      output = execErr.stdout || "";
+    }
+
+    // Fail CLOSED. Every branch below means "the scan did not produce a report
+    // I can reason about" — not "there is nothing wrong". Reporting those as a
+    // warning let the check pass while knowing nothing, which is the same
+    // failure shape as the single-boolean implementation this replaced: a
+    // security gate that is green because it did not look.
+    if (!output.trim()) {
+      this.addIssue(
+        "error",
+        "dependencies",
+        "pnpm audit produced no output — the vulnerability scan did not run, so its result cannot be trusted",
+      );
+      this.results.dependencies.status = "failed";
+      return;
+    }
+
+    let audit: PnpmAuditJson;
+    try {
+      audit = JSON.parse(output) as PnpmAuditJson;
+    } catch (parseError: unknown) {
       const message =
-        error instanceof Error ? error.message : String(error);
+        parseError instanceof Error
+          ? parseError.message
+          : String(parseError);
+      this.addIssue(
+        "error",
+        "dependencies",
+        `Could not parse pnpm audit output as JSON — the scan produced no usable report: ${message}`,
+      );
+      this.results.dependencies.status = "failed";
+      return;
+    }
+
+    // `{ "advisories": {} }` is a legitimate clean report. A response with no
+    // `advisories` key at all is not — that is what a retired or erroring audit
+    // endpoint returns, and defaulting it to {} would read as "zero
+    // vulnerabilities" when the truth is "no answer".
+    const rawAdvisories = audit.advisories;
+    if (
+      rawAdvisories === undefined ||
+      rawAdvisories === null ||
+      typeof rawAdvisories !== "object" ||
+      Array.isArray(rawAdvisories)
+    ) {
+      this.addIssue(
+        "error",
+        "dependencies",
+        "pnpm audit returned a report with no object-valued 'advisories' field — treating this as a failed scan rather than a clean one",
+      );
+      this.results.dependencies.status = "failed";
+      return;
+    }
+
+    const advisories = Object.values(rawAdvisories);
+    // Only moderate+ advisories require an explicit accept — this mirrors
+    // the previous --audit-level=moderate threshold. Low/info advisories are
+    // still surfaced for visibility but do not block the build on their own.
+    const actionable = advisories.filter((a) =>
+      ["moderate", "high", "critical"].includes(a.severity),
+    );
+
+    const isAccepted = (a: PnpmAdvisory): boolean => {
+      const entry = ACCEPTED_RISK_PACKAGES[a.module_name];
+      if (!entry) {
+        return false;
+      }
+      return (
+        (SEVERITY_RANK[a.severity] ?? 0) <=
+        (SEVERITY_RANK[entry.maxSeverity] ?? 0)
+      );
+    };
+
+    const accepted = actionable.filter(isAccepted);
+    const unaccepted = actionable.filter((a) => !isAccepted(a));
+
+    // Print every accepted advisory, not just a count. The ceiling model is
+    // deliberately quiet about more-of-the-same, so the log is the only place
+    // a newly-appeared advisory inside an existing ceiling becomes visible.
+    if (accepted.length > 0) {
+      accepted.forEach((a) => {
+        const entry = ACCEPTED_RISK_PACKAGES[a.module_name];
+        this.log(
+          `Accepted risk — ${a.module_name} ${a.severity} (ceiling ${entry.maxSeverity}) advisory ${a.id}: ${a.title} — ${entry.reason}`,
+          "cyan",
+        );
+      });
+    }
+
+    // An accepted-risk entry whose package no longer has any live advisory is
+    // dead weight: it makes the accepted list look larger than the real
+    // exposure, and it hides the fact that something was fixed upstream. Report
+    // it as a warning rather than an error — a stale acceptance is tidy-up, not
+    // a vulnerability, and failing the build for it would break unrelated work
+    // the moment a dependency gets patched.
+    //
+    // This is the safeguard the previous advisory-id list never had. That list
+    // could only grow: ids were added by hand whenever the build broke, and
+    // nothing ever told anyone when one stopped mattering.
+    //
+    // Computed BEFORE the unaccepted-advisory return below. A run that fails on
+    // a real advisory is exactly a run someone is about to read carefully, so
+    // it is the worst moment to withhold the rest of what the scan noticed.
+    //
+    // The threshold is named explicitly: `actionable` drops low-severity
+    // advisories, so a package whose only open advisory is low would otherwise
+    // be described as having none at all.
+    const packagesWithLiveAdvisories = new Set(
+      actionable.map((a) => a.module_name),
+    );
+    const staleAcceptances = Object.keys(ACCEPTED_RISK_PACKAGES).filter(
+      (pkg) => !packagesWithLiveAdvisories.has(pkg),
+    );
+    if (staleAcceptances.length > 0) {
       this.addIssue(
         "warning",
         "dependencies",
-        `Could not complete vulnerability scan: ${message}`,
+        `Accepted-risk entries with no live moderate-or-higher advisory (safe to remove from ACCEPTED_RISK_PACKAGES): ${staleAcceptances.join(", ")}`,
       );
-      this.results.dependencies.status = "warning";
     }
+
+    if (unaccepted.length > 0) {
+      const behind = commitsBehindRelease();
+      unaccepted.forEach((a) => {
+        const entry = ACCEPTED_RISK_PACKAGES[a.module_name];
+        const why = entry
+          ? `exceeds the accepted ${entry.maxSeverity} ceiling for ${a.module_name}`
+          : `${a.module_name} is not an accepted-risk package`;
+        // Say so when the branch, not the dependency, is the problem. Ordered
+        // most specific first, because a contributor reading a red gate needs
+        // the strongest available statement about whose fault it is.
+        //
+        // The accepted-risk check is skipped when this branch already has an
+        // entry: a local ceiling that is merely too low is a real review
+        // decision about a package that got worse, not staleness.
+        const acceptedOnRelease = entry
+          ? undefined
+          : releaseAcceptsPackage(a.module_name);
+        const overriddenOnRelease = releaseOverridesPackage(a.module_name);
+        const rebase = `Rebase onto origin/release and re-run before investigating your own changes.`;
+        let staleBase = "";
+        if (overriddenOnRelease) {
+          staleBase =
+            ` — NOTE: origin/release pins this package out of the vulnerable range ` +
+            `(override "${overriddenOnRelease}") and this branch does not` +
+            `${behind ? `, being ${behind} commit(s) behind` : ""}. ${rebase}`;
+        } else if (acceptedOnRelease) {
+          staleBase =
+            ` — NOTE: origin/release accepts ${a.module_name} at a ${acceptedOnRelease} ceiling ` +
+            `and this branch does not${behind ? `, being ${behind} commit(s) behind` : ""}. ${rebase}`;
+        } else if (behind && behind > 0) {
+          // No specific signal, but staleness alone is worth saying: advisories
+          // are routinely cleared on release by lockfile and override changes,
+          // and a contributor has no way to tell that from a real finding.
+          staleBase =
+            ` — NOTE: this branch is ${behind} commit(s) behind origin/release. ` +
+            `Dependency advisories are frequently resolved there by lockfile or ` +
+            `override changes, so this may not originate in your changes. ${rebase}`;
+        }
+        this.addIssue(
+          "error",
+          "dependencies",
+          `Unaccepted ${a.severity} advisory ${a.id} in ${a.module_name} (${why}): ${a.title}${staleBase}`,
+        );
+      });
+      this.results.dependencies.status = "failed";
+      this.results.dependencies.details = unaccepted;
+      return;
+    }
+
+    if (actionable.length === 0) {
+      this.log("No known vulnerabilities found", "green");
+    } else {
+      this.log(
+        `All ${actionable.length} open production advisories are explicitly accepted risk`,
+        "green",
+      );
+    }
+    this.results.dependencies.status = "passed";
   }
 
   // 2. Professional Secret Detection with Gitleaks Integration
@@ -250,12 +711,21 @@ class SecurityValidator {
       }
 
       let gitleaksResult: string;
+      let gitleaksScanFailed = false;
+      let gitleaksUnavailable = false;
       try {
         // Use spawnSync for safer command execution without shell interpretation
         const result = spawnSync(gitleaksCommand, gitleaksArgs, {
           encoding: "utf8",
           maxBuffer: 10 * 1024 * 1024,
           cwd: this.projectRoot,
+          // This script gates CI, and spawnSync blocks the event loop: an
+          // external scanner that wedges takes the whole job down with it and
+          // reports nothing. SIGKILL because spawnSync's timeout sends SIGTERM
+          // and then keeps waiting — verified: against a child that ignores
+          // SIGTERM the call never returns at all.
+          timeout: SCANNER_TIMEOUT_MS,
+          killSignal: "SIGKILL",
         });
 
         if (result.error) {
@@ -269,12 +739,39 @@ class SecurityValidator {
         const err = gitleaksError as {
           stderr?: string;
           message?: string;
+          code?: string;
         };
         if (err.stderr) {
           this.log(`Gitleaks stderr: ${err.stderr.toString()}`, "yellow");
         }
         this.log(`Gitleaks error: ${err.message}`, "yellow");
         gitleaksResult = "[]";
+
+        // "[]" means "gitleaks found nothing", and below that becomes
+        // status = "passed". But a scan that was STARTED AND THEN KILLED did
+        // not find nothing — it found nothing *yet*. Adding the bound above
+        // made that case reachable in seconds rather than never, which without
+        // this would have quietly converted a hung security gate into a green
+        // one. Same standard as the pnpm-audit path: a scan with no result
+        // cannot be reported as a clean result.
+        //
+        // Scoped deliberately to the killed case. Gitleaks being ABSENT
+        // (ENOENT) is a different and already-handled situation: this repo
+        // treats it as "fall back to basic detection", CI runners do not all
+        // install it, and promoting that to a hard failure is a policy change
+        // this file has no business making as a side effect of adding a
+        // timeout. An earlier revision of this commit did exactly that and
+        // turned the `test` job red on a repo whose only fault was not having
+        // gitleaks on PATH.
+        gitleaksUnavailable = true;
+        if (err.code === "ETIMEDOUT" || err.code === "ERR_CHILD_KILLED") {
+          gitleaksScanFailed = true;
+          this.addIssue(
+            "error",
+            "secrets",
+            `Gitleaks exceeded ${SCANNER_TIMEOUT_MS / 1000}s and was killed — the secret scan did not complete, so its result cannot be trusted`,
+          );
+        }
         // Do not throw, fallback to empty findings and continue with basic detection
       }
 
@@ -356,6 +853,37 @@ class SecurityValidator {
         }
 
         this.results.secrets.details = findings;
+      } else if (gitleaksScanFailed) {
+        // Empty findings here came from a scan that never completed, not from
+        // a clean tree. Reported as failed so CI cannot go green on it.
+        this.log(
+          "Gitleaks produced no result — not reporting the tree as clean",
+          "red",
+        );
+        this.results.secrets.status = "failed";
+      } else if (gitleaksUnavailable) {
+        // Gitleaks never ran, so "no findings" is an artefact of the empty
+        // "[]" assigned in the catch above, not an observation about the tree.
+        // Reporting "No secrets detected by Gitleaks" here was simply untrue,
+        // and it is what CI has been printing all along, since runners do not
+        // install gitleaks: the professional scan was skipped AND the fallback
+        // the catch below promises was never reached, because that catch only
+        // fires on a throw and the inner one swallows the error.
+        //
+        // Run the fallback that was always intended. Escalating to a hard
+        // failure instead is the other obvious option and it is wrong: absent
+        // tooling is a runner-configuration fact this project already tolerates
+        // by design, and turning it fatal broke the `test` job once already.
+        this.log(
+          "Gitleaks unavailable — running basic pattern detection instead",
+          "yellow",
+        );
+        this.addIssue(
+          "warning",
+          "secrets",
+          "Gitleaks not installed - using basic pattern detection only",
+        );
+        await this.basicSecretDetection();
       } else {
         this.log("No secrets detected by Gitleaks", "green");
         this.results.secrets.status = "passed";
@@ -377,6 +905,12 @@ class SecurityValidator {
   }
 
   async basicSecretDetection(): Promise<void> {
+    // Set when a pattern scan is killed mid-run. The finding count below then
+    // describes an INCOMPLETE sweep, so it must not be allowed to produce a
+    // "passed" status — the run already fails via the recorded error, but the
+    // status field is what a reader trusts.
+    let patternScanKilled = false;
+
     const criticalPatterns: Array<{
       pattern: string;
       type: string;
@@ -428,8 +962,27 @@ class SecurityValidator {
             {
               encoding: "utf8",
               maxBuffer: 5 * 1024 * 1024,
+              timeout: SCANNER_TIMEOUT_MS,
+              killSignal: "SIGKILL",
             },
           );
+          // rg exits 1 on "no matches", which is a real result. A spawn
+          // failure or a timeout is not — it produces empty stdout that is
+          // indistinguishable from "clean" unless the error is inspected.
+          // Only a killed scan is escalated, for the same reason as the
+          // gitleaks path above: `rg` being absent is a runner-configuration
+          // fact this file already tolerates, while a scan that started and
+          // was killed leaves a pattern genuinely unchecked behind empty
+          // output that is indistinguishable from "no matches".
+          const rgErr = result.error as NodeJS.ErrnoException | undefined;
+          if (rgErr?.code === "ETIMEDOUT" || rgErr?.code === "ERR_CHILD_KILLED") {
+            patternScanKilled = true;
+            this.addIssue(
+              "error",
+              "secrets",
+              `Pattern scan exceeded ${SCANNER_TIMEOUT_MS / 1000}s for /${pattern}/ and was killed — that pattern was not checked`,
+            );
+          }
           output = result.stdout || "";
         } catch (_err: unknown) {
           // If rg returns non-zero (no matches), output remains empty
@@ -453,7 +1006,7 @@ class SecurityValidator {
               cleanContent.includes("xxx") ||
               cleanContent.includes("replace") ||
               cleanContent.includes("here") ||
-              /^[x\-_=<>\[\]{}()]{10,}$/.test(cleanContent)
+              /^[x\-_=<>[\]{}()]{10,}$/.test(cleanContent)
             );
           });
 
@@ -494,10 +1047,31 @@ class SecurityValidator {
         "secrets",
         "Install official gitleaks for enhanced detection: https://github.com/gitleaks/gitleaks",
       );
-      this.results.secrets.status =
-        totalFindings > 0 ? "warning" : "passed";
+      this.results.secrets.status = patternScanKilled
+        ? "failed"
+        : totalFindings > 0
+          ? "warning"
+          : "passed";
+    } else if (patternScanKilled) {
+      this.log(
+        "A pattern scan was killed — not reporting the tree as clean",
+        "red",
+      );
+      this.results.secrets.status = "failed";
     } else {
-      this.log("No critical secrets detected (basic scan)", "green");
+      // Wording matters here, not just tone. build-validations.ts decides
+      // whether this script failed by SUBSTRING-MATCHING its stdout for
+      // "critical secrets" — so the obvious phrasing, "No critical secrets
+      // detected", makes the parent report a critical-secret failure on a
+      // clean scan. That stayed hidden while this line was unreachable in CI
+      // (gitleaks absent meant the fallback never ran at all); routing the
+      // fallback correctly is what surfaced it, as a red `test` job on a repo
+      // with no secrets in it.
+      //
+      // Phrased to avoid the matched substring entirely. The parent's
+      // log-scraping is the real fragility and is filed separately; this line
+      // must not depend on that being fixed first.
+      this.log("Basic scan found no matching secret patterns", "green");
       this.results.secrets.status = "passed";
     }
   }
@@ -530,10 +1104,56 @@ class SecurityValidator {
 
       // Check for license-checker package availability
       try {
-        execSync("pnpm exec license-checker --summary", { stdio: "pipe" });
-        this.log("License compliance check available", "green");
-        this.results.licenses.status = "passed";
-      } catch (_error: unknown) {
+        // Bounded for the same reason as the audit above, and it is not
+        // hypothetical: license-checker walks the whole installed dependency
+        // tree from disk and resolves licence metadata, so on a cold or very
+        // large node_modules it is I/O-bound and can sit for a long time. It is
+        // also `pnpm exec`, which will try to FETCH the package if it is not
+        // already installed — a network operation, and the same registry-hang
+        // exposure the audit call has.
+        //
+        // SIGKILL rather than the default SIGTERM because execSync's timeout
+        // sends SIGTERM and then keeps waiting, so a child that ignores it
+        // hangs forever and the bound buys nothing.
+        execSync("pnpm exec license-checker --summary", {
+          stdio: "pipe",
+          timeout: SCANNER_TIMEOUT_MS,
+          killSignal: "SIGKILL",
+        });
+        // The tool RAN. Nothing read its output, so no licence has been
+        // evaluated and "passed" would be a claim this code cannot support —
+        // the same shape as the secret- and dependency-scan branches that had
+        // to be corrected: a status that means "the tool exists", printed where
+        // a reader sees "compliance verified".
+        //
+        // Reported as a warning with the reason stated. Deliberately NOT
+        // upgraded to a real check here: deciding which licences are acceptable
+        // is policy, and inventing that policy inside a status assignment would
+        // be worse than admitting the gap.
+        this.log(
+          "license-checker is available but its output is not evaluated — no licence was checked",
+          "yellow",
+        );
+        this.addIssue(
+          "warning",
+          "licenses",
+          "Licence compliance is NOT verified: license-checker runs but its summary is discarded, so no licence is evaluated. Treat this check as a tooling probe, not a compliance result.",
+        );
+        this.results.licenses.status = "warning";
+      } catch (licenseError: unknown) {
+        const lcErr = licenseError as { code?: string; signal?: string };
+        // A timeout is not the same fact as "not installed", and saying
+        // "Install license-checker" to someone whose scan was killed is
+        // actively misleading — they have it, it did not finish.
+        if (lcErr.code === "ETIMEDOUT" || lcErr.signal === "SIGKILL") {
+          this.addIssue(
+            "warning",
+            "licenses",
+            `license-checker exceeded ${SCANNER_TIMEOUT_MS / 1000}s and was killed — the licence probe did not complete`,
+          );
+          this.results.licenses.status = "warning";
+          return;
+        }
         this.addIssue(
           "info",
           "licenses",

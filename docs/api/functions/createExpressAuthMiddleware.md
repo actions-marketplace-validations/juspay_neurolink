@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **createExpressAuthMiddleware**(`config`): `Promise`\<[`ExpressMiddleware`](../type-aliases/ExpressMiddleware.md)\>
 
-Defined in: [auth/middleware/AuthMiddleware.ts:648](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/auth/middleware/AuthMiddleware.ts#L648)
+Defined in: [auth/middleware/AuthMiddleware.ts:647](https://github.com/juspay/neurolink/blob/release/src/lib/auth/middleware/AuthMiddleware.ts#L647)
 
 Create Express-compatible middleware
 

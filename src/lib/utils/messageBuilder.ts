@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, statSync } from "fs";
 import { readFile as readFileAsync, stat as statAsync } from "fs/promises";
-import { getGlobalDispatcher, interceptors, request } from "undici";
+import { request } from "undici";
+import { redirectFollowingDispatcher } from "./redirectDispatcher.js";
 import {
   MultimodalLogger,
   ProviderImageAdapter,
@@ -31,11 +32,27 @@ import type {
   TextGenerationOptions,
 } from "../types/index.js";
 import { tracers, ATTR, withSpan } from "../telemetry/index.js";
+import {
+  needsVisionTranscode,
+  toVisionCompatibleImage,
+} from "../adapters/imageFormatSupport.js";
+import {
+  FILE_TYPE_REGISTRY,
+  lookupByExtension,
+} from "../processors/config/fileTypeRegistry.js";
 import { ErrorFactory, NeuroLinkError, withTimeout } from "./errorHandling.js";
 import { FileDetector } from "./fileDetector.js";
+import { detectIsoBmffImageMimeType } from "./isoBmff.js";
+import {
+  needsAudioTranscode,
+  supportsNativeAudio,
+  toProviderCompatibleAudio,
+} from "../adapters/audioFormatSupport.js";
 import { getImageCache } from "./imageCache.js";
 import { ImageProcessor, imageUtils } from "./imageProcessor.js";
 import { logger } from "./logger.js";
+import { looksLikeSvgMarkup } from "./markupSniff.js";
+import { redactUrlForError } from "./logSanitize.js";
 import { PDFImageConverter, PDFProcessor } from "./pdfProcessor.js";
 import { urlDownloadRateLimiter } from "./rateLimiter.js";
 import { estimateTokens } from "./tokenEstimation.js";
@@ -47,6 +64,7 @@ import type {
   FilePart,
   ImagePart,
   TextPart,
+  MultimodalAudioEntry,
   MultimodalPdfEntry,
 } from "../types/index.js";
 
@@ -57,82 +75,32 @@ import type {
 // estimatePostProcessingTokens() can use type-aware estimates.
 // ---------------------------------------------------------------------------
 
-/** Extension → file type mapping for budget estimation */
-const EXTENSION_TYPE_MAP: Record<string, string> = {
-  // Video
-  mp4: "video",
-  mkv: "video",
-  mov: "video",
-  avi: "video",
-  webm: "video",
-  wmv: "video",
-  flv: "video",
-  m4v: "video",
-  // Audio
-  mp3: "audio",
-  wav: "audio",
-  ogg: "audio",
-  flac: "audio",
-  m4a: "audio",
-  aac: "audio",
-  wma: "audio",
-  opus: "audio",
-  // Image
-  jpg: "image",
-  jpeg: "image",
-  jpe: "image",
-  jfif: "image",
-  png: "image",
-  apng: "image",
-  gif: "image",
-  webp: "image",
-  bmp: "image",
-  tiff: "image",
-  tif: "image",
-  avif: "image",
-  // Below this line the entries exist because this map now decides whether an
-  // image is processed eagerly (see isEagerMultimodalFile), not merely how its
-  // tokens are estimated. An extension missing here classifies as `undefined`
-  // and takes the lazy path, which drops the pixels — so a gap is a dropped
-  // photo, not a slightly-off estimate. HEIC is the one that matters most:
-  // it is what an iPhone writes by default.
-  heic: "image",
-  heif: "image",
-  ico: "image",
-  jp2: "image",
-  jpx: "image",
-  // NB: `svg` is deliberately absent here — it is mapped to its own "svg"
-  // routing type further down, and listing it twice is a duplicate key whose
-  // second entry silently wins. `isEagerMultimodalFile` accepts both types
-  // instead, so SVG takes the eager path without this map having to lie about
-  // which processor handles it.
-  // Archive
-  zip: "archive",
-  tar: "archive",
-  gz: "archive",
-  tgz: "archive",
-  rar: "archive",
-  "7z": "archive",
-  jar: "archive",
-  // Documents
-  xlsx: "xlsx",
-  xls: "xlsx",
-  ods: "xlsx",
-  docx: "docx",
-  doc: "docx",
-  odt: "docx",
-  rtf: "docx",
-  pptx: "pptx",
-  ppt: "pptx",
-  odp: "pptx",
-  // PDF
-  pdf: "pdf",
-  // SVG
-  svg: "svg",
-  // CSV
-  csv: "csv",
-  tsv: "csv",
-};
+/**
+ * Extension → file type for budget estimation.
+ *
+ * Derived from the canonical registry rather than hand-listed: this was a
+ * fourth copy of the same knowledge, and it disagreed with the detector it is
+ * supposed to predict — it had no entry for .mpg/.mpeg/.3gp/.aiff and so on, so
+ * estimatePostProcessingTokens() silently fell back to a generic estimate for
+ * exactly the large media files whose estimate matters most.
+ */
+const EXTENSION_TYPE_MAP: Record<string, string> = Object.fromEntries(
+  FILE_TYPE_REGISTRY.flatMap((entry) =>
+    entry.extensions.map((ext) => [ext.slice(1), entry.fileType] as const),
+  ),
+);
+
+/**
+ * MIME type → routing type, derived from the same registry as
+ * {@link EXTENSION_TYPE_MAP} so the two can never disagree about a format.
+ */
+const MIMETYPE_TYPE_MAP: Record<string, string> = Object.fromEntries(
+  FILE_TYPE_REGISTRY.flatMap((entry) =>
+    entry.mimeTypes.map(
+      (mime) => [mime.toLowerCase(), entry.fileType] as const,
+    ),
+  ),
+);
 
 /**
  * Infer file type from extension in a file path or URL.
@@ -698,97 +666,6 @@ export async function buildMessagesArray(
     currentPrompt = options.input.text;
   }
 
-  // Process CSV files if present and inject into prompt using proper CSV parser
-  if ("input" in options && options.input) {
-    const input = options.input as {
-      text?: string;
-      csvFiles?: Array<Buffer | string>;
-      files?: Array<Buffer | string>;
-    };
-
-    let csvContent = "";
-    const csvOptions = "csvOptions" in options ? options.csvOptions : undefined;
-
-    // Process explicit csvFiles array
-    if (input.csvFiles && input.csvFiles.length > 0) {
-      for (let i = 0; i < input.csvFiles.length; i++) {
-        const csvFile = input.csvFiles[i];
-        const filename = extractFilename(csvFile, i);
-        const filePath = typeof csvFile === "string" ? csvFile : filename;
-        try {
-          const result = await FileDetector.detectAndProcess(csvFile, {
-            allowedTypes: ["csv"],
-            csvOptions: csvOptions,
-          });
-
-          let csvSection = `\n\n## CSV Data from "${filename}":\n`;
-
-          // Add metadata from csv-parser library
-          if (result.metadata) {
-            const metadataText = formatCSVMetadata(result.metadata);
-            if (metadataText) {
-              csvSection += metadataText + `\n\n`;
-            }
-          }
-
-          // Put the actual CSV content BEFORE the tool instructions —
-          // buildCSVToolInstructions references "the CSV data shown above"
-          // and the trailing position keeps that reference accurate.
-          // Vertex Gemini misreads CSV-only prompts as "no files attached"
-          // when the NOTE-then-data order makes the reference dangle.
-          csvSection += result.content;
-          csvSection += buildCSVToolInstructions(filePath);
-          csvContent += csvSection;
-          logger.info(`[CSV] ✅ Processed: ${filename}`, result.metadata);
-        } catch (error) {
-          logger.error(`[CSV] ❌ Failed to process ${filename}:`, error);
-          csvContent += `\n\n## CSV Data Error: Failed to process "${filename}"\nReason: ${error instanceof Error ? error.message : "Unknown error"}`;
-        }
-      }
-    }
-
-    // Process unified files array (auto-detect CSV)
-    if (input.files && input.files.length > 0) {
-      for (const file of input.files) {
-        const filename = extractFilename(file);
-        try {
-          const result = await FileDetector.detectAndProcess(file, {
-            maxSize: 50 * 1024 * 1024,
-            allowedTypes: ["csv"],
-            csvOptions: csvOptions,
-            mimetypeHint: isFileWithMetadata(file) ? file.mimetype : undefined,
-          });
-
-          if (result.type === "csv") {
-            let csvSection = `\n\n## CSV Data from "${filename}":\n`;
-
-            // Add metadata from csv-parser library
-            if (result.metadata) {
-              const metadataText = formatCSVMetadata(result.metadata);
-              if (metadataText) {
-                csvSection += metadataText + `\n\n`;
-              }
-            }
-
-            csvSection += result.content;
-            csvContent += csvSection;
-            logger.info(`[FileDetector] ✅ CSV: ${filename}`, result.metadata);
-          }
-        } catch (error) {
-          // Silently skip non-CSV files in auto-detect mode
-          logger.debug(
-            `[FileDetector] Skipped ${filename}: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-      }
-    }
-
-    // Prepend CSV content to current prompt
-    if (csvContent) {
-      currentPrompt = csvContent + (currentPrompt || "");
-    }
-  }
-
   if (currentPrompt?.trim()) {
     messages.push({
       role: "user",
@@ -874,10 +751,88 @@ function enforceFileBudget(
 }
 
 /**
+ * Per input, the file entries already folded into text and media.
+ *
+ * A WeakMap so a long-lived process cannot accumulate references to request
+ * payloads: the record vanishes with the input object it is keyed on.
+ */
+const PREPROCESSED_FILES = new WeakMap<object, Set<unknown>>();
+
+/**
+ * Ceiling on reading one already-detected local file back off disk.
+ *
+ * Sized for the 100 MB this path admits from cold storage, not for the warm
+ * page cache the read usually hits — detection has just read the same bytes.
+ */
+const FILE_READ_TIMEOUT_MS = 30_000;
+
+/**
+ * Read a file input's bytes, or null when they cannot be had.
+ *
+ * Asynchronous because this path admits files up to 100 MB: a synchronous read
+ * of one blocks the event loop for every other in-flight request on the
+ * process, which for a server handling concurrent generations is not a
+ * micro-optimisation to trade away.
+ *
+ * A URL or data URI yields null rather than a fetch: those arrive already
+ * materialised by the time detection runs, and re-fetching a remote URL here
+ * would issue a second network request behind the caller's back.
+ */
+async function readFileInputBytes(file: FileInput): Promise<Buffer | null> {
+  try {
+    if (isFileWithMetadata(file)) {
+      return file.buffer;
+    }
+    if (Buffer.isBuffer(file)) {
+      return file;
+    }
+    if (typeof file === "string") {
+      const { readFile, stat } = await import("node:fs/promises");
+      // Two different hangs live here, and they need different guards.
+      //
+      // A FIFO or device node blocks inside the read syscall, where neither a
+      // timeout nor an abort can reach it — measured: with a signal attached,
+      // a blocked FIFO read stays pending through both open and mid-read. The
+      // timeout would return while that read sat there forever. So refuse
+      // anything that is not a regular file up front; that is the only thing
+      // that actually prevents this case.
+      //
+      // A regular file on a slow or hung mount does return control between
+      // chunks, so there the signal works (measured: rejects with AbortError
+      // in flight) — and it matters, because racing the promise alone leaves
+      // the read filling a buffer nobody will collect. Aborting in `finally`
+      // covers both exits; after a resolved read it is a no-op.
+      //
+      // stat-then-read is a TOCTOU window, but a narrow one, and it is strictly
+      // better than the unbounded read it replaces.
+      const stats = await withTimeout(stat(file), FILE_READ_TIMEOUT_MS);
+      if (!stats.isFile()) {
+        return null;
+      }
+      const controller = new AbortController();
+      try {
+        return await withTimeout(
+          readFile(file, { signal: controller.signal }),
+          FILE_READ_TIMEOUT_MS,
+        );
+      } finally {
+        controller.abort();
+      }
+    }
+  } catch {
+    // An unreadable file is not an error here: the metadata summary was
+    // already appended, so the caller degrades to previous behaviour. This
+    // covers the missing-file case that an `existsSync` pre-check used to
+    // (without the TOCTOU gap between check and read) and the timeout above.
+  }
+  return null;
+}
+
+/**
  * Append a detected file result to options.input based on its type.
  * Handles CSV, SVG, image, PDF, video, audio, archive, xlsx, docx, pptx, text, and unknown types.
  */
-function appendDetectedFileResult(
+async function appendDetectedFileResult(
   result: {
     type: string;
     content: string | Buffer;
@@ -887,7 +842,7 @@ function appendDetectedFileResult(
   },
   file: FileInput,
   options: GenerateOptions,
-): void {
+): Promise<void> {
   options.input ??= {};
   const filename = extractFilename(file);
 
@@ -937,6 +892,16 @@ function appendDetectedFileResult(
   } else if (result.type === "audio") {
     if (result.content) {
       options.input.text += `\n\n## Audio File: "${filename}"\n${result.content}\n`;
+    }
+    // Carry the bytes forward as well as the summary. Whether they are used is
+    // decided later, per provider: one that can listen receives the audio, one
+    // that cannot still gets the summary above and is no worse off than before.
+    const audioBytes = await readFileInputBytes(file);
+    if (audioBytes) {
+      options.input.nativeAudioFiles = [
+        ...(options.input.nativeAudioFiles || []),
+        { buffer: audioBytes, filename, mimeType: result.mimeType },
+      ];
     }
     if (result.images && result.images.length > 0) {
       options.input.images = [
@@ -1074,6 +1039,24 @@ function warnIfVideoTranscriptionRequested(
  * `input.files` — without this, mimetype-hint and text-file inputs
  * would silently never reach the model on those paths.
  */
+/**
+ * Record that one file entry has been folded into an input.
+ *
+ * Marked per entry as each completes, not per run: the loop throws on the
+ * first file it cannot process (#273, fail loud), and the SDK's own retry path
+ * re-invokes this function with the same input. Marking the whole run on entry
+ * would make that retry a silent no-op — permanently skipping the failed file
+ * and shipping a half-populated request with nothing surfaced. Marking the
+ * whole run on exit would instead re-process the files that had already
+ * succeeded, duplicating them. Per entry is the only version that is right in
+ * both directions.
+ */
+function markFileProcessed(input: object, entry: unknown): void {
+  const processed = PREPROCESSED_FILES.get(input) ?? new Set<unknown>();
+  processed.add(entry);
+  PREPROCESSED_FILES.set(input, processed);
+}
+
 export async function processUnifiedFilesArray(
   options: GenerateOptions,
   maxSize: number,
@@ -1084,8 +1067,36 @@ export async function processUnifiedFilesArray(
     return;
   }
 
-  const totalFiles = options.input.files.length;
-  const files = options.input.files;
+  // Every result this function produces is *appended* — the summary onto
+  // `text`, the bytes onto `nativeAudioFiles`/`images`/`pdfFiles` — and
+  // `files` is only ever read, never consumed. Running it twice over the same
+  // entry therefore doubles the injected text and attaches the same recording
+  // twice, which a provider sees as two distinct files.
+  //
+  // That is reachable: providers whose native paths preprocess in both
+  // `generate()` and `executeStream()` share one `options.input` reference
+  // with `BaseProvider`'s real-stream → fake-stream fallback, so a retried
+  // stream runs this a second time over the same object.
+  //
+  // Tracked per *entry* rather than per input, because a caller that appends a
+  // file to an input it has already used must still get the new one processed
+  // — treating the whole input as done would silently drop it. Entries are
+  // compared by identity (or by value for a path string), which is what a
+  // repeat of the same attachment actually looks like.
+  const alreadyProcessed =
+    PREPROCESSED_FILES.get(options.input) ?? new Set<unknown>();
+  const pending = options.input.files.filter(
+    (entry) => !alreadyProcessed.has(entry),
+  );
+  if (pending.length === 0) {
+    logger.debug(
+      "[NEUROLINK] Every attached file has already been processed for this input — skipping to avoid duplicate attachments",
+    );
+    return;
+  }
+
+  const totalFiles = pending.length;
+  const files = pending;
 
   warnIfVideoTranscriptionRequested(options.videoOptions);
 
@@ -1137,6 +1148,7 @@ export async function processUnifiedFilesArray(
                 `[NEUROLINK] File lazily registered: ${filename} (${fileSize} bytes) — deferred processing`,
               );
               includedCount++;
+              markFileProcessed(inp2, file);
               continue;
             }
           }
@@ -1149,6 +1161,16 @@ export async function processUnifiedFilesArray(
           // for tiny files — the lazy registry path has its own hint wiring.
           const fileMimetypeHint = isFileWithMetadata(file)
             ? file.mimetype
+            : undefined;
+          // The name has to travel the same way, and for the same reason: the
+          // line above unwraps the object to its buffer, so by the time
+          // detection resolves an extension there is no name left to read one
+          // from. Without this a `.tar` supplied as bytes-plus-name is
+          // unidentifiable — its "ustar" marker sits at byte 257, not at
+          // offset 0 — and reports "Could not extract content" for an archive
+          // that extracts perfectly when handed its filename.
+          const fileFilenameHint = isFileWithMetadata(file)
+            ? file.filename
             : undefined;
           const result = await FileDetector.detectAndProcess(rawFileInput, {
             maxSize: genericFileMaxSize,
@@ -1178,9 +1200,10 @@ export async function processUnifiedFilesArray(
               : undefined,
             provider: provider,
             mimetypeHint: fileMimetypeHint,
+            filenameHint: fileFilenameHint,
           });
 
-          appendDetectedFileResult(result, file, options);
+          await appendDetectedFileResult(result, file, options);
           includedCount++;
 
           // Log what content type was added to the message
@@ -1188,6 +1211,7 @@ export async function processUnifiedFilesArray(
           logger.info(
             `[NEUROLINK] File added to message: ${filename} as ${contentType} (type: ${result.type})`,
           );
+          markFileProcessed(inp2, file);
         } catch (error) {
           const errMsg = error instanceof Error ? error.message : String(error);
           // #273: don't silently drop a failed file — log, then throw so the
@@ -1246,6 +1270,19 @@ export async function processUnifiedFilesArray(
         options.systemPrompt = existingSystem
           ? `${existingSystem}${filePromptAugmentation}`
           : filePromptAugmentation.trim();
+
+        // Keep options.prompt in sync with the enriched input.text.
+        // neurolink.ts snapshots `prompt: options.input?.text` at baseOptions
+        // creation — BEFORE this function appends file content — and some
+        // native paths (executeNativeAnthropicGenerate historically) read
+        // `options.prompt` first. Leaving the stale snapshot in place means
+        // every appended file is silently dropped on those paths and the model
+        // answers "no file attached". Same dual-write processCSVFilesForNativeSDK
+        // already documents for exactly this trap.
+        const promptCarrier = options as { prompt?: string };
+        if (typeof promptCarrier.prompt === "string") {
+          promptCarrier.prompt = inp2.text;
+        }
       }
     },
   );
@@ -1624,6 +1661,10 @@ export async function buildMultimodalMessagesArray(
   // Process unified files array (auto-detect)
   await processUnifiedFilesArray(options, maxSize, provider);
 
+  // Detection can append images (PDF page renders, video keyframes, a HEIC
+  // photo), so compatibility conversion has to run after it, not before.
+  await normalizeVisionImageFormats(inp);
+
   // Process explicit CSV files array
   await processExplicitCsvFiles(options);
 
@@ -1647,8 +1688,16 @@ export async function buildMultimodalMessagesArray(
     pdfFiles.length > 0 ||
     !!(inp.content && inp.content.some((c) => c.type === "pdf"));
 
-  // If no images or PDFs, use standard message building and convert to MultimodalChatMessage[]
-  if (!hasImages && !hasPDFs) {
+  // Audio that is to be delivered natively is multimodal for the same reason a
+  // PDF is: it becomes a non-text part. Without this an audio-only turn — the
+  // ordinary "transcribe this recording" request — took the text-only branch
+  // below, where the collected bytes have nowhere to go and only the metadata
+  // summary survives.
+  const hasNativeAudio =
+    (inp.nativeAudioFiles?.length ?? 0) > 0 && supportsNativeAudio(provider);
+
+  // If no images, PDFs or audio, use standard message building and convert to MultimodalChatMessage[]
+  if (!hasImages && !hasPDFs && !hasNativeAudio) {
     // #289: CSV content[] items don't need vision, so they never reach the
     // multimodal converter below — process them into the prompt text here
     // (otherwise a `content: [{type:"csv"}]`-only request silently drops it).
@@ -1777,19 +1826,35 @@ export async function buildMultimodalMessagesArray(
     let userContent: string | unknown;
 
     if (inp.content && inp.content.length > 0) {
+      // Audio detected from `input.files` has to reach this branch too. A
+      // caller that supplies structured `content` AND attaches an audio file
+      // is not asking for the audio to be discarded — but this branch bypasses
+      // the multimodal converter below, so the bytes were dropped and only the
+      // metadata summary folded into `text` survived. Exactly the failure this
+      // change exists to remove, reintroduced through the other door.
       userContent = await convertContentToProviderFormat(
         inp.content,
         provider,
         model,
         options.pdfOptions,
+        inp.nativeAudioFiles ?? [],
       );
-    } else if ((inp.images && inp.images.length > 0) || pdfFiles.length > 0) {
+    } else if (
+      (inp.images && inp.images.length > 0) ||
+      pdfFiles.length > 0 ||
+      // Audio alone must still take the multimodal path. Without this clause an
+      // audio-only turn fell through to the plain-text branch below, so the
+      // recording was dropped and only its metadata summary — already folded
+      // into `text` — ever reached the model.
+      (inp.nativeAudioFiles?.length ?? 0) > 0
+    ) {
       userContent = await convertMultimodalToProviderFormat(
         inp.text ?? "",
         inp.images || [],
         pdfFiles,
         provider,
         model,
+        inp.nativeAudioFiles ?? [],
       );
     } else {
       userContent = inp.text;
@@ -1883,6 +1948,7 @@ async function convertContentToProviderFormat(
   provider: string,
   _model: string,
   pdfOptions?: GenerateOptions["pdfOptions"],
+  audioFiles: MultimodalAudioEntry[] = [],
 ): Promise<unknown> {
   const textContent = content.find((c) => c.type === "text");
   const imageContent = content.filter((c) => c.type === "image");
@@ -1897,15 +1963,28 @@ async function convertContentToProviderFormat(
     text = await appendCsvContentToText(csvContent, text);
   }
 
-  const hasMultimodal = imageContent.length > 0 || pdfContent.length > 0;
+  // Audio the provider can actually read counts as multimodal content, on both
+  // of the checks below. Computed before the validation rather than after it:
+  // a request whose structured `content` carries no text but does carry an
+  // attached recording is a complete request, and leaving audio out of
+  // `hasMultimodal` rejected it as empty before delivery could be considered.
+  //
+  // The same flag then keeps it off the text-only early return, which would
+  // otherwise hand back a plain string and lose the bytes — the exact drop this
+  // change exists to stop, reached through a different branch. Gated on the
+  // provider accepting audio so one that cannot keeps the cheaper plain-text
+  // shape rather than an array carrying a part it will ignore.
+  const deliversAudio = audioFiles.length > 0 && supportsNativeAudio(provider);
+  const hasMultimodal =
+    imageContent.length > 0 || pdfContent.length > 0 || deliversAudio;
 
   // Validate that we have at least some content
   if (!hasMultimodal && !text) {
     throw new Error("Content must include either text or multimodal content");
   }
 
-  // Text-only case (CSV has already been folded into `text`)
-  if (imageContent.length === 0 && pdfContent.length === 0) {
+  // Text-only case (CSV has already been folded into `text`).
+  if (!hasMultimodal) {
     return text;
   }
 
@@ -1940,6 +2019,7 @@ async function convertContentToProviderFormat(
     pdfFiles,
     provider,
     _model,
+    audioFiles,
   );
 }
 
@@ -1972,9 +2052,7 @@ async function downloadImageFromUrl(url: string): Promise<string> {
 
   try {
     const response = await request(url, {
-      dispatcher: getGlobalDispatcher().compose(
-        interceptors.redirect({ maxRedirections: 5 }),
-      ),
+      dispatcher: redirectFollowingDispatcher(5),
       method: "GET",
       headersTimeout: 10000, // 10 second timeout for headers
       bodyTimeout: 30000, // 30 second timeout for body,
@@ -2033,25 +2111,24 @@ async function downloadImageFromUrl(url: string): Promise<string> {
 }
 
 /**
- * Get MIME type from file extension
+ * Get MIME type from an image file extension.
+ *
+ * Delegates to the canonical registry instead of the six-case switch this used
+ * to be. That switch covered png/gif/webp/bmp/tiff and defaulted *everything
+ * else* to image/jpeg, so a .heic, .avif, .ico or .jp2 path was labelled JPEG
+ * — which meant `needsVisionTranscode()` never fired for it and the raw bytes
+ * went to the provider under a MIME type that was simply untrue. Exactly the
+ * kind of hand-maintained table this registry exists to delete.
+ *
+ * The image/jpeg fallback is kept only for genuinely unknown extensions, since
+ * callers here have already established they are handling an image.
  */
 function getMimeTypeFromExtension(filePath: string): string {
-  const ext = filePath.toLowerCase().split(".").pop();
-  switch (ext) {
-    case "png":
-      return "image/png";
-    case "gif":
-      return "image/gif";
-    case "webp":
-      return "image/webp";
-    case "bmp":
-      return "image/bmp";
-    case "tiff":
-    case "tif":
-      return "image/tiff";
-    default:
-      return "image/jpeg";
+  const entry = lookupByExtension(filePath);
+  if (entry?.modality === "image") {
+    return entry.mimeTypes[0];
   }
+  return "image/jpeg";
 }
 
 /**
@@ -2130,6 +2207,61 @@ function detectMimeTypeFromBuffer(buffer: Buffer): string | undefined {
         buffer[3] === 0x2a))
   ) {
     return "image/tiff";
+  }
+
+  // The formats above are the ones a provider accepts (or that sharp handles
+  // trivially). Everything below is a format NO vision provider accepts, and
+  // recognising it here is what lets `needsVisionTranscode()` fire — a Buffer
+  // whose format was unrecognised fell through to the image/jpeg default and
+  // was shipped to the provider unconverted under a MIME type that was false.
+  // Raw Buffers are the most direct way a backend attaches an image, so this
+  // was the single biggest hole in the vision-compatibility path.
+
+  // HEIC / HEIF / AVIF: ISO-BMFF `ftyp` box, distinguished by major brand.
+  // Shared with the FileDetector so the two cannot drift on brand tables.
+  const isoBmffImage = detectIsoBmffImageMimeType(buffer);
+  if (isoBmffImage) {
+    return isoBmffImage;
+  }
+
+  // ICO: 00 00 01 00. Checked after the ftyp probe because an ISO-BMFF file
+  // also starts with a zero byte.
+  if (
+    buffer.length >= 4 &&
+    buffer[0] === 0x00 &&
+    buffer[1] === 0x00 &&
+    buffer[2] === 0x01 &&
+    buffer[3] === 0x00
+  ) {
+    return "image/x-icon";
+  }
+
+  // SVG is markup, so it has no byte signature — and without this probe a raw
+  // SVG buffer matched nothing, kept processImageToBase64's "image/jpeg"
+  // default, and was shipped to the provider as XML labelled as a JPEG.
+  // Shared forward scan rather than a local regex: the regex form of this
+  // check is a CodeQL js/redos finding (see markupSniff).
+  if (looksLikeSvgMarkup(buffer)) {
+    return "image/svg+xml";
+  }
+
+  // JPEG 2000: the full 12-byte signature box, trailing 0D 0A 87 0A included.
+  // Those four bytes are a line-ending probe that a transfer mangling newlines
+  // or stripping the eighth bit corrupts, so checking only length and brand
+  // accepts exactly the damaged files the signature exists to reject.
+  if (
+    buffer.length >= 12 &&
+    buffer[0] === 0x00 &&
+    buffer[1] === 0x00 &&
+    buffer[2] === 0x00 &&
+    buffer[3] === 0x0c &&
+    buffer.toString("latin1", 4, 8) === "jP  " &&
+    buffer[8] === 0x0d &&
+    buffer[9] === 0x0a &&
+    buffer[10] === 0x87 &&
+    buffer[11] === 0x0a
+  ) {
+    return "image/jp2";
   }
 
   return undefined;
@@ -2251,7 +2383,210 @@ async function processImageToBase64(
     imageData = image.toString("base64");
   }
 
+  // Last line of defence for vision-format compatibility. `normalizeVisionImageFormats`
+  // handles `input.images` eagerly so the providers that read that array
+  // directly (Google AI Studio, Bedrock) see converted bytes, but images that
+  // arrive as URLs are downloaded further downstream and only become bytes
+  // here. A no-op for the universal formats, so the common path is unaffected.
+  if (needsVisionTranscode(mimeType)) {
+    // Guard the decoded bytes, not just the Buffer input. The buffer branch
+    // above is already checked, but a data: URI reaches here having only been
+    // regex-matched — so an oversized one was handed straight to sharp/ffmpeg,
+    // which decode it in full.
+    //
+    // Sized before the decode rather than after: checking the Buffer would mean
+    // allocating the very thing the limit exists to refuse.
+    const context = `image input at index ${index}`;
+    ImageProcessor.validateSize(base64DecodedByteLength(imageData), context);
+    const rawImage = Buffer.from(imageData, "base64");
+    const compatible = await toVisionCompatibleImage(rawImage, mimeType);
+    if (compatible.converted) {
+      imageData = compatible.buffer.toString("base64");
+      mimeType = compatible.mimeType;
+    }
+  }
+
   return { imageData, mimeType };
+}
+
+/**
+ * Transcode any image in `input.images` that no vision provider accepts,
+ * rewriting the entry in place as a PNG data URI.
+ *
+ * Mutates in place and is idempotent, matching `processUnifiedFilesArray` and
+ * `foldMediaAliasesIntoFiles`: the shared multimodal builder and the providers
+ * that bypass it (Google AI Studio's and Vertex's native SDK paths, Bedrock's
+ * Converse path) can all call it on the same options object without converting
+ * anything twice.
+ *
+ * Entries that are `http(s)` URLs are left alone — they have no bytes yet, and
+ * `processImageToBase64` converts them once they are downloaded.
+ */
+export async function normalizeVisionImageFormats(
+  input: GenerateOptions["input"],
+): Promise<void> {
+  const images = input?.images;
+  if (!images || images.length === 0) {
+    return;
+  }
+
+  for (let index = 0; index < images.length; index++) {
+    const entry = images[index];
+    // ImageWithAltText wraps the payload in `.data`; convert that and keep the
+    // alt text attached rather than dropping the wrapper.
+    const isWrapped =
+      typeof entry === "object" && entry !== null && !Buffer.isBuffer(entry);
+    const payload = isWrapped
+      ? (entry as ImageWithAltText).data
+      : (entry as Buffer | string);
+
+    const source = await readImageSourceForConversion(payload);
+    if (!source || !needsVisionTranscode(source.mimeType)) {
+      continue;
+    }
+
+    const compatible = await toVisionCompatibleImage(
+      source.buffer,
+      source.mimeType,
+    );
+    if (!compatible.converted) {
+      continue;
+    }
+
+    const dataUri = `data:${compatible.mimeType};base64,${compatible.buffer.toString("base64")}`;
+    images[index] = isWrapped
+      ? { ...(entry as ImageWithAltText), data: dataUri }
+      : dataUri;
+  }
+}
+
+/**
+ * Resolve one `input.images` entry to bytes plus a MIME type, or undefined when
+ * it cannot be resolved without a network call.
+ *
+ * File paths are only read when their extension says the format would need
+ * conversion. Reading every attached .png off disk just to confirm it is
+ * already compatible would double the I/O of the common case for no benefit.
+ */
+/**
+ * Byte length `Buffer.from(b64, "base64")` will allocate, computed without
+ * allocating it.
+ *
+ * Base64 encodes 3 bytes per 4 characters, so the encoded length settles the
+ * decoded length up front. The point is ordering: a size guard applied to the
+ * decoded Buffer has already paid for the allocation it exists to prevent, so
+ * every base64 site here checks this first and decodes second — the same shape
+ * as the file-path branch, which stats before it reads.
+ *
+ * This bounds the decode, not the whole request: the encoded string is already
+ * resident by the time we see it, so an oversized payload still costs its own
+ * length in memory. What it removes is the second, larger allocation on top.
+ *
+ * Whitespace is skipped because the decoder ignores it, which keeps the count
+ * exact rather than a conservative over-estimate that would reject legitimate
+ * payloads sitting just under the limit.
+ */
+function base64DecodedByteLength(base64: string): number {
+  let significant = 0;
+  let padding = 0;
+  for (let i = 0; i < base64.length; i++) {
+    const code = base64.charCodeAt(i);
+    if (code === 32 || code === 9 || code === 10 || code === 13) {
+      continue;
+    }
+    significant++;
+    if (code === 61) {
+      padding++;
+    }
+  }
+  return Math.max(0, Math.floor(significant / 4) * 3 - padding);
+}
+
+/**
+ * Whether a payload is small enough to hand to an image decoder, reported
+ * rather than thrown. See {@link readImageSourceForConversion} for why this
+ * pass degrades instead of failing.
+ */
+function withinConversionByteLimit(bytes: number, context: string): boolean {
+  try {
+    ImageProcessor.validateSize(bytes, context);
+    return true;
+  } catch (error) {
+    logger.warn(
+      `[messageBuilder] Skipping vision-format conversion for ${context}: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return false;
+  }
+}
+
+function withinConversionLimit(buffer: Buffer, context: string): boolean {
+  return withinConversionByteLimit(buffer.length, context);
+}
+
+async function readImageSourceForConversion(
+  payload: Buffer | string,
+): Promise<{ buffer: Buffer; mimeType: string } | undefined> {
+  // Both in-memory shapes are size-checked before they can reach a decoder,
+  // the same way the file-path branch below is. `withinConversionLimit`
+  // reports rather than throws, because this whole pass is best-effort: an
+  // image too large to convert is left in its original format for the
+  // downstream guard to reject, which is what an unconvertible image already
+  // does. Throwing here would turn a normalisation step into a hard failure.
+  if (Buffer.isBuffer(payload)) {
+    const mimeType = detectMimeTypeFromBuffer(payload);
+    if (!mimeType || !withinConversionLimit(payload, "image buffer")) {
+      return undefined;
+    }
+    return { buffer: payload, mimeType };
+  }
+  if (typeof payload !== "string") {
+    return undefined;
+  }
+  if (payload.startsWith("data:")) {
+    const match = payload.match(/^data:([^;]+);base64,(.+)$/);
+    if (!match) {
+      return undefined;
+    }
+    if (
+      !withinConversionByteLimit(
+        base64DecodedByteLength(match[2]),
+        "image data URI",
+      )
+    ) {
+      return undefined;
+    }
+    return { buffer: Buffer.from(match[2], "base64"), mimeType: match[1] };
+  }
+  if (isInternetUrl(payload)) {
+    return undefined;
+  }
+  const mimeType = getMimeTypeFromExtension(payload);
+  if (!needsVisionTranscode(mimeType)) {
+    return undefined;
+  }
+  try {
+    // Preflight the size before reading. Conversion replaces the entry with a
+    // data URI, which bypasses processImageToBase64's buffer-size guard — so
+    // without this a large local HEIC/TIFF/BMP was read fully into memory and
+    // then re-encoded, with no limit applied at either step.
+    const { size } = await statAsync(payload);
+    ImageProcessor.validateSize(size, `image at ${safeBasename(payload)}`);
+    const buffer = await readFileAsync(payload);
+    ImageProcessor.validateBufferSize(
+      buffer,
+      `image at ${safeBasename(payload)}`,
+    );
+    return { buffer, mimeType };
+  } catch (error) {
+    // The path may be a signed URL or carry credentials in query params, so it
+    // is redacted rather than interpolated verbatim (see logSanitize).
+    logger.warn(
+      `[messageBuilder] Could not read ${redactUrlForError(payload)} for image ` +
+        `format conversion: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return undefined;
+  }
 }
 
 /**
@@ -2367,6 +2702,7 @@ async function convertMultimodalToProviderFormat(
   pdfFiles: MultimodalPdfEntry[],
   provider: string,
   model: string,
+  audioFiles: MultimodalAudioEntry[] = [],
 ): Promise<Array<TextPart | ImagePart | FilePart>> {
   const content: Array<TextPart | ImagePart | FilePart> = [
     { type: "text", text },
@@ -2389,6 +2725,46 @@ async function convertMultimodalToProviderFormat(
     }
   }
 
+  // Attach audio to providers that can listen. The metadata summary was
+  // already appended to `text` during detection, so this adds the recording
+  // itself rather than replacing the description — a model asked "how long is
+  // this?" keeps the exact answer, and one asked "what is said?" can now
+  // answer at all.
+  if (audioFiles.length > 0 && supportsNativeAudio(provider)) {
+    for (const audio of audioFiles) {
+      // Derived from the trimmed basename so a directory containing a dot
+      // (`/srv/v1.2/recording`) cannot be mistaken for the file's extension.
+      const base = safeBasename(audio.filename);
+      const dot = base.lastIndexOf(".");
+      const extension = dot > 0 ? base.slice(dot) : ".bin";
+      const compatible = await toProviderCompatibleAudio(
+        audio.buffer,
+        audio.mimeType,
+        extension,
+      );
+      // A conversion that could not run leaves a container the provider does
+      // not accept. Sending it anyway turns a metadata answer into an opaque
+      // HTTP 400, so it is skipped and the summary stands.
+      if (needsAudioTranscode(compatible.mimeType)) {
+        logger.warn(
+          `[Audio] Skipping native delivery of ${base}: ` +
+            `${compatible.mimeType} is not accepted by ${provider} and could ` +
+            `not be converted. The metadata summary was still included.`,
+        );
+        continue;
+      }
+      content.push({
+        type: "file" as const,
+        data: compatible.buffer,
+        mediaType: compatible.mimeType,
+      });
+      logger.info(
+        `[Audio] ✅ Added to content (native audio): ${base}` +
+          `${compatible.converted ? ` (converted to ${compatible.mimeType})` : ""}`,
+      );
+    }
+  }
+
   // Check if provider supports native PDF processing
   const supportsNativePDF = PDFProcessor.supportsNativePDF(provider);
 
@@ -2407,104 +2783,181 @@ async function convertMultimodalToProviderFormat(
       }),
     );
   } else {
-    // Provider doesn't support native PDF - convert PDF pages to images
-    // This enables PDF processing for providers like Mistral, Ollama that support images but not PDFs
-    logger.info(
-      `[PDF→Image] Provider ${provider} doesn't support native PDF. Converting ${pdfFiles.length} PDF(s) to images...`,
+    // No native PDF support: inline the PDF's text layer, clearly labeled per
+    // file. Image-only conversion sent content a text-only backend can never
+    // read — observed live as the model flatly claiming no file was attached
+    // — and for proxy providers (litellm/openrouter) supportsVision() is a
+    // pass-through, so vision cannot be trusted to carry the content either.
+    // Text is therefore always included (primary for text-only backends,
+    // extra grounding otherwise); page images are appended below only when
+    // the provider may actually see them. A PDF with no text layer (pure
+    // scan) gets an explicit note rather than silence, so the model
+    // acknowledges an unreadable attachment instead of denying it exists.
+    const providerCanSeeImages = ProviderImageAdapter.supportsVision(
+      provider,
+      model,
     );
-
     for (const pdf of pdfFiles) {
+      const name = safeBasename(pdf.filename);
       try {
-        const effectiveMaxPages = pdf.maxPages ?? PDF_LIMITS.DEFAULT_MAX_PAGES;
-        const conversionResult = await PDFImageConverter.convertToImages(
-          pdf.buffer,
-          {
-            // #297: this is the only PDF→image call the product actually makes,
-            // and it used to hardcode scale 2.0 — silently overriding the
-            // lowered PDF_LIMITS.DEFAULT_SCALE and keeping the memory cost the
-            // issue reports (a 100-page render at 2.0 is ~776MB; 1.5 is ~44%
-            // fewer pixels per page). Callers can raise it back per request.
-            scale: pdf.scale ?? PDF_LIMITS.DEFAULT_SCALE,
-            // Page ceiling guards token overflow; also now caller-adjustable
-            // rather than a constant nothing could reach.
-            maxPages: effectiveMaxPages,
-            ...(pdf.password ? { password: pdf.password } : {}), // #258
-            ...(pdf.maxCanvasPixels
-              ? { maxCanvasPixels: pdf.maxCanvasPixels }
-              : {}), // #260
-          },
-        );
-
-        // The renderer stops at maxPages, so a longer document is silently
-        // truncated — say so rather than letting the model answer from a
-        // partial document as though it had the whole thing.
-        //
-        // Keyed on the cap being reached, not on pdf.pageCount: that field is
-        // null whenever `input.content` omits `metadata.pages`, which is the
-        // common case, so a page-count comparison would simply never fire
-        // there. Reaching the cap is also unambiguous — a short count caused by
-        // per-page render failures (#294 isolates those into `errors`) would
-        // otherwise be misreported as a maxPages truncation.
-        if (conversionResult.pageCount >= effectiveMaxPages) {
-          logger.warn(
-            `[PDF→Image] ${safeBasename(pdf.filename)} hit the ${effectiveMaxPages}-page ` +
-              `conversion limit. Any pages beyond that were not sent — the model may be ` +
-              `answering from a partial document. Raise pdfOptions.maxPages or split the file.`,
-          );
-        }
-        if (conversionResult.errors && conversionResult.errors.length > 0) {
-          logger.warn(
-            `[PDF→Image] ${safeBasename(pdf.filename)}: ${conversionResult.errors.length} page(s) ` +
-              `failed to render and were omitted (page ${conversionResult.errors.map((e) => e.page).join(", ")}).`,
-          );
-        }
-
-        logger.info(
-          `[PDF→Image] ✅ Converted ${pdf.filename}: ${conversionResult.pageCount} page(s) → images`,
-        );
-
-        // Add each page as an ImagePart (raw base64, not data: URI — see SSRF note above)
-        conversionResult.images.forEach((base64Image, pageIndex) => {
-          content.push({
-            type: "image" as const,
-            image: base64Image,
-            mimeType: "image/png",
-          } as ImagePart);
-
-          logger.debug(
-            `[PDF→Image] Added page ${pageIndex + 1}/${conversionResult.pageCount} of ${pdf.filename}`,
-          );
+        const { PDFParse } = await import("pdf-parse");
+        const parser = new PDFParse({
+          data: new Uint8Array(pdf.buffer),
+          ...(pdf.password ? { password: pdf.password } : {}), // #258
         });
-
-        // Log any warnings from conversion
-        if (conversionResult.warnings) {
-          conversionResult.warnings.forEach((warning) => {
-            logger.warn(`[PDF→Image] ${warning}`);
-          });
+        try {
+          const extracted = await parser.getText();
+          const pdfText = (extracted?.text ?? "").trim();
+          if (pdfText.length > 0) {
+            content.push({
+              type: "text" as const,
+              text: `\n[Attached PDF: ${name}]\n${pdfText}\n[End of PDF: ${name}]`,
+            });
+            logger.info(
+              `[PDF→Text] ✅ Extracted text for non-vision provider ${provider}: ${name} (${pdfText.length} chars)`,
+            );
+          } else {
+            content.push({
+              type: "text" as const,
+              text: `\n[Attached PDF: ${name} — no extractable text layer (likely a scanned document); its contents are unavailable to this text-only model.]`,
+            });
+            logger.warn(
+              `[PDF→Text] ${name} has no text layer; provider ${provider} cannot see images — content unavailable`,
+            );
+          }
+        } finally {
+          await parser.destroy?.();
         }
       } catch (error) {
         const errorMessage =
           error instanceof Error ? error.message : String(error);
-        logger.error(
-          `[PDF→Image] ❌ Failed to convert ${pdf.filename}: ${errorMessage}`,
-        );
-
-        // #258: password errors are already actionable typed errors — re-throw
-        // them unwrapped so the "supply a password" guidance isn't buried.
-        const code = (error as { code?: string })?.code;
-        if (
-          code === "PDF_PASSWORD_REQUIRED" ||
-          code === "PDF_INCORRECT_PASSWORD"
-        ) {
-          throw error;
+        logger.error(`[PDF→Text] ❌ Failed to parse ${name}: ${errorMessage}`);
+        // #258: password errors are actionable and must surface. pdf-parse
+        // raises pdf.js's PasswordException (not our typed PDF_PASSWORD_*
+        // codes), so detect by name/message shape. When the provider can see
+        // images, defer the throw to the image-conversion path below — it
+        // raises the canonical typed error with the "supply the password"
+        // guidance callers and tests rely on.
+        const isPasswordError =
+          (error as { name?: string })?.name === "PasswordException" ||
+          /password/i.test(errorMessage);
+        if (isPasswordError) {
+          if (!providerCanSeeImages) {
+            throw error;
+          }
+          // Image branch will produce the canonical typed password error.
+          continue;
         }
+        content.push({
+          type: "text" as const,
+          text: `\n[Attached PDF: ${name} — could not be parsed (${errorMessage}); its contents are unavailable.]`,
+        });
+      }
+    }
+    // Page images in addition to the text, for providers that may actually
+    // see them (vision models, and proxies whose upstream might).
+    if (providerCanSeeImages) {
+      logger.info(
+        `[PDF→Image] Provider ${provider} doesn't support native PDF. Converting ${pdfFiles.length} PDF(s) to images...`,
+      );
 
-        // Re-throw so the user knows PDF processing failed
-        throw new Error(
-          `PDF to image conversion failed for ${pdf.filename}: ${errorMessage}. ` +
-            `Provider ${provider} doesn't support native PDFs and image conversion failed.`,
-          { cause: error },
-        );
+      for (const pdf of pdfFiles) {
+        try {
+          const effectiveMaxPages =
+            pdf.maxPages ?? PDF_LIMITS.DEFAULT_MAX_PAGES;
+          const conversionResult = await PDFImageConverter.convertToImages(
+            pdf.buffer,
+            {
+              // #297: this is the only PDF→image call the product actually makes,
+              // and it used to hardcode scale 2.0 — silently overriding the
+              // lowered PDF_LIMITS.DEFAULT_SCALE and keeping the memory cost the
+              // issue reports (a 100-page render at 2.0 is ~776MB; 1.5 is ~44%
+              // fewer pixels per page). Callers can raise it back per request.
+              scale: pdf.scale ?? PDF_LIMITS.DEFAULT_SCALE,
+              // Page ceiling guards token overflow; also now caller-adjustable
+              // rather than a constant nothing could reach.
+              maxPages: effectiveMaxPages,
+              ...(pdf.password ? { password: pdf.password } : {}), // #258
+              ...(pdf.maxCanvasPixels
+                ? { maxCanvasPixels: pdf.maxCanvasPixels }
+                : {}), // #260
+            },
+          );
+
+          // The renderer stops at maxPages, so a longer document is silently
+          // truncated — say so rather than letting the model answer from a
+          // partial document as though it had the whole thing.
+          //
+          // Keyed on the cap being reached, not on pdf.pageCount: that field is
+          // null whenever `input.content` omits `metadata.pages`, which is the
+          // common case, so a page-count comparison would simply never fire
+          // there. Reaching the cap is also unambiguous — a short count caused by
+          // per-page render failures (#294 isolates those into `errors`) would
+          // otherwise be misreported as a maxPages truncation.
+          if (conversionResult.pageCount >= effectiveMaxPages) {
+            logger.warn(
+              `[PDF→Image] ${safeBasename(pdf.filename)} hit the ${effectiveMaxPages}-page ` +
+                `conversion limit. Any pages beyond that were not sent — the model may be ` +
+                `answering from a partial document. Raise pdfOptions.maxPages or split the file.`,
+            );
+          }
+          if (conversionResult.errors && conversionResult.errors.length > 0) {
+            logger.warn(
+              `[PDF→Image] ${safeBasename(pdf.filename)}: ${conversionResult.errors.length} page(s) ` +
+                `failed to render and were omitted (page ${conversionResult.errors.map((e) => e.page).join(", ")}).`,
+            );
+          }
+
+          logger.info(
+            `[PDF→Image] ✅ Converted ${pdf.filename}: ${conversionResult.pageCount} page(s) → images`,
+          );
+
+          // Add each page as an ImagePart (raw base64, not data: URI — see SSRF note above)
+          conversionResult.images.forEach((base64Image, pageIndex) => {
+            content.push({
+              type: "image" as const,
+              image: base64Image,
+              mimeType: "image/png",
+            } as ImagePart);
+
+            logger.debug(
+              `[PDF→Image] Added page ${pageIndex + 1}/${conversionResult.pageCount} of ${pdf.filename}`,
+            );
+          });
+
+          // Log any warnings from conversion
+          if (conversionResult.warnings) {
+            conversionResult.warnings.forEach((warning) => {
+              logger.warn(`[PDF→Image] ${warning}`);
+            });
+          }
+        } catch (error) {
+          const errorMessage =
+            error instanceof Error ? error.message : String(error);
+          logger.error(
+            `[PDF→Image] ❌ Failed to convert ${pdf.filename}: ${errorMessage}`,
+          );
+
+          // #258: password errors are already actionable typed errors — re-throw
+          // them unwrapped so the "supply a password" guidance isn't buried.
+          const code = (error as { code?: string })?.code;
+          if (
+            code === "PDF_PASSWORD_REQUIRED" ||
+            code === "PDF_INCORRECT_PASSWORD"
+          ) {
+            throw error;
+          }
+
+          // Re-throw so the user knows PDF processing failed. The inlined
+          // text layer above does NOT soften this: conversion failures
+          // include caller mistakes (e.g. an invalid maxCanvasPixels, #260)
+          // that must surface rather than be silently downgraded.
+          throw new Error(
+            `PDF to image conversion failed for ${pdf.filename}: ${errorMessage}. ` +
+              `Provider ${provider} doesn't support native PDFs and image conversion failed.`,
+            { cause: error },
+          );
+        }
       }
     }
   }
@@ -2644,17 +3097,18 @@ function getFileSource(file: FileInput): "buffer" | "path" | "url" | "datauri" {
  * 10 KB is far below any real photo, so this affected essentially every image
  * attached by path — an ordinary JPEG, not just unusual formats.
  *
- * Scoped to images deliberately, and audio deserves spelling out because the
- * reason is not the one it appears to be. An audio file's message contains only
- * a metadata block — duration, codec, sample rate — on BOTH paths; no audio
- * bytes are handed to the provider either way. Moving audio to the eager path
- * would therefore change nothing about what the model receives. That audio
- * content never reaches the model at all is a separate and pre-existing gap,
- * not something this threshold decision can repair, and it is easy to mistake
- * for working code because the metadata block answers exactly the questions
- * ("how long is it?", "what sample rate?") a test is most tempted to ask.
- * Video is left alone for the opposite reason: its frames are measurably
- * present in the message and a model reads them correctly.
+ * Images were only the most visible case. The same reasoning generalises to
+ * every type whose content is not text, which is why the rule below is stated
+ * as an exclusion — preview lazily what a text slice can faithfully represent,
+ * process everything else — rather than as a list of media types. See
+ * {@link isEagerType} for what that costs and buys per modality.
+ *
+ * Audio deserves a note because it is the case most likely to look fine while
+ * being broken: its message carries a metadata block — duration, codec, sample
+ * rate — that answers exactly the questions ("how long is it?", "what sample
+ * rate?") a test is most tempted to ask, and answers them correctly with no
+ * audio whatsoever attached. A test asking those questions passes against a
+ * model that received nothing.
  *
  * Note this costs no extra memory: `tryRegisterFileReference` already calls
  * `getFileBuffer()` and reads the whole file to register it. The lazy path was
@@ -2663,48 +3117,72 @@ function getFileSource(file: FileInput): "buffer" | "path" | "url" | "datauri" {
  */
 function isEagerMultimodalFile(file: FileInput): boolean {
   if (typeof file === "string") {
-    return isImageLikeType(inferFileTypeFromExtension(file));
+    return isEagerType(inferFileTypeFromExtension(file));
   }
   if (Buffer.isBuffer(file)) {
-    return isImageLikeType(inferFileTypeFromBuffer(file));
+    return isEagerType(inferFileTypeFromBuffer(file));
   }
 
-  // A `FileWithMetadata` carries two independent declarations, and either one
-  // alone is enough: the shape exists for Slack/Curator-style uploads that
+  // A `FileWithMetadata` carries two independent declarations, and either is
+  // enough on its own: the shape exists for Slack/Curator-style uploads that
   // arrive as bytes plus a mimetype, so its `filename` may be extensionless or
-  // simply wrong. Reading them as a `??` chain meant the first *recognised*
-  // name won outright — `upload.pdf` with `mimetype: "image/png"` classified as
-  // a PDF and lost its pixels down the lazy path. Any declaration of an image
-  // is therefore decisive.
+  // simply wrong. Reading them as a `??` chain let the first *recognised* name
+  // win outright — `recording.txt` with `mimetype: "audio/mpeg"` classified as
+  // text, stayed lazy, and never reached the native-audio path this change
+  // exists to feed. A file is kept lazy only when nothing about it disagrees.
   const declared = [
     inferFileTypeFromExtension(file.filename),
     inferFileTypeFromMimetype(file.mimetype),
   ];
-  if (declared.some(isImageLikeType)) {
+  if (declared.some(isEagerType)) {
     return true;
   }
 
-  // The buffer sniff is the last resort rather than a third vote, because it is
-  // a substring scan: an HTML page with an inline `<svg>` icon in its head
-  // would otherwise be pulled onto the eager path and sent in full, which is
-  // the opposite of what the size tiers are for. It only speaks when nothing
-  // else did.
+  // The buffer sniff is a last resort rather than a third vote, because it is
+  // partly a substring scan: an HTML page with an inline `<svg>` icon in its
+  // head would otherwise be pulled onto the eager path and sent in full, which
+  // is the opposite of what the size tiers are for. It speaks only when neither
+  // declaration did.
   return declared.every((type) => type === undefined)
-    ? isImageLikeType(inferFileTypeFromBuffer(file.buffer))
+    ? isEagerType(inferFileTypeFromBuffer(file.buffer))
     : false;
 }
 
 /**
- * Whether a routing type should have its bytes preserved rather than previewed.
+ * Whether a routing type must be processed rather than previewed.
  *
  * "svg" is a separate routing type rather than a sub-case of "image" (it goes
  * to the sanitizer, not to a vision encoder), but it is still an image as far
  * as this decision is concerned: its markup IS its content, and previewing it
  * away leaves the model with nothing. Accepting both keeps this correct
  * whichever of the two type vocabularies the caller's map uses.
+ *
+ * Audio and video join them, for one shared reason: the lazy path never runs
+ * the detection branch that produces their model-visible content — the decoded
+ * audio buffer, the extracted video keyframes — so a lazily registered file is
+ * summarised away no matter what the dispatch side is willing to send.
+ *
+ * Video is the clearest demonstration that this is a delivery problem and not a
+ * format one. Keyframe extraction is identical across containers (three frames,
+ * ~38 KB each, for every one of mp4/wmv/flv/mpg/m2ts), and a frame pulled from
+ * any of them shows the test token perfectly legibly. Yet only mp4 answered
+ * correctly, because Gemini accepts an mp4 natively and never needed the
+ * frames; every container it cannot decode returned NOTHING_RECEIVED, since the
+ * frames that would have carried the answer were never extracted. Making video
+ * eager fixed all four at once.
+ *
+ * Documents and archives are here for the same reason once removed. The lazy
+ * preview is a truncated slice of the raw bytes, so it is only ever faithful
+ * for a file that IS text. A .rtf sliced raw is RTF control words, and a
+ * .bz2/.xz/.zst is compressed bytes — the model was told "binary file of
+ * unknown type" about files whose processors extract them cleanly.
+ *
+ * Which leaves plain text and CSV on the lazy path, and they are exactly the
+ * cases it was built for: a truncated sample of a large CSV is a faithful
+ * sample, and the file tools can read the rest on demand.
  */
-function isImageLikeType(type: string | undefined): boolean {
-  return type === "image" || type === "svg";
+function isEagerType(type: string | undefined): boolean {
+  return type !== undefined && type !== "text" && type !== "csv";
 }
 
 /**
@@ -2720,10 +3198,24 @@ function inferFileTypeFromMimetype(mimetype?: string): string | undefined {
     return undefined;
   }
   const normalized = mimetype.split(";")[0].trim().toLowerCase();
-  if (normalized === "image/svg+xml") {
-    return "svg";
+  // "application/octet-stream" is deliberately absent from the registry side of
+  // this lookup: it is the opaque sentinel a caller sends when it knows
+  // nothing, not a claim about content, and treating it as one would let a
+  // shrugging uploader force a routing decision.
+  if (normalized === "application/octet-stream") {
+    return undefined;
   }
-  return normalized.startsWith("image/") ? "image" : undefined;
+  const exact = MIMETYPE_TYPE_MAP[normalized];
+  if (exact) {
+    return exact;
+  }
+  // A family fallback for types the registry does not enumerate — `audio/webm`,
+  // `image/x-something`. The leading segment is enough to decide eager vs lazy
+  // even when the exact codec is unknown to us.
+  const family = normalized.split("/")[0];
+  return family === "image" || family === "audio" || family === "video"
+    ? family
+    : undefined;
 }
 
 /**

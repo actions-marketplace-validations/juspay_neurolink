@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../../../README.md)
+[**NeuroLink API Reference**](../../../README.md)
 
 ---
 

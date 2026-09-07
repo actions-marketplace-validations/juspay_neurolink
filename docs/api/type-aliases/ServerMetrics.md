@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ServerMetrics** = `object`
 
-Defined in: [types/mcp.ts:2579](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2579)
+Defined in: [types/mcp.ts:2598](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2598)
 
 Runtime metrics tracked per MCP server by MultiServerManager.
 
@@ -18,7 +18,7 @@ Runtime metrics tracked per MCP server by MultiServerManager.
 
 > **activeRequests**: `number`
 
-Defined in: [types/mcp.ts:2580](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2580)
+Defined in: [types/mcp.ts:2599](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2599)
 
 ---
 
@@ -26,7 +26,7 @@ Defined in: [types/mcp.ts:2580](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **totalRequests**: `number`
 
-Defined in: [types/mcp.ts:2581](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2581)
+Defined in: [types/mcp.ts:2600](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2600)
 
 ---
 
@@ -34,7 +34,7 @@ Defined in: [types/mcp.ts:2581](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **completedRequests**: `number`
 
-Defined in: [types/mcp.ts:2582](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2582)
+Defined in: [types/mcp.ts:2601](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2601)
 
 ---
 
@@ -42,7 +42,7 @@ Defined in: [types/mcp.ts:2582](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **averageResponseTime**: `number`
 
-Defined in: [types/mcp.ts:2583](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2583)
+Defined in: [types/mcp.ts:2602](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2602)
 
 ---
 
@@ -50,7 +50,7 @@ Defined in: [types/mcp.ts:2583](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **errorRate**: `number`
 
-Defined in: [types/mcp.ts:2584](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2584)
+Defined in: [types/mcp.ts:2603](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2603)
 
 ---
 
@@ -58,7 +58,7 @@ Defined in: [types/mcp.ts:2584](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > `optional` **lastHealthCheck?**: `Date`
 
-Defined in: [types/mcp.ts:2585](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2585)
+Defined in: [types/mcp.ts:2604](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2604)
 
 ---
 
@@ -66,4 +66,4 @@ Defined in: [types/mcp.ts:2585](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **isHealthy**: `boolean`
 
-Defined in: [types/mcp.ts:2586](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2586)
+Defined in: [types/mcp.ts:2605](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2605)

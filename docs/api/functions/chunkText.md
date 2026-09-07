@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **chunkText**(`text`, `strategy?`, `config?`): `Promise`\<[`Chunk`](../type-aliases/Chunk.md)[]\>
 
-Defined in: [rag/chunking/chunkerRegistry.ts:217](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/rag/chunking/chunkerRegistry.ts#L217)
+Defined in: [rag/chunking/chunkerRegistry.ts:217](https://github.com/juspay/neurolink/blob/release/src/lib/rag/chunking/chunkerRegistry.ts#L217)
 
 Convenience function to chunk text with a given strategy
 

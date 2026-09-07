@@ -33,9 +33,13 @@ function printAnalysis(
       : chalk.yellow("    Completed: unavailable (no final request logs)"),
   );
   logger.always(
-    report.coverage.attempts && report.coverage.finalRequests
+    report.coverage.attempts &&
+      report.coverage.finalRequests &&
+      report.coverage.comparableRequestAttempts
       ? `    Recovered after retry: ${report.requests.recoveredAfterRetry}`
-      : chalk.yellow("    Recovered after retry: unavailable"),
+      : chalk.yellow(
+          "    Recovered after retry: unavailable (request/attempt windows are incomplete or non-comparable)",
+        ),
   );
   if (report.requests.errors > 0) {
     logger.always(
@@ -46,6 +50,11 @@ function printAnalysis(
     logger.always(
       `    Attempts: ${report.attempts.total}, ${report.attempts.errors} errors${report.attempts.errors > 0 ? ` ${JSON.stringify(report.attempts.errorTypes)}` : ""}`,
     );
+    if (Object.keys(report.attempts.transportScopes).length > 0) {
+      logger.always(
+        `    Transport scopes: ${JSON.stringify(report.attempts.transportScopes)}`,
+      );
+    }
   }
   logger.always(
     report.coverage.lifecycle
@@ -77,6 +86,15 @@ function printAnalysis(
     logger.always(
       `    Selection reasons: ${JSON.stringify(report.routing.selectionReasons)}`,
     );
+    const productionQuotaProbes =
+      report.routing.selectionReasons.quota_probe ?? 0;
+    if (productionQuotaProbes > 0) {
+      logger.always(
+        chalk.yellow(
+          `    WARNING: ${productionQuotaProbes} production request(s) were selected for quota discovery`,
+        ),
+      );
+    }
     logger.always(
       `    Initial accounts: ${JSON.stringify(report.routing.initialAccounts)}`,
     );
@@ -96,6 +114,7 @@ function printAnalysis(
   for (const [label, summary] of [
     ["Response headers", report.latencyMs.headers],
     ["First chunk", report.latencyMs.firstChunk],
+    ["First useful output", report.latencyMs.firstUsefulOutput],
     ["Terminal", report.latencyMs.terminal],
     ["Final request log", report.latencyMs.finalRequest],
     ["Account attempt", report.latencyMs.attempt],
@@ -110,15 +129,47 @@ function printAnalysis(
       `    Usage records: ${report.cache.requestsWithUsage}, cache-read requests: ${report.cache.requestsWithCacheRead}, hit rate: ${report.cache.requestHitRate === null ? "-" : `${(report.cache.requestHitRate * 100).toFixed(1)}%`}`,
     );
     logger.always(
-      `    Tokens: ${report.cache.cacheReadTokens} read, ${report.cache.cacheCreationTokens} created, ${report.cache.inputTokens} input`,
+      `    Tokens: ${report.cache.cacheReadTokens} read, ${report.cache.cacheCreationTokens} created, ${report.cache.inputTokens} input, ${report.cache.outputTokens} output`,
     );
+    logger.always(
+      report.cache.requestsPriced > 0
+        ? `    Estimated cost: $${report.cache.estimatedCostUsd.toFixed(4)} across ${report.cache.requestsPriced} priced request(s)`
+        : "    Estimated cost: unavailable (no request carried a priceable model)",
+    );
+    if (report.cache.requestsPricedByPrefix > 0) {
+      logger.always(
+        chalk.yellow(
+          `    ⚠ ${report.cache.requestsPricedByPrefix} request(s) priced by name-prefix fallback, not an exact rate: ${report.cache.modelsPricedByPrefix.join(", ")}`,
+        ),
+      );
+    }
+    if (report.cache.requestsUnpriced > 0) {
+      logger.always(
+        chalk.yellow(
+          `    ⚠ ${report.cache.requestsUnpriced} request(s) had usage but no pricing row: ${report.cache.unpricedModels.join(", ")}`,
+        ),
+      );
+    }
   } else {
     logger.always(chalk.yellow("    Cache usage: unavailable"));
   }
   logger.always("");
   logger.always(chalk.bold("  Data Quality"));
+  if (!report.coverage.comparableRequestAttempts) {
+    logger.always(
+      chalk.yellow(
+        "    WARNING: request and attempt totals do not cover a comparable full window; do not reconcile them as one cohort",
+      ),
+    );
+  }
   logger.always(
-    `    ${report.dataQuality.linesRead} lines scanned, ${report.dataQuality.malformedLines} malformed, ${report.dataQuality.unsupportedLifecycleLines} unsupported lifecycle, ${report.dataQuality.lifecycleSequenceGaps} sequence gaps, ${report.dataQuality.lifecycleSequenceDuplicates} duplicates`,
+    `    ${report.dataQuality.linesRead} lines scanned, ${report.dataQuality.malformedLines} malformed, ${report.dataQuality.unsupportedLifecycleLines} unsupported lifecycle, ${report.dataQuality.lifecycleSequenceGaps} sequence gaps, ${report.dataQuality.lifecycleSequenceDuplicates} duplicates (${report.dataQuality.conflictingLifecycleDuplicates} conflicting)`,
+  );
+  logger.always(
+    `    Outcome evidence: ${report.dataQuality.finalOutcomeConflicts} conflicts reconciled, ${report.dataQuality.acceptedWithoutFinal} accepted without a final record, ${report.dataQuality.terminalWithoutFinal} transport terminals without a final record`,
+  );
+  logger.always(
+    `    Repeated attempt records merged: ${report.dataQuality.duplicateAttempts}`,
   );
   logger.always(
     `    Routing decisions: ${report.dataQuality.routingDecisions.valid} valid, ${report.dataQuality.routingDecisions.invalid} invalid, ${report.dataQuality.routingDecisions.absent} absent`,
@@ -126,7 +177,7 @@ function printAnalysis(
   for (const [stream, range] of Object.entries(report.dataQuality.streams)) {
     if (range.observedFrom) {
       logger.always(
-        `    ${stream}: ${range.observedFrom} to ${range.observedTo}${range.startsAtOrBeforeRequestedWindow ? "" : chalk.yellow(" (starts after requested window)")}`,
+        `    ${stream}: ${range.observedFrom} to ${range.observedTo}${range.completeWindow ? "" : chalk.yellow(" (partial: starts after requested window)")}`,
       );
     }
   }

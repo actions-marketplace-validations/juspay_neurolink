@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **TTSVoice** = `object`
 
-Defined in: [types/tts.ts:162](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tts.ts#L162)
+Defined in: [types/tts.ts:189](https://github.com/juspay/neurolink/blob/release/src/lib/types/tts.ts#L189)
 
 TTS voice information
 
@@ -18,7 +18,7 @@ TTS voice information
 
 > **id**: `string`
 
-Defined in: [types/tts.ts:164](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tts.ts#L164)
+Defined in: [types/tts.ts:191](https://github.com/juspay/neurolink/blob/release/src/lib/types/tts.ts#L191)
 
 Voice identifier
 
@@ -28,7 +28,7 @@ Voice identifier
 
 > **name**: `string`
 
-Defined in: [types/tts.ts:166](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tts.ts#L166)
+Defined in: [types/tts.ts:193](https://github.com/juspay/neurolink/blob/release/src/lib/types/tts.ts#L193)
 
 Display name
 
@@ -38,7 +38,7 @@ Display name
 
 > **languageCode**: `string`
 
-Defined in: [types/tts.ts:168](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tts.ts#L168)
+Defined in: [types/tts.ts:195](https://github.com/juspay/neurolink/blob/release/src/lib/types/tts.ts#L195)
 
 Primary language code (e.g., "en-US")
 
@@ -48,7 +48,7 @@ Primary language code (e.g., "en-US")
 
 > **languageCodes**: `string`[]
 
-Defined in: [types/tts.ts:170](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tts.ts#L170)
+Defined in: [types/tts.ts:197](https://github.com/juspay/neurolink/blob/release/src/lib/types/tts.ts#L197)
 
 All supported language codes
 
@@ -58,7 +58,7 @@ All supported language codes
 
 > **gender**: [`TTSGender`](TTSGender.md)
 
-Defined in: [types/tts.ts:172](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tts.ts#L172)
+Defined in: [types/tts.ts:199](https://github.com/juspay/neurolink/blob/release/src/lib/types/tts.ts#L199)
 
 TTSGender
 
@@ -68,7 +68,7 @@ TTSGender
 
 > `optional` **type?**: [`TTSVoiceType`](TTSVoiceType.md)
 
-Defined in: [types/tts.ts:174](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tts.ts#L174)
+Defined in: [types/tts.ts:201](https://github.com/juspay/neurolink/blob/release/src/lib/types/tts.ts#L201)
 
 Voice type
 
@@ -78,7 +78,7 @@ Voice type
 
 > `optional` **description?**: `string`
 
-Defined in: [types/tts.ts:176](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tts.ts#L176)
+Defined in: [types/tts.ts:203](https://github.com/juspay/neurolink/blob/release/src/lib/types/tts.ts#L203)
 
 Voice description (optional)
 
@@ -88,6 +88,6 @@ Voice description (optional)
 
 > `optional` **naturalSampleRateHertz?**: `number`
 
-Defined in: [types/tts.ts:178](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/tts.ts#L178)
+Defined in: [types/tts.ts:205](https://github.com/juspay/neurolink/blob/release/src/lib/types/tts.ts#L205)
 
 Natural sample rate in Hz (optional)

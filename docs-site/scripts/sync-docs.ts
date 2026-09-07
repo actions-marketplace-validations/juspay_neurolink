@@ -935,6 +935,20 @@ const LINK_MAPPINGS: Record<string, string> = {
   "claude-proxy-config-reference.md": "/features/claude-proxy-config-reference",
   "claude-proxy-troubleshooting": "/features/claude-proxy-troubleshooting",
   "claude-proxy-troubleshooting.md": "/features/claude-proxy-troubleshooting",
+  // The rest of the proxy family. Without an entry the rewriter drops the
+  // `features/` segment and emits /docs/<name>, which is not a page — a
+  // relative link from features/index.md then fails the Docusaurus broken-link
+  // check even though the doc is copied and reachable.
+  "proxy-accounts-endpoint": "/features/proxy-accounts-endpoint",
+  "proxy-accounts-endpoint.md": "/features/proxy-accounts-endpoint",
+  "proxy-cli-onboarding": "/features/proxy-cli-onboarding",
+  "proxy-cli-onboarding.md": "/features/proxy-cli-onboarding",
+  "codex-proxy-support": "/features/codex-proxy-support",
+  "codex-proxy-support.md": "/features/codex-proxy-support",
+  "opencode-proxy-support": "/features/opencode-proxy-support",
+  "opencode-proxy-support.md": "/features/opencode-proxy-support",
+  "claude-proxy-observability": "/features/claude-proxy-observability",
+  "claude-proxy-observability.md": "/features/claude-proxy-observability",
 
   // Provider guides -> getting-started/providers
   "ollama-setup": "/getting-started/providers/ollama",
@@ -1344,6 +1358,8 @@ const LINK_MAPPINGS: Record<string, string> = {
   // ── New provider getting-started guides (feat/more-providers) ─────────
   xai: "/getting-started/providers/xai",
   groq: "/getting-started/providers/groq",
+  cerebras: "/getting-started/providers/cerebras",
+  sambanova: "/getting-started/providers/sambanova",
   replicate: "/getting-started/providers/replicate",
   voyage: "/getting-started/providers/voyage",
   stability: "/getting-started/providers/stability",
@@ -1401,6 +1417,26 @@ const LINK_MAPPINGS: Record<string, string> = {
   checklist: "/provider-integration/checklist",
   "SAFETY-PRIMITIVES": "/provider-integration/safety-primitives",
   "safety-primitives": "/provider-integration/safety-primitives",
+  // Tiered onboarding playbook. These live in subdirectories, and without an
+  // entry here a link to one resolves against the site root — a link to
+  // tiers/README.md becomes /docs/tiers/readme, which does not exist and
+  // fails the build's broken-link check.
+  "tiers/README": "/provider-integration/tiers/readme",
+  "tiers/tier-1-aggregator-passthrough":
+    "/provider-integration/tiers/tier-1-aggregator-passthrough",
+  "tiers/tier-2-catalog-entry":
+    "/provider-integration/tiers/tier-2-catalog-entry",
+  "tiers/tier-3-adapter-native":
+    "/provider-integration/tiers/tier-3-adapter-native",
+  "tiers/tier-4-full-custom": "/provider-integration/tiers/tier-4-full-custom",
+  "adr/README": "/provider-integration/adr/readme",
+  "adr/0001-provider-descriptor-as-source-of-truth":
+    "/provider-integration/adr/0001-provider-descriptor-as-source-of-truth",
+  "adr/0002-catalog-over-subclass-default":
+    "/provider-integration/adr/0002-catalog-over-subclass-default",
+  "adr/0003-mocked-contract-as-merge-gate":
+    "/provider-integration/adr/0003-mocked-contract-as-merge-gate",
+  "manifests/README": "/provider-integration/manifests/readme",
 };
 
 /**

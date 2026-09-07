@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **VectorStore** = `object`
 
-Defined in: [types/rag.ts:486](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/rag.ts#L486)
+Defined in: [types/rag.ts:488](https://github.com/juspay/neurolink/blob/release/src/lib/types/rag.ts#L488)
 
 Abstract vector store type
 Vector stores should implement this type to work with the query tool
@@ -19,7 +19,7 @@ Vector stores should implement this type to work with the query tool
 
 > **query**(`params`): `Promise`\<[`VectorQueryResult`](VectorQueryResult.md)[]\>
 
-Defined in: [types/rag.ts:487](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/rag.ts#L487)
+Defined in: [types/rag.ts:489](https://github.com/juspay/neurolink/blob/release/src/lib/types/rag.ts#L489)
 
 #### Parameters
 

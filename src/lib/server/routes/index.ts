@@ -11,8 +11,10 @@ import type {
 import { createAgentRoutes } from "./agentRoutes.js";
 import { createClaudeProxyRoutes } from "./claudeProxyRoutes.js";
 // ClaudeProxyDeps removed
+import { createGeminiProxyRoutes } from "./geminiProxyRoutes.js";
 import { createHealthRoutes } from "./healthRoutes.js";
 import { createOpenAIProxyRoutes } from "./openaiProxyRoutes.js";
+import { createCodexProxyRoutes } from "./codexProxyRoutes.js";
 import { createMCPRoutes } from "./mcpRoutes.js";
 import { createMemoryRoutes } from "./memoryRoutes.js";
 import { createOpenApiRoutes } from "./openApiRoutes.js";
@@ -24,6 +26,8 @@ export { createClaudeProxyRoutes } from "./claudeProxyRoutes.js";
 // ClaudeProxyDeps removed
 export { createHealthRoutes } from "./healthRoutes.js";
 export { createOpenAIProxyRoutes } from "./openaiProxyRoutes.js";
+export { createCodexProxyRoutes } from "./codexProxyRoutes.js";
+export { createGeminiProxyRoutes } from "./geminiProxyRoutes.js";
 export { createMCPRoutes } from "./mcpRoutes.js";
 export { createMemoryRoutes } from "./memoryRoutes.js";
 export { createOpenApiRoutes } from "./openApiRoutes.js";
@@ -50,10 +54,14 @@ export function createAllRoutes(
     routes.push(createOpenApiRoutes(basePath, options.getRoutes));
   }
 
-  // Unified proxy flag enables both Claude and OpenAI endpoints.
+  // Unified proxy flag enables every door. Codex was omitted here for long
+  // enough that it became reachable only from `neurolink proxy start`; a
+  // consumer opting into proxying means all of it, not a subset.
   // Legacy per-format flags are still supported for backward compatibility.
   const enableClaudeProxy = options?.proxy || options?.claudeProxy;
   const enableOpenAIProxy = options?.proxy || options?.openaiProxy;
+  const enableCodexProxy = options?.proxy || options?.codexProxy;
+  const enableGeminiProxy = options?.proxy || options?.geminiProxy;
 
   if (enableClaudeProxy) {
     routes.push(createClaudeProxyRoutes(undefined, basePath));
@@ -61,6 +69,14 @@ export function createAllRoutes(
 
   if (enableOpenAIProxy) {
     routes.push(createOpenAIProxyRoutes(undefined, basePath));
+  }
+
+  if (enableCodexProxy) {
+    routes.push(createCodexProxyRoutes(basePath));
+  }
+
+  if (enableGeminiProxy) {
+    routes.push(createGeminiProxyRoutes(undefined, basePath));
   }
 
   return routes;

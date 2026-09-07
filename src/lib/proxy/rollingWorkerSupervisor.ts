@@ -5,15 +5,18 @@ import type {
   RollingWorkerFailureDetails,
   RollingWorkerHandle,
   RollingWorkerSupervisorOptions,
+  RollingWorkerSupervisorEvent,
   RollingWorkerSupervisorSnapshot,
   TransferableProxySocket,
 } from "../types/index.js";
 import { ErrorFactory } from "../utils/errorHandling.js";
+import { PROXY_SOCKET_OFFER_TIMEOUT } from "./rollingWorkerProtocol.js";
 
 const DEFAULT_READY_TIMEOUT_MS = 30_000;
 const DEFAULT_SOCKET_QUEUE_LIMIT = 1_024;
 const DEFAULT_SOCKET_QUEUE_TIMEOUT_MS = 30_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 30_000;
+const MAX_RECENT_SUPERVISOR_EVENTS = 100;
 
 /**
  * Owns worker generations while the caller owns the public listening socket.
@@ -26,6 +29,7 @@ export class RollingWorkerSupervisor {
       RollingWorkerSupervisorOptions,
       | "readyTimeoutMs"
       | "socketQueueLimit"
+      | "maxPendingTransfers"
       | "socketQueueTimeoutMs"
       | "shutdownTimeoutMs"
     >
@@ -36,9 +40,14 @@ export class RollingWorkerSupervisor {
   private candidate: RollingCandidateWorker | null = null;
   private readonly draining = new Map<number, RollingManagedWorker>();
   private readonly queuedSockets: RollingQueuedSocket[] = [];
+  private flushingSockets = false;
+  private consecutiveOfferTimeouts = 0;
+  private lastStallReplacementAt = 0;
+  private transferStateTimer: NodeJS.Timeout | undefined;
   private replacement: Promise<RollingWorkerSupervisorSnapshot> | null = null;
   private rejectedSockets = 0;
   private failedTransfers = 0;
+  private readonly recentEvents: RollingWorkerSupervisorEvent[] = [];
   private lastFailure: RollingWorkerSupervisorSnapshot["lastFailure"] = null;
   private closed = false;
   private shutdownPromise: Promise<void> | null = null;
@@ -49,6 +58,7 @@ export class RollingWorkerSupervisor {
       ...options,
       readyTimeoutMs: options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS,
       socketQueueLimit: options.socketQueueLimit ?? DEFAULT_SOCKET_QUEUE_LIMIT,
+      maxPendingTransfers: Math.max(1, options.maxPendingTransfers ?? 16),
       socketQueueTimeoutMs:
         options.socketQueueTimeoutMs ?? DEFAULT_SOCKET_QUEUE_TIMEOUT_MS,
       shutdownTimeoutMs:
@@ -79,8 +89,15 @@ export class RollingWorkerSupervisor {
         generation: worker.generation,
       })),
       queuedSockets: this.queuedSockets.length,
+      pendingTransfers:
+        (this.active?.pendingTransfers ?? 0) +
+        [...this.draining.values()].reduce(
+          (total, worker) => total + worker.pendingTransfers,
+          0,
+        ),
       rejectedSockets: this.rejectedSockets,
       failedTransfers: this.failedTransfers,
+      recentEvents: [...this.recentEvents],
       lastFailure: this.lastFailure,
     };
   }
@@ -133,11 +150,16 @@ export class RollingWorkerSupervisor {
       this.rejectSocket(socket);
       return;
     }
-    if (this.active) {
+    if (
+      this.active &&
+      this.queuedSockets.length === 0 &&
+      this.active.pendingTransfers < this.options.maxPendingTransfers
+    ) {
       this.transferSocket(this.active, socket);
       return;
     }
     this.queueSocket(socket);
+    this.flushQueuedSockets();
   }
 
   private queueSocket(socket: TransferableProxySocket): void {
@@ -158,7 +180,7 @@ export class RollingWorkerSupervisor {
     };
     queued.timeout.unref?.();
     this.queuedSockets.push(queued);
-    this.publishState();
+    this.scheduleTransferState();
   }
 
   close(): Promise<void> {
@@ -383,6 +405,7 @@ export class RollingWorkerSupervisor {
           drainRequested: false,
         };
         this.active = activated;
+        this.consecutiveOfferTimeouts = 0;
         this.candidate = null;
         this.flushQueuedSockets();
         if (previous) {
@@ -396,6 +419,11 @@ export class RollingWorkerSupervisor {
         this.options.log?.(
           `[proxy-supervisor] activated generation=${generation} pid=${handle.pid} version=${expectedVersion}`,
         );
+        this.recordEvent({
+          type: "activated",
+          generation,
+          version: expectedVersion,
+        });
         this.publishState();
         finish();
       });
@@ -471,16 +499,25 @@ export class RollingWorkerSupervisor {
   }
 
   private flushQueuedSockets(): void {
-    // Capture the active worker once: a synchronous sendSocket failure inside
-    // transferSocket can clear this.active mid-loop, and re-reading it would
-    // pass null into transferSocket and strand the queued socket.
-    const worker = this.active;
-    if (!worker) {
+    if (this.flushingSockets) {
       return;
     }
-    for (const queued of this.queuedSockets.splice(0)) {
-      clearTimeout(queued.timeout);
-      this.transferSocket(worker, queued.socket);
+    this.flushingSockets = true;
+    try {
+      while (
+        this.active &&
+        this.queuedSockets.length > 0 &&
+        this.active.pendingTransfers < this.options.maxPendingTransfers
+      ) {
+        const queued = this.queuedSockets.shift();
+        if (!queued) {
+          break;
+        }
+        clearTimeout(queued.timeout);
+        this.transferSocket(this.active, queued.socket);
+      }
+    } finally {
+      this.flushingSockets = false;
     }
   }
 
@@ -489,6 +526,7 @@ export class RollingWorkerSupervisor {
     socket: TransferableProxySocket,
   ): void {
     worker.pendingTransfers += 1;
+    this.scheduleTransferState();
     let settled = false;
     const complete = (error?: Error | null): void => {
       if (settled) {
@@ -498,8 +536,12 @@ export class RollingWorkerSupervisor {
       worker.pendingTransfers = Math.max(0, worker.pendingTransfers - 1);
       if (error) {
         this.handleTransferFailure(worker, socket, error);
+      } else if (this.active?.generation === worker.generation) {
+        this.consecutiveOfferTimeouts = 0;
       }
       this.maybeDrainWorker(worker);
+      this.flushQueuedSockets();
+      this.scheduleTransferState();
     };
     try {
       worker.handle.sendSocket(worker.generation, socket, complete);
@@ -534,10 +576,40 @@ export class RollingWorkerSupervisor {
   ): void {
     this.failedTransfers += 1;
     const detail = this.describeTransferError(error);
+    this.recordEvent({
+      type: "failed_transfer",
+      generation: worker.generation,
+      version: worker.version,
+      phase: "transfer",
+      reason: detail,
+    });
     const lifecycle = this.extractLifecycleFailureDetails(
       error,
       worker.handle.pid,
     );
+    const cancelledOffer =
+      error instanceof Error &&
+      (error as NodeJS.ErrnoException).code === PROXY_SOCKET_OFFER_TIMEOUT;
+    if (cancelledOffer && this.active?.generation === worker.generation) {
+      this.consecutiveOfferTimeouts += 1;
+      // Persistent stalls need recovery, but keep serving existing streams
+      // until a replacement activates. Avoid accumulating draining workers or
+      // spawning repeatedly when the whole host is under pressure.
+      if (
+        this.consecutiveOfferTimeouts >= 3 &&
+        !this.candidate &&
+        this.draining.size === 0 &&
+        Date.now() - this.lastStallReplacementAt >= 60_000 &&
+        !this.closed
+      ) {
+        this.lastStallReplacementAt = Date.now();
+        this.options.onReplacementRequested?.({
+          generation: worker.generation,
+          pid: worker.handle.pid,
+          reason: "socket_offer_timeout",
+        });
+      }
+    }
     this.recordFailure(
       worker.generation,
       worker.version,
@@ -548,15 +620,21 @@ export class RollingWorkerSupervisor {
         // If the error already records an exit, the supervisor did not cause
         // that exit. Otherwise this captures the deliberate cleanup following
         // the failed transfer, not a claimed root cause for the failure.
-        supervisorAction: lifecycle.observedExit
-          ? "none"
-          : "sigkill_after_transfer_failure",
+        supervisorAction: cancelledOffer
+          ? "cancel_uncommitted_socket"
+          : lifecycle.observedExit
+            ? "none"
+            : "sigkill_after_transfer_failure",
       },
     );
     this.options.log?.(
       `[proxy-supervisor] socket transfer failed generation=${worker.generation} pid=${worker.handle.pid}: ${detail}`,
     );
-    if (this.active?.generation === worker.generation && !this.closed) {
+    if (
+      !cancelledOffer &&
+      this.active?.generation === worker.generation &&
+      !this.closed
+    ) {
       this.active = null;
       this.draining.set(worker.generation, worker);
       if (!lifecycle.observedExit) {
@@ -567,11 +645,27 @@ export class RollingWorkerSupervisor {
       }
       this.publishState();
     }
-    this.rejectSocket(socket);
+    this.rejectSocket(
+      socket,
+      worker.generation,
+      worker.version,
+      "transfer_failure",
+    );
   }
 
-  private rejectSocket(socket: TransferableProxySocket): void {
+  private rejectSocket(
+    socket: TransferableProxySocket,
+    generation: number | null = this.active?.generation ?? null,
+    version: string | null = this.active?.version ?? null,
+    reason = "unavailable",
+  ): void {
     this.rejectedSockets += 1;
+    this.recordEvent({
+      type: "rejected_socket",
+      generation,
+      version,
+      reason,
+    });
     socket.destroy();
     this.publishState();
   }
@@ -631,9 +725,42 @@ export class RollingWorkerSupervisor {
       message: message.slice(0, 1_000),
       ...details,
     };
+    this.recordEvent({
+      type: "failure",
+      generation,
+      version,
+      phase,
+      reason: message,
+    });
+  }
+
+  private recordEvent(event: Omit<RollingWorkerSupervisorEvent, "at">): void {
+    this.recentEvents.push({
+      at: new Date().toISOString(),
+      ...event,
+      ...(event.reason ? { reason: event.reason.slice(0, 1_000) } : {}),
+    });
+    if (this.recentEvents.length > MAX_RECENT_SUPERVISOR_EVENTS) {
+      this.recentEvents.splice(
+        0,
+        this.recentEvents.length - MAX_RECENT_SUPERVISOR_EVENTS,
+      );
+    }
+  }
+
+  private scheduleTransferState(): void {
+    if (this.closed || this.transferStateTimer || !this.options.onStateChange) {
+      return;
+    }
+    // The installed supervisor persists each notification. Keep diagnostics
+    // fresh without adding a synchronous disk write to every socket handoff.
+    this.transferStateTimer = setTimeout(() => this.publishState(), 250);
+    this.transferStateTimer.unref();
   }
 
   private publishState(): void {
+    clearTimeout(this.transferStateTimer);
+    this.transferStateTimer = undefined;
     try {
       this.options.onStateChange?.(this.snapshot());
     } catch (error) {

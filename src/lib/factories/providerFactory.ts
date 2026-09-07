@@ -4,13 +4,41 @@ import type {
   AIProvider,
   NeurolinkCredentials,
   ProviderConstructor,
+  ProviderDescriptor,
   ProviderRegistration,
 } from "../types/index.js";
 
 import { logger } from "../utils/logger.js";
+import {
+  PROVIDER_DESCRIPTORS,
+  PROVIDER_DESCRIPTORS_BY_NAME,
+  PROVIDER_ALIAS_INDEX,
+} from "./providerDescriptors.js";
 
 // Pure factory pattern with no hardcoded imports
 // All providers loaded dynamically via registry to avoid circular dependencies
+
+/**
+ * Resolve a registered provider name (or alias) to its NeurolinkCredentials
+ * key. Backed by ProviderFactory.getDescriptor() — PROVIDER_DESCRIPTORS is
+ * the single source of truth for provider identity — instead of a
+ * hand-maintained map, so this can no longer drift out of sync with the
+ * descriptors, and it correctly resolves aliases (e.g. "hf") through
+ * PROVIDER_ALIAS_INDEX, not just canonical names. Falls back to the
+ * lowercased input when no descriptor is found, matching the retired
+ * map's behavior for unknown provider names.
+ *
+ * Referencing ProviderFactory here (defined further down this file) is
+ * safe: this function's body only runs when called, by which point the
+ * module has finished evaluating and ProviderFactory is fully defined —
+ * there is no temporal-dead-zone hazard from the declaration order.
+ */
+export function resolveCredentialKey(providerName: string): string {
+  const normalized = providerName.toLowerCase();
+  return (
+    ProviderFactory.getDescriptor(normalized)?.credentialsKey ?? normalized
+  );
+}
 
 /**
  * True Factory Pattern implementation for AI Providers
@@ -29,11 +57,13 @@ export class ProviderFactory {
     constructor: ProviderConstructor,
     defaultModel?: string, // Optional - provider can read from env
     aliases: string[] = [],
+    descriptor?: ProviderDescriptor,
   ): void {
     const registration: ProviderRegistration = {
       constructor,
       defaultModel,
       aliases,
+      descriptor,
     };
 
     // Register main name
@@ -92,21 +122,7 @@ export class ProviderFactory {
       model = model || registration.defaultModel;
     }
 
-    // Map registered provider names to NeurolinkCredentials keys.
-    // Most names match (openai, anthropic, vertex, bedrock, etc.)
-    // but every kebab-case provider whose canonical credentials key is
-    // camelCase MUST be mapped here — otherwise per-call credential
-    // overrides silently get dropped (the factory looks up
-    // credentials["lm-studio"] which is undefined while the user wrote
-    // credentials.lmStudio).
-    const credentialKeyMap: Record<string, string> = {
-      "google-ai": "googleAiStudio",
-      "openai-compatible": "openaiCompatible",
-      huggingface: "huggingFace",
-      "lm-studio": "lmStudio",
-      "nvidia-nim": "nvidiaNim",
-    };
-    const credKey = credentialKeyMap[normalizedName] ?? normalizedName;
+    const credKey = resolveCredentialKey(normalizedName);
 
     // Extract provider-scoped credential slice (e.g. credentials.openai for OpenAI)
     const scopedCredentials = credentials
@@ -122,54 +138,18 @@ export class ProviderFactory {
         );
       }
 
-      let result: AIProvider;
+      const factoryResult = (
+        registration.constructor as (
+          modelName?: string,
+          providerName?: string,
+          sdk?: NeuroLink,
+          region?: string,
+          credentials?: Record<string, unknown>,
+        ) => Promise<AIProvider> | AIProvider
+      )(model, resolvedProviderName, sdk, region, scopedCredentials);
 
-      try {
-        const factoryResult = (
-          registration.constructor as (
-            modelName?: string,
-            providerName?: string,
-            sdk?: NeuroLink,
-            region?: string,
-            credentials?: Record<string, unknown>,
-          ) => Promise<AIProvider> | AIProvider
-        )(model, resolvedProviderName, sdk, region, scopedCredentials);
-
-        // Handle both sync and async results
-        result =
-          factoryResult instanceof Promise
-            ? await factoryResult
-            : factoryResult;
-      } catch (factoryError) {
-        if (
-          registration.constructor.prototype &&
-          registration.constructor.prototype.constructor ===
-            registration.constructor
-        ) {
-          try {
-            result = new (registration.constructor as new (
-              modelName?: string,
-              providerName?: string,
-              sdk?: NeuroLink,
-              region?: string,
-              credentials?: Record<string, unknown>,
-            ) => AIProvider)(
-              model,
-              resolvedProviderName,
-              sdk,
-              region,
-              scopedCredentials,
-            );
-          } catch (constructorError) {
-            throw new Error(
-              `Both factory function and constructor failed. Factory error: ${factoryError}. Constructor error: ${constructorError}`,
-              { cause: constructorError },
-            );
-          }
-        } else {
-          throw factoryError;
-        }
-      }
+      const result =
+        factoryResult instanceof Promise ? await factoryResult : factoryResult;
 
       return result;
     } catch (error) {
@@ -206,23 +186,48 @@ export class ProviderFactory {
   }
 
   /**
+   * Look up a provider's static descriptor. Checks the built-in
+   * PROVIDER_DESCRIPTORS first (works even before registerAllProviders()
+   * has run, and resolves aliases via PROVIDER_ALIAS_INDEX), then falls
+   * back to whatever descriptor a live custom registration attached via
+   * registerProvider()'s 5th parameter.
+   */
+  static getDescriptor(name: string): ProviderDescriptor | undefined {
+    const normalized = name.toLowerCase();
+    const canonical = PROVIDER_ALIAS_INDEX.get(normalized);
+    if (canonical) {
+      const builtIn = PROVIDER_DESCRIPTORS_BY_NAME.get(canonical);
+      if (builtIn) {
+        return builtIn;
+      }
+    }
+    return ProviderFactory.providers.get(normalized)?.descriptor;
+  }
+
+  /** All built-in provider descriptors (does not include custom-registered providers that lack a descriptor). */
+  static getAllDescriptors(): readonly ProviderDescriptor[] {
+    return PROVIDER_DESCRIPTORS;
+  }
+
+  /**
    * Normalize provider names using aliases (PHASE 1: Factory Pattern)
    */
   static normalizeProviderName(providerName: string): string | null {
     const normalized = providerName.toLowerCase();
-
-    // Check direct registration
     if (ProviderFactory.providers.has(normalized)) {
       return normalized;
     }
-
-    // Check aliases from all registrations
+    const canonical = PROVIDER_ALIAS_INDEX.get(normalized);
+    if (canonical && ProviderFactory.providers.has(canonical)) {
+      return canonical;
+    }
+    // Fallback for providers registered without a built-in descriptor
+    // (e.g. TTS/STT/media handlers registered outside PROVIDER_DESCRIPTORS).
     for (const [name, registration] of ProviderFactory.providers.entries()) {
       if (registration.aliases?.includes(normalized)) {
         return name;
       }
     }
-
     return null;
   }
 

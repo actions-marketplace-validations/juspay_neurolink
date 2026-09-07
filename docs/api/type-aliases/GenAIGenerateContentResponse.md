@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **GenAIGenerateContentResponse** = `object`
 
-Defined in: [types/providers.ts:883](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L883)
+Defined in: [types/providers.ts:1174](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1174)
 
 Google AI generate content response
 
@@ -18,7 +18,7 @@ Google AI generate content response
 
 > `optional` **candidates?**: `object`[]
 
-Defined in: [types/providers.ts:884](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L884)
+Defined in: [types/providers.ts:1175](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1175)
 
 #### content?
 

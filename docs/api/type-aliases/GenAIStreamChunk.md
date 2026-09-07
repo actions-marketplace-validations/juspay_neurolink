@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **GenAIStreamChunk** = `object`
 
-Defined in: [types/providers.ts:864](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L864)
+Defined in: [types/providers.ts:1155](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1155)
 
 Google AI generateContentStream response chunk
 
@@ -18,7 +18,7 @@ Google AI generateContentStream response chunk
 
 > `optional` **text?**: `string`
 
-Defined in: [types/providers.ts:865](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L865)
+Defined in: [types/providers.ts:1156](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1156)
 
 ---
 
@@ -26,7 +26,7 @@ Defined in: [types/providers.ts:865](https://github.com/juspay/neurolink/blob/ff
 
 > `optional` **functionCalls?**: `object`[]
 
-Defined in: [types/providers.ts:866](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L866)
+Defined in: [types/providers.ts:1157](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1157)
 
 #### name
 
@@ -42,7 +42,7 @@ Defined in: [types/providers.ts:866](https://github.com/juspay/neurolink/blob/ff
 
 > `optional` **candidates?**: `object`[]
 
-Defined in: [types/providers.ts:867](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L867)
+Defined in: [types/providers.ts:1158](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1158)
 
 #### content?
 

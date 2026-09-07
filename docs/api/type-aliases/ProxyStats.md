@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ProxyStats** = `object`
 
-Defined in: [types/proxy.ts:711](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L711)
+Defined in: [types/proxy.ts:1197](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1197)
 
 ## Properties
 
@@ -16,7 +16,7 @@ Defined in: [types/proxy.ts:711](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **startedAt**: `number`
 
-Defined in: [types/proxy.ts:712](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L712)
+Defined in: [types/proxy.ts:1198](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1198)
 
 ---
 
@@ -24,7 +24,15 @@ Defined in: [types/proxy.ts:712](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **totalAttempts**: `number`
 
-Defined in: [types/proxy.ts:713](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L713)
+Defined in: [types/proxy.ts:1199](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1199)
+
+---
+
+### totalAttemptErrors
+
+> **totalAttemptErrors**: `number`
+
+Defined in: [types/proxy.ts:1200](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1200)
 
 ---
 
@@ -32,7 +40,7 @@ Defined in: [types/proxy.ts:713](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **totalRequests**: `number`
 
-Defined in: [types/proxy.ts:714](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L714)
+Defined in: [types/proxy.ts:1201](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1201)
 
 ---
 
@@ -40,7 +48,7 @@ Defined in: [types/proxy.ts:714](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **totalSuccess**: `number`
 
-Defined in: [types/proxy.ts:715](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L715)
+Defined in: [types/proxy.ts:1202](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1202)
 
 ---
 
@@ -48,7 +56,7 @@ Defined in: [types/proxy.ts:715](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **totalErrors**: `number`
 
-Defined in: [types/proxy.ts:716](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L716)
+Defined in: [types/proxy.ts:1203](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1203)
 
 ---
 
@@ -56,7 +64,23 @@ Defined in: [types/proxy.ts:716](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **totalRateLimits**: `number`
 
-Defined in: [types/proxy.ts:717](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L717)
+Defined in: [types/proxy.ts:1204](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1204)
+
+---
+
+### totalTransientRateLimits
+
+> **totalTransientRateLimits**: `number`
+
+Defined in: [types/proxy.ts:1205](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1205)
+
+---
+
+### totalQuotaRateLimits
+
+> **totalQuotaRateLimits**: `number`
+
+Defined in: [types/proxy.ts:1206](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1206)
 
 ---
 
@@ -64,4 +88,4 @@ Defined in: [types/proxy.ts:717](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **accounts**: `Record`\<`string`, [`AccountStats`](AccountStats.md)\>
 
-Defined in: [types/proxy.ts:718](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L718)
+Defined in: [types/proxy.ts:1207](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L1207)

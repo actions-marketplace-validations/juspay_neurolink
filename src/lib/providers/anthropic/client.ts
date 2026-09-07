@@ -41,7 +41,7 @@ import {
   wrapFetchWithLimitCapture,
 } from "./rateLimitCapture.js";
 import type {
-  UnknownRecord,
+  ToolExecutionSummaryInternal,
   AnthropicProviderConfig,
   StreamOptions,
   StreamResult,
@@ -55,6 +55,7 @@ import type {
   ClaudeSubscriptionTier,
   ClaudeUsageInfo,
   OAuthToken,
+  ProviderErrorRule,
   ZodUnknownSchema,
 } from "../../types/index.js";
 import {
@@ -63,7 +64,9 @@ import {
   ProviderError,
   RateLimitError,
 } from "../../types/index.js";
+import { classifyProviderError } from "../../utils/errorClassifier.js";
 import { logger } from "../../utils/logger.js";
+import { drainDetachedPump } from "../../utils/drainDetachedPump.js";
 import {
   ANTHROPIC_ELISION_NOTE,
   planAnthropicLoopReclaim,
@@ -82,7 +85,21 @@ import type {
   VertexAnthropicMessage,
 } from "../../types/index.js";
 import { calculateCost } from "../../utils/pricing.js";
-import { resolveDeferredTool } from "../../tools/toolDiscovery.js";
+import { stringifyAnthropicToolOutput } from "./toolOutput.js";
+import { createAnthropicLoopAdapter } from "./loopAdapter.js";
+import type { AgenticLoopReclaimResult } from "../../types/index.js";
+import { runAgenticLoop } from "../../core/loopEngine.js";
+import {
+  hasNativeDoGenerate,
+  runNativeGenerateLoop,
+} from "../../core/nativeGenerateLoop.js";
+import { withProviderRetry } from "../../utils/providerRetry.js";
+import { resolveRequestKind } from "../../core/resolveRequestKind.js";
+import {
+  resolveToolExecutionRecords,
+  toolCallsFromSummaries,
+} from "../../core/toolExecutionRecorder.js";
+import { transformToolExecutions } from "../../utils/transformationUtils.js";
 import {
   createAnthropicConfig,
   getProviderModel,
@@ -110,17 +127,18 @@ import {
 } from "../anthropicImageBlocks.js";
 import { resolveSamplingParams } from "../../models/modelRegistry.js";
 import {
-  createChunkQueue,
   createDeferredAnalytics,
   stringifyToolInput,
 } from "../openaiChatCompletionsClient.js";
+import { createStreamChannel } from "../../core/streamChannel.js";
+import { toNativeToolDeclarations } from "../../core/nativeToolFormat.js";
 
 import { ANTHROPIC_BETA_HEADERS } from "./constants.js";
+import { cacheControlOf } from "./cacheControl.js";
 import {
   appendFinalResultInstruction,
   appendFinalResultTool,
   FINAL_RESULT_TOOL_NAME,
-  stringifyFinalResultInput,
 } from "./structuredOutput.js";
 
 // AnthropicProviderConfig is imported from types/providers.ts
@@ -303,49 +321,6 @@ const detectAuthMethod = (
 // ───────────────────────────────────────────────────────────────────────────
 // Native Messages-API conversion helpers (NeuroLink/V3 shapes → Anthropic)
 // ───────────────────────────────────────────────────────────────────────────
-
-/**
- * Read an Anthropic cache breakpoint from a message/part/tool carrier.
- * MessageBuilder marks system messages (and GenerationHandler marks the last
- * tool definition) with `providerOptions.anthropic.cacheControl` — the
- * AI-SDK-era prompt-caching contract this native path must keep honoring.
- */
-const cacheControlOf = (
-  carrier: unknown,
-): Anthropic.Messages.CacheControlEphemeral | undefined => {
-  const cc = (
-    carrier as {
-      providerOptions?: { anthropic?: { cacheControl?: { type?: string } } };
-    }
-  )?.providerOptions?.anthropic?.cacheControl;
-  return cc?.type === "ephemeral" ? { type: "ephemeral" } : undefined;
-};
-
-/** Serialize a tool-result `output` into text for a tool_result block. */
-const stringifyAnthropicToolOutput = (output: unknown): string => {
-  if (output === null || output === undefined) {
-    return "";
-  }
-  if (typeof output === "string") {
-    return output;
-  }
-  const o = output as { type?: string; value?: unknown };
-  if (o.type === "text" && typeof o.value === "string") {
-    return o.value;
-  }
-  if (o.type === "json" || o.type === "error-json") {
-    try {
-      return JSON.stringify(o.value);
-    } catch {
-      return String(o.value);
-    }
-  }
-  try {
-    return JSON.stringify(output);
-  } catch {
-    return String(output);
-  }
-};
 
 /**
  * Convert NeuroLink/V3-shaped messages (the shape produced by
@@ -569,38 +544,6 @@ const messagesToAnthropic = (
     ...(system !== undefined ? { system } : {}),
     messages,
   };
-};
-
-/** Convert a NeuroLink tool record into Anthropic tool definitions. */
-const toolsToAnthropic = (
-  tools: Record<string, Tool>,
-): Anthropic.Messages.Tool[] | undefined => {
-  const entries = Object.entries(tools);
-  if (entries.length === 0) {
-    return undefined;
-  }
-  return entries.map(([name, tool]) => {
-    const t = tool as {
-      description?: string;
-      inputSchema?: unknown;
-      parameters?: unknown;
-    };
-    const rawSchema = t.inputSchema ?? t.parameters;
-    const input_schema = (
-      rawSchema
-        ? convertZodToJsonSchema(rawSchema as never)
-        : { type: "object", properties: {} }
-    ) as Anthropic.Messages.Tool.InputSchema;
-    // GenerationHandler marks the last tool definition with a cache
-    // breakpoint when prompt caching is active — keep honoring it.
-    const cc = cacheControlOf(tool);
-    return {
-      name,
-      ...(t.description ? { description: t.description } : {}),
-      input_schema,
-      ...(cc ? { cache_control: cc } : {}),
-    };
-  });
 };
 
 /** Map a NeuroLink tool choice onto Anthropic's tool_choice shape. */
@@ -1530,54 +1473,78 @@ export class AnthropicProvider extends BaseProvider {
           ...(thinking ? { thinking } : {}),
         };
 
-        // The 60s anthropic generate default was tuned for the old ~4096
-        // max_tokens. Now that the default ceiling is the model's real max,
-        // a large structured response needs more wall-clock to be produced —
-        // otherwise the inner controller aborts mid-generation (the AI-SDK
-        // doGenerate layer doesn't see the caller's `timeout`). Raise the
-        // floor to 5 min when a large output budget is in play — but only
-        // when the caller did NOT set an explicit timeout: an explicit value
-        // is a contract and must never be silently extended. The abort
-        // signal stays the real bound.
-        const callerTimeout = (options as { timeout?: number | string })
-          .timeout;
-        const callerSpecifiedTimeout =
-          callerTimeout !== undefined && callerTimeout !== null;
+        // The caller's resolved `timeout` reaches this layer only through
+        // providerOptions.neurolink.timeoutMs (AI-SDK call options carry no
+        // `timeout`; the old `options.timeout` read here never fired on V3).
+        // An explicit value is a per-call contract: never floored, never
+        // extended. Without one, the 60s anthropic default was tuned for the
+        // old ~4096 max_tokens — now that the default ceiling is the model's
+        // real max, raise the floor to 5 min when a large output budget is
+        // in play. The abort signal stays the real bound.
+        const neurolinkNs = options.providerOptions?.neurolink;
+        const forwardedTimeoutMs =
+          typeof neurolinkNs?.timeoutMs === "number" &&
+          Number.isFinite(neurolinkNs.timeoutMs) &&
+          neurolinkNs.timeoutMs > 0
+            ? neurolinkNs.timeoutMs
+            : undefined;
         const generateTimeoutMs =
-          params.max_tokens > 8192 && !callerSpecifiedTimeout
-            ? Math.max(getTimeoutForOptions(options), 300_000)
-            : getTimeoutForOptions(options);
+          forwardedTimeoutMs !== undefined
+            ? forwardedTimeoutMs
+            : params.max_tokens > 8192
+              ? Math.max(getTimeoutForOptions(options), 300_000)
+              : getTimeoutForOptions(options);
         const timeoutController = createTimeoutController(
           generateTimeoutMs,
           providerName,
           "generate",
         );
+        const requestSignal = composeAbortSignals(
+          options.abortSignal,
+          timeoutController?.controller.signal,
+        );
         let response: Anthropic.Messages.Message;
         try {
           response = await client.messages.create(params, {
-            signal: composeAbortSignals(
-              options.abortSignal,
-              timeoutController?.controller.signal,
-            ),
+            signal: requestSignal,
           });
+        } catch (error) {
+          // The Anthropic SDK collapses ANY fired signal into its generic
+          // APIUserAbortError ("Request was aborted."), discarding the
+          // signal's reason. When the abort came from one of NeuroLink's own
+          // timers (this per-call timer, or the turn-level one upstream),
+          // the TimeoutError reason is the honest identity — surface it.
+          const reason = requestSignal?.aborted
+            ? requestSignal.reason
+            : undefined;
+          if (reason instanceof TimeoutError) {
+            throw reason;
+          }
+          throw error;
         } finally {
           timeoutController?.cleanup();
         }
 
         const content: Array<{ type: string } & Record<string, unknown>> = [];
         let finalResultText: string | undefined;
+        // Text emitted in forced-json mode, kept only as a fallback (see below).
+        const jsonModeText: string[] = [];
+        let jsonToolAnswered = false;
         for (const block of response.content) {
           if (block.type === "thinking") {
             content.push({ type: "reasoning", text: block.thinking });
           } else if (block.type === "text") {
             // In forced-json mode the payload arrives via the tool input, not
             // text — pass text through only in normal mode.
-            if (!jsonTool) {
+            if (jsonTool) {
+              jsonModeText.push(block.text);
+            } else {
               content.push({ type: "text", text: block.text });
             }
           } else if (block.type === "tool_use") {
             if (jsonTool && block.name === jsonTool) {
               // Unwrap the synthetic tool call back into text JSON.
+              jsonToolAnswered = true;
               content.push({
                 type: "text",
                 text: stringifyToolInput(block.input),
@@ -1598,6 +1565,15 @@ export class AnthropicProvider extends BaseProvider {
               });
             }
           }
+        }
+        // Forced-json mode normally drops text blocks because the payload rides
+        // in the synthetic tool's input. But when the response is cut short
+        // (stop_reason "max_tokens") the tool call can be missing entirely, and
+        // dropping the text would leave an EMPTY completion with nothing for
+        // coerceJsonToSchema to recover. Fall back to the text so a partial
+        // object can still be salvaged and flagged truncated.
+        if (jsonTool && !jsonToolAnswered && jsonModeText.length > 0) {
+          content.push({ type: "text", text: jsonModeText.join("") });
         }
 
         // final_result is terminal — parity with the native Claude-on-Vertex
@@ -1666,64 +1642,51 @@ export class AnthropicProvider extends BaseProvider {
   }
 
   protected formatProviderError(error: unknown): Error {
-    if (error instanceof TimeoutError) {
-      return new NetworkError(
-        `Request timed out after ${error.timeout}ms`,
-        this.providerName,
-      );
-    }
-
-    const errorRecord = error as UnknownRecord;
-    const message =
-      typeof errorRecord?.message === "string"
-        ? errorRecord.message
-        : "Unknown error";
-
-    if (
-      message.includes("API_KEY_INVALID") ||
-      message.includes("Invalid API key")
-    ) {
-      return new AuthenticationError(
-        "Invalid Anthropic API key. Please check your ANTHROPIC_API_KEY environment variable.",
-        this.providerName,
-      );
-    }
-
-    if (
-      message.includes("rate limit") ||
-      message.includes("too_many_requests") ||
-      message.includes("429")
-    ) {
-      return new RateLimitError(
-        "Anthropic rate limit exceeded. Please try again later.",
-        this.providerName,
-      );
-    }
-
-    if (
-      message.includes("ECONNRESET") ||
-      message.includes("ENOTFOUND") ||
-      message.includes("ECONNREFUSED") ||
-      message.includes("network") ||
-      message.includes("connection")
-    ) {
-      return new NetworkError(
-        `Connection error: ${message}`,
-        this.providerName,
-      );
-    }
-
-    if (
-      message.includes("500") ||
-      message.includes("502") ||
-      message.includes("503") ||
-      message.includes("504") ||
-      message.includes("server error")
-    ) {
-      return new ProviderError(`Server error: ${message}`, this.providerName);
-    }
-
-    return new ProviderError(`Anthropic error: ${message}`, this.providerName);
+    const rules: ProviderErrorRule[] = [
+      {
+        // Plan 02's mocked-contract work documented a pre-existing gap: the
+        // Anthropic SDK formats auth failures as a bare "401 <msg>" string,
+        // which the message-text regex alone does not catch — mirrors
+        // Vertex's statusCode === 401 fallback in this same task.
+        match: (ctx) =>
+          ctx.statusCode === 401 ||
+          /API_KEY_INVALID|Invalid API key/i.test(ctx.message),
+        errorClass: AuthenticationError,
+        message:
+          "Invalid Anthropic API key. Please check your ANTHROPIC_API_KEY environment variable.",
+      },
+      {
+        match: (ctx) =>
+          ctx.statusCode === 429 ||
+          /rate limit|too_many_requests|429/i.test(ctx.message),
+        errorClass: RateLimitError,
+        message: "Anthropic rate limit exceeded. Please try again later.",
+      },
+      {
+        match: (ctx) =>
+          /ECONNRESET|ENOTFOUND|ECONNREFUSED|network|connection/i.test(
+            ctx.message,
+          ),
+        errorClass: NetworkError,
+        message: (ctx) => `Connection error: ${ctx.message}`,
+      },
+      {
+        match: (ctx) => /500|502|503|504|server error/i.test(ctx.message),
+        errorClass: ProviderError,
+        message: (ctx) => `Server error: ${ctx.message}`,
+      },
+      {
+        match: () => true,
+        errorClass: ProviderError,
+        message: (ctx) => `Anthropic error: ${ctx.message}`,
+      },
+    ];
+    return classifyProviderError(
+      error,
+      rules,
+      this.providerName,
+      this.modelName,
+    );
   }
 
   // executeGenerate removed - BaseProvider handles all generation with tools
@@ -1742,7 +1705,7 @@ export class AnthropicProvider extends BaseProvider {
     // generate() calls can be in flight on one provider instance, and an
     // instance field would attribute one call's limits to another.
     const { result, snapshot } = await withLimitCapture(() =>
-      super.generate(optionsOrPrompt, analysisSchema),
+      this.dispatchGenerate(optionsOrPrompt, analysisSchema),
     );
     if (result && snapshot) {
       this.recordLimitSnapshot(snapshot);
@@ -1752,6 +1715,194 @@ export class AnthropicProvider extends BaseProvider {
       }
     }
     return result;
+  }
+
+  /**
+   * Text turns run natively; every other request kind still goes to
+   * BaseProvider.generate().
+   *
+   * The loop runs over this provider's own delegating-model `doGenerate`,
+   * which issues a NON-streaming `messages.create`. That matters: the streaming
+   * loop adapter hardcodes `stream: true`, and an earlier attempt that routed
+   * generate through it silently changed the wire.
+   */
+  private async dispatchGenerate(
+    optionsOrPrompt: TextGenerationOptions | string,
+    analysisSchema?: ValidationSchema,
+  ): Promise<EnhancedGenerateResult | null> {
+    await this.ensureModelLimits();
+    const options = this.normalizeTextOptions(optionsOrPrompt);
+    if (resolveRequestKind(options, this.modelName) !== "text") {
+      return super.generate(options, analysisSchema);
+    }
+    this.validateOptions(options);
+    const mergedTools = await this.getToolsForStream(options);
+    const callerOwnsFallback =
+      "disableInternalFallback" in options &&
+      options.disableInternalFallback === true;
+    // The native loop bypasses BaseProvider.executeGeneration, so the turn
+    // budget has to be composed here or it stops existing for this provider.
+    return this.runGenerateWithModelFallback(
+      () =>
+        this.withTurnTimeout(
+          { ...options, tools: mergedTools },
+          this.getDescriptorGenerateMs(),
+          (timedOptions) => this.executeNativeGenerate(timedOptions),
+        ),
+      callerOwnsFallback,
+    );
+  }
+
+  private async executeNativeGenerate(
+    options: TextGenerationOptions,
+  ): Promise<EnhancedGenerateResult> {
+    const startTime = Date.now();
+    const modelId = this.modelName || getDefaultAnthropicModel();
+    // Middleware must wrap the model here. The native loop bypasses
+    // BaseProvider.executeGeneration, and with it the only place middleware was
+    // ever applied — a probe showed a caller's wrapGenerate running zero times
+    // on every native provider while their onFinish still fired, because
+    // onFinish had been special-cased and nothing else had.
+    const model = await this.getAISDKModelWithMiddleware(options);
+    if (!hasNativeDoGenerate(model)) {
+      throw this.handleProviderError(
+        new Error("anthropic: model handle exposes no doGenerate()"),
+      );
+    }
+    const doGenerate = model.doGenerate.bind(model);
+
+    const shouldUseTools = !options.disableTools && this.supportsTools();
+    const toolsRecord = shouldUseTools
+      ? (options.tools as Record<string, Tool>) || {}
+      : {};
+    const v3Tools = Object.entries(toolsRecord).map(([name, t]) => {
+      const tool = t as { description?: string; inputSchema?: unknown };
+      return {
+        type: "function" as const,
+        name,
+        description: tool.description ?? "",
+        inputSchema: (tool.inputSchema
+          ? convertZodToJsonSchema(tool.inputSchema as ZodUnknownSchema)
+          : { type: "object", properties: {} }) as Record<string, unknown>,
+      };
+    });
+    const hasTools = v3Tools.length > 0;
+
+    // Two structured-output routes, and doGenerate implements both. With no
+    // tools it replaces the tool list with one forced json tool; with tools it
+    // APPENDS final_result so the real tools stay callable. Picking the wrong
+    // one is what dropped structuredData to null on the first attempt.
+    const schemaJson = options.schema
+      ? (convertZodToJsonSchema(options.schema as ZodUnknownSchema) as Record<
+          string,
+          unknown
+        >)
+      : undefined;
+    const responseFormat =
+      schemaJson && !hasTools
+        ? { type: "json" as const, schema: schemaJson }
+        : undefined;
+
+    const anthropicNamespace: Record<string, unknown> = {};
+    if (schemaJson && hasTools) {
+      anthropicNamespace.finalResultSchema = schemaJson;
+    }
+    if (
+      options.thinkingConfig?.enabled &&
+      options.thinkingConfig.budgetTokens
+    ) {
+      anthropicNamespace.thinking = {
+        type: "enabled" as const,
+        budget_tokens: options.thinkingConfig.budgetTokens,
+      };
+    }
+    // The per-call `timeout` keeps its per-MODEL-CALL meaning once
+    // `turnTimeoutMs` owns the whole-turn deadline, and it reaches the model
+    // layer only through providerOptions.neurolink. Without it each step fell
+    // back to the provider default.
+    const mergedProviderOptions: Record<string, Record<string, unknown>> = {};
+    if (Object.keys(anthropicNamespace).length > 0) {
+      mergedProviderOptions.anthropic = anthropicNamespace;
+    }
+    if (typeof options.timeout === "number") {
+      mergedProviderOptions.neurolink = { timeoutMs: options.timeout };
+    }
+    const providerOptions =
+      Object.keys(mergedProviderOptions).length > 0
+        ? mergedProviderOptions
+        : undefined;
+
+    const conversation = (await this.buildMessagesForStream(
+      options as StreamOptions,
+    )) as Array<Record<string, unknown>>;
+
+    const toolExecutionSummaries: ToolExecutionSummaryInternal[] = [];
+    const loop = await runNativeGenerateLoop(
+      {
+        doGenerate,
+        conversation,
+        ...(hasTools ? { tools: v3Tools } : {}),
+        toolsRecord,
+        // A caller's toolChoice was dropped here while the streaming path and
+        // the OpenAI-compatible native path both forwarded it, so
+        // `toolChoice: "required"` and named-tool choices silently degraded to
+        // Anthropic's default `auto` on generate().
+        ...(hasTools && options.toolChoice
+          ? { toolChoice: resolveToolChoice(options, toolsRecord, true) }
+          : {}),
+        ...(responseFormat ? { responseFormat } : {}),
+        ...(providerOptions ? { providerOptions } : {}),
+        maxSteps: options.maxSteps || DEFAULT_MAX_STEPS,
+        ...(options.maxTokens ? { maxOutputTokens: options.maxTokens } : {}),
+        ...(options.temperature !== undefined
+          ? { temperature: options.temperature }
+          : {}),
+        ...(options.abortSignal ? { abortSignal: options.abortSignal } : {}),
+        ...(options.toolTimeoutMs !== undefined
+          ? { toolTimeoutMs: options.toolTimeoutMs }
+          : {}),
+        runStep: (call) =>
+          withProviderRetry<Record<string, unknown>>(
+            call,
+            trace.getActiveSpan() ?? undefined,
+            "anthropic generate",
+          ).catch((err: unknown) => {
+            throw this.handleProviderError(err);
+          }),
+      },
+      toolExecutionSummaries,
+    );
+
+    const enhanced: EnhancedGenerateResult = {
+      content: loop.text,
+      provider: this.providerName,
+      model: modelId,
+      finishReason: loop.finishReason,
+      ...(loop.rawFinishReason
+        ? { rawFinishReason: loop.rawFinishReason }
+        : {}),
+      usage: {
+        input: loop.inputTokens,
+        output: loop.outputTokens,
+        total: loop.inputTokens + loop.outputTokens,
+        ...(loop.cacheReadTokens
+          ? { cacheReadTokens: loop.cacheReadTokens }
+          : {}),
+        ...(loop.cacheWriteTokens
+          ? { cacheCreationTokens: loop.cacheWriteTokens }
+          : {}),
+      },
+      responseTime: Date.now() - startTime,
+      toolsUsed: loop.toolsUsed,
+      toolCalls: toolCallsFromSummaries(toolExecutionSummaries),
+      toolExecutions: resolveToolExecutionRecords(
+        options,
+        transformToolExecutions(toolExecutionSummaries),
+      ),
+      enhancedWithTools: loop.toolsUsed.length > 0,
+    };
+
+    return this.finalizeNativeGenerate(enhanced, options, startTime);
   }
 
   /**
@@ -1823,7 +1974,9 @@ export class AnthropicProvider extends BaseProvider {
         ? (options.tools as Record<string, Tool>) || (await this.getAllTools())
         : {};
       anthropicTools = shouldUseTools
-        ? toolsToAnthropic(toolsRecord)
+        ? (toNativeToolDeclarations(toolsRecord, "input_schema") as
+            | Anthropic.Messages.Tool[]
+            | undefined)
         : undefined;
       // Build message array from options with multimodal support, then
       // convert to the Anthropic Messages payload (system + content blocks).
@@ -1886,7 +2039,11 @@ export class AnthropicProvider extends BaseProvider {
 
     const maxSteps = options.maxSteps || DEFAULT_MAX_STEPS;
     const emitter = this.neurolink?.getEventEmitter();
-    const { pushChunk, nextChunk } = createChunkQueue();
+    const channel = createStreamChannel<{
+      content: string;
+      reasoning?: string;
+    }>();
+    const { push: pushChunk } = channel;
     const { usagePromise, finishPromise, resolveUsage, resolveFinish } =
       createDeferredAnalytics();
 
@@ -1941,6 +2098,14 @@ export class AnthropicProvider extends BaseProvider {
     const toolsUsed: string[] = [];
     const streamStartTime = Date.now();
 
+    // Mutable-reference contract from StreamResult.metadata: created before
+    // the loop and filled once the turn drains, because wrapper spreads
+    // snapshot top-level result fields before the loop resolves. This is how
+    // the Gemini/Vertex native paths already report their resolved outcome;
+    // without it a consumer (e.g. the SDK's no-output fallback gate) cannot
+    // tell a step-capped turn from a failed one.
+    const turnMetadata: NonNullable<StreamResult["metadata"]> = {};
+
     // Hoisted out of runLoop so the error path can resolve the usage
     // accumulated by steps that completed BEFORE the failure — those steps
     // were billed and must not be reported as zero.
@@ -1988,7 +2153,6 @@ export class AnthropicProvider extends BaseProvider {
     };
 
     const runLoop = async (): Promise<void> => {
-      const conversation = payload.messages.slice();
       // The provider's REAL prompt-token count for the previous step,
       // calibrating the guard's char-based estimate for free, paired with the
       // guard's own estimate for that same request — a ratio between counts of
@@ -1996,29 +2160,19 @@ export class AnthropicProvider extends BaseProvider {
       let lastObservedPromptTokens: number | undefined;
       let lastSentEstimate: number | undefined;
 
-      for (let step = 0; step < maxSteps; step++) {
-        // Mid-turn discovery sync: search_tools (tools.discovery) hydrates
-        // new tools into toolsRecord between steps; Claude only calls tools
-        // declared in the request, so advertise them now (`params` below
-        // rebuilds from anthropicTools every step).
-        if (anthropicTools) {
-          const declared = new Set(anthropicTools.map((t) => t.name));
-          const hydrated = Object.fromEntries(
-            Object.entries(toolsRecord).filter(([name]) => !declared.has(name)),
-          );
-          if (Object.keys(hydrated).length > 0) {
-            anthropicTools.push(...(toolsToAnthropic(hydrated) ?? []));
-            logger.info(
-              `[Anthropic] ${Object.keys(hydrated).length} tool(s) hydrated mid-turn via discovery: ${Object.keys(hydrated).join(", ")}`,
-            );
-          }
-        }
-        // In-turn context guard. This loop appends an assistant tool_use
-        // message plus a user tool_result message every step — growth the
-        // pre-dispatch budget check never sees. Without it a long agentic run
-        // overflows the window mid-loop and loses every completed step.
-        // Returns undefined while the request still fits, leaving the history
-        // byte-identical so the rolling cache prefix below stays valid.
+      /**
+       * Reclaim, as a PURE function of the conversation.
+       *
+       * The hand-rolled loop this replaces rebuilt in place
+       * (`conversation.length = 0; conversation.push(...rebuilt)`) because it
+       * owned the array. The engine owns it now and assigns what this
+       * returns, so mutating here would corrupt a retried or reclaimed step.
+       */
+      const planReclaim = (
+        conversation: Anthropic.Messages.MessageParam[],
+      ):
+        | AgenticLoopReclaimResult<Anthropic.Messages.MessageParam[]>
+        | undefined => {
         const reclaim = planAnthropicLoopReclaim({
           conversation,
           availableInputTokens: getAvailableInputTokens(
@@ -2040,68 +2194,85 @@ export class AnthropicProvider extends BaseProvider {
             lastSentEstimate = tokens;
           },
         });
-        if (reclaim) {
-          // Applied HERE, in the loop's own concrete types: the guard decides,
-          // the caller mutates. Dropping an assistant tool_use message together
-          // with its user tool_result message is what keeps blocks paired.
-          const dropSet = new Set(reclaim.drop);
-          const truncateSet = new Set(reclaim.truncate);
-          const rebuilt: Anthropic.Messages.MessageParam[] = [];
-          for (let i = 0; i < conversation.length; i++) {
-            if (dropSet.has(i)) {
-              continue;
-            }
-            const message = conversation[i];
-            if (truncateSet.has(i) && Array.isArray(message.content)) {
-              rebuilt.push({
-                ...message,
-                content: message.content.map((block) =>
-                  block.type === "tool_result"
-                    ? {
-                        ...block,
-                        content: previewAnthropicToolResultText(
-                          typeof block.content === "string"
-                            ? block.content
-                            : (JSON.stringify(block.content) ?? ""),
-                        ),
-                      }
-                    : block,
-                ),
-              });
-              continue;
-            }
-            rebuilt.push(message);
+        if (!reclaim) {
+          return undefined;
+        }
+        // Dropping an assistant tool_use message together with its user
+        // tool_result message is what keeps blocks paired.
+        const dropSet = new Set(reclaim.drop);
+        const truncateSet = new Set(reclaim.truncate);
+        const rebuilt: Anthropic.Messages.MessageParam[] = [];
+        for (let i = 0; i < conversation.length; i++) {
+          if (dropSet.has(i)) {
+            continue;
           }
-          if (dropSet.size > 0) {
-            // Anthropic requires user/assistant alternation around tool blocks;
-            // the note is a user turn placed immediately before the first
-            // surviving assistant tool_use turn, which preserves it.
-            let noteIndex = rebuilt.findIndex(
-              (m) =>
-                Array.isArray(m.content) &&
-                m.content.some(
-                  (b) => b.type === "tool_use" || b.type === "tool_result",
-                ),
-            );
-            if (noteIndex < 0) {
-              noteIndex = Math.min(1, rebuilt.length);
-            }
-            rebuilt.splice(noteIndex, 0, {
-              role: "user",
-              content: [{ type: "text", text: ANTHROPIC_ELISION_NOTE }],
+          const message = conversation[i];
+          if (truncateSet.has(i) && Array.isArray(message.content)) {
+            rebuilt.push({
+              ...message,
+              content: message.content.map((block) =>
+                block.type === "tool_result"
+                  ? {
+                      ...block,
+                      content: previewAnthropicToolResultText(
+                        typeof block.content === "string"
+                          ? block.content
+                          : (JSON.stringify(block.content) ?? ""),
+                      ),
+                    }
+                  : block,
+              ),
             });
+            continue;
           }
-          conversation.length = 0;
-          conversation.push(...rebuilt);
+          rebuilt.push(message);
+        }
+        if (dropSet.size > 0) {
+          // Anthropic requires user/assistant alternation around tool blocks;
+          // the note is a user turn placed immediately before the first
+          // surviving assistant tool_use turn, which preserves it.
+          let noteIndex = rebuilt.findIndex(
+            (m) =>
+              Array.isArray(m.content) &&
+              m.content.some(
+                (b) => b.type === "tool_use" || b.type === "tool_result",
+              ),
+          );
+          if (noteIndex < 0) {
+            noteIndex = Math.min(1, rebuilt.length);
+          }
+          rebuilt.splice(noteIndex, 0, {
+            role: "user",
+            content: [{ type: "text", text: ANTHROPIC_ELISION_NOTE }],
+          });
+        }
+        return { conversation: rebuilt };
+      };
+
+      const buildParams = (
+        conversation: Anthropic.Messages.MessageParam[],
+      ): Anthropic.Messages.MessageCreateParamsNonStreaming => {
+        // Mid-turn discovery sync: search_tools (tools.discovery) hydrates
+        // new tools into toolsRecord between steps; Claude only calls tools
+        // declared in the request, so advertise them now.
+        if (anthropicTools) {
+          const declared = new Set(anthropicTools.map((t) => t.name));
+          const hydrated = Object.fromEntries(
+            Object.entries(toolsRecord).filter(([name]) => !declared.has(name)),
+          );
+          if (Object.keys(hydrated).length > 0) {
+            const extra = toNativeToolDeclarations(hydrated, "input_schema") as
+              | Anthropic.Messages.Tool[]
+              | undefined;
+            if (extra && extra.length > 0) {
+              anthropicTools = [...anthropicTools, ...extra];
+            }
+          }
         }
 
         // Prompt-cache parity with the native Vertex+Claude path — rolling
-        // history breakpoints, re-applied per step so the stable prefix
-        // stays byte-identical while the breakpoint follows the growing
-        // tail. Budget respects markers upstream layers already placed
-        // (system / last tool / message blocks) so the request never
-        // exceeds Anthropic's four-marker cap. Pure: `conversation` itself
-        // is never mutated, so re-counting per step stays stable.
+        // history breakpoints, re-applied per step so the stable prefix stays
+        // byte-identical while the breakpoint follows the growing tail.
         const cacheMarkersUsed = countAnthropicCacheMarkers({
           system: payload.system,
           tools: anthropicTools,
@@ -2111,7 +2282,6 @@ export class AnthropicProvider extends BaseProvider {
           conversation as VertexAnthropicMessage[],
           ANTHROPIC_MAX_CACHE_BREAKPOINTS - cacheMarkersUsed,
         ) as Anthropic.Messages.MessageParam[];
-        // Registry-driven strip (Sonnet 5 / Opus 4.7+ / Fable 5 families)
         const streamSamplingParams = resolveSamplingParams(
           "anthropic",
           modelId,
@@ -2120,11 +2290,14 @@ export class AnthropicProvider extends BaseProvider {
             : {},
           "anthropic.executeStream",
         );
-        const params: Anthropic.Messages.MessageCreateParamsStreaming = {
+        return {
           model: modelId,
           messages: cachedConversation,
           max_tokens: resolveClaudeMaxTokens(modelId, options.maxTokens),
-          stream: true,
+          // No `stream: true` here: executeStep sets it when it calls
+          // messages.create, so declaring it made the caller assert a literal
+          // the adapter immediately overwrites — and forced this whole params
+          // object into the streaming variant for a field it does not own.
           ...(payload.system ? { system: payload.system } : {}),
           ...(streamSamplingParams.temperature !== undefined
             ? { temperature: streamSamplingParams.temperature }
@@ -2135,279 +2308,212 @@ export class AnthropicProvider extends BaseProvider {
           ...(anthropicToolChoice ? { tool_choice: anthropicToolChoice } : {}),
           ...(thinking ? { thinking } : {}),
         };
-        const events = await client.messages.create(params, {
-          signal: abortSignal ?? undefined,
-        });
+      };
 
-        // Per-step accumulators, keyed by content-block index so blocks are
-        // replayed to the conversation in order (thinking blocks must be
-        // passed back with their signatures when tool use continues a turn).
-        const blockTypes = new Map<number, string>();
-        const textAcc = new Map<number, string>();
-        const thinkingAcc = new Map<
-          number,
-          { text: string; signature: string }
-        >();
-        const toolAcc = new Map<
-          number,
-          { id: string; name: string; inputJson: string }
-        >();
-        let stopReason: string | null = null;
-        // message_start carries a small output placeholder and message_delta
-        // reports the CUMULATIVE output for the message — latest wins within
-        // the step (adding both double-counted the placeholder every step).
-        // Write-through: each event folds only the DELTA over this step's
-        // previous value into totalOutput, so the total is correct at every
-        // point mid-drain — a step killed mid-stream (abort/timeout) still
-        // counts the billed output it already reported.
-        let stepOutputTokens = 0;
+      const baseAdapter = createAnthropicLoopAdapter({
+        client,
+        maxSteps,
+        toolsRecord,
+        buildParams,
+        planReclaim,
+        noteObservedPromptTokens: (tokens) => {
+          lastObservedPromptTokens = tokens;
+        },
+        ...(finalResultActive
+          ? {
+              finalResultToolName: FINAL_RESULT_TOOL_NAME,
+              onTerminalResult: (text: string) => {
+                finalResultText = text;
+                logger.debug(
+                  "[Anthropic] Extracted structured output from final_result tool (stream)",
+                  { chars: text.length },
+                );
+              },
+            }
+          : {}),
+      });
 
-        for await (const event of events) {
-          if (event.type === "message_start") {
-            totalInput += event.message.usage.input_tokens ?? 0;
-            const startOutputTokens = event.message.usage.output_tokens ?? 0;
-            totalOutput += startOutputTokens - stepOutputTokens;
-            stepOutputTokens = startOutputTokens;
-            // Anthropic reports cache reads/writes SEPARATELY from
-            // input_tokens on the same message_start event — without these
-            // the streaming path silently drops all cache accounting.
-            totalCacheRead += event.message.usage.cache_read_input_tokens ?? 0;
-            totalCacheWrite +=
-              event.message.usage.cache_creation_input_tokens ?? 0;
-            // Calibration signal for the in-turn guard: the FULL prompt size,
-            // which on this path means uncached input plus both cache tiers.
-            // Using input_tokens alone would read a cache-hit step as tiny and
-            // let the guard drift far under the real cost.
-            lastObservedPromptTokens =
-              (event.message.usage.input_tokens ?? 0) +
-              (event.message.usage.cache_read_input_tokens ?? 0) +
-              (event.message.usage.cache_creation_input_tokens ?? 0);
-          } else if (event.type === "content_block_start") {
-            blockTypes.set(event.index, event.content_block.type);
-            if (event.content_block.type === "tool_use") {
-              toolAcc.set(event.index, {
-                id: event.content_block.id,
-                name: event.content_block.name,
-                inputJson: "",
-              });
-            }
-          } else if (event.type === "content_block_delta") {
-            const delta = event.delta;
-            if (delta.type === "text_delta") {
-              textAcc.set(
-                event.index,
-                (textAcc.get(event.index) ?? "") + delta.text,
-              );
-              if (finalResultActive) {
-                bufferedText += delta.text;
-              } else {
-                pushChunk({ content: delta.text });
-              }
-            } else if (delta.type === "thinking_delta") {
-              const acc = thinkingAcc.get(event.index) ?? {
-                text: "",
-                signature: "",
-              };
-              acc.text += delta.thinking;
-              thinkingAcc.set(event.index, acc);
-              // Reasoning rides the dedicated chunk channel; `content` stays
-              // an always-present string so plain-text consumers are safe.
-              pushChunk({ content: "", reasoning: delta.thinking });
-            } else if (delta.type === "signature_delta") {
-              const acc = thinkingAcc.get(event.index) ?? {
-                text: "",
-                signature: "",
-              };
-              acc.signature += delta.signature;
-              thinkingAcc.set(event.index, acc);
-            } else if (delta.type === "input_json_delta") {
-              const acc = toolAcc.get(event.index);
-              if (acc) {
-                acc.inputJson += delta.partial_json;
-              }
-            }
-          } else if (event.type === "message_delta") {
-            stopReason = event.delta.stop_reason ?? stopReason;
-            const cumulativeOutputTokens =
-              event.usage?.output_tokens ?? stepOutputTokens;
-            totalOutput += cumulativeOutputTokens - stepOutputTokens;
-            stepOutputTokens = cumulativeOutputTokens;
+      // Wrapped rather than folded into the adapter: analytics emission and
+      // tool-execution storage fire ONCE PER STEP in the loop this replaces,
+      // and buildToolResultMessages is the only per-step hook — it receives
+      // exactly that step's results. Doing this from the turn's final result
+      // instead would batch every step's tools into one late write.
+      const adapter: typeof baseAdapter = {
+        ...baseAdapter,
+        buildToolResultMessages: (
+          conversation,
+          stepResult,
+          toolResults,
+          engineStep,
+        ) => {
+          for (const result of toolResults) {
+            toolsUsed.push(result.name);
           }
-        }
-        lastStop = stopReason;
-
-        // final_result is terminal: its arguments ARE the answer, so the turn
-        // ends here and any tool calls issued alongside it are not executed
-        // (parity with the native Vertex loops). It is never executed as a
-        // tool, never recorded in toolsUsed, and never stored as a tool
-        // execution — the pattern stays invisible to callers.
-        if (finalResultActive) {
-          const finalCall = [...toolAcc.values()].find(
-            (acc) => acc.name === FINAL_RESULT_TOOL_NAME,
+          const toolCallsForStorage = toolResults.map((result) => ({
+            type: "tool-call" as const,
+            toolCallId: result.id,
+            toolName: result.name,
+            args: result.args,
+          }));
+          const toolResultsForStorage = toolResults.map((result) =>
+            result.error
+              ? {
+                  type: "tool-result" as const,
+                  toolCallId: result.id,
+                  toolName: result.name,
+                  error: result.error,
+                }
+              : {
+                  type: "tool-result" as const,
+                  toolCallId: result.id,
+                  toolName: result.name,
+                  result: result.output,
+                },
           );
-          if (finalCall) {
-            finalResultText = stringifyFinalResultInput(finalCall.inputJson);
-            lastStop = "end_turn";
-            logger.debug(
-              "[Anthropic] Extracted structured output from final_result tool (stream)",
-              { chars: finalResultText.length },
-            );
-            break;
-          }
-        }
-
-        if (stopReason !== "tool_use" || toolAcc.size === 0) {
-          break;
-        }
-
-        // Replay this assistant turn (thinking + text + tool_use blocks, in
-        // block order) then execute the requested tools and append their
-        // results as a user turn — the native multi-step tool loop.
-        const assistantBlocks: Anthropic.Messages.ContentBlockParam[] = [];
-        const orderedIndexes = [...blockTypes.keys()].sort((a, b) => a - b);
-        for (const idx of orderedIndexes) {
-          const type = blockTypes.get(idx);
-          if (type === "thinking") {
-            const acc = thinkingAcc.get(idx);
-            if (acc && acc.text.length > 0) {
-              assistantBlocks.push({
-                type: "thinking",
-                thinking: acc.text,
-                signature: acc.signature,
-              });
-            }
-          } else if (type === "text") {
-            const text = textAcc.get(idx);
-            if (text && text.length > 0) {
-              assistantBlocks.push({ type: "text", text });
-            }
-          } else if (type === "tool_use") {
-            const acc = toolAcc.get(idx);
-            if (acc) {
-              let input: unknown;
-              try {
-                input = acc.inputJson ? JSON.parse(acc.inputJson) : {};
-              } catch {
-                input = {};
-              }
-              assistantBlocks.push({
-                type: "tool_use",
-                id: acc.id,
-                name: acc.name,
-                input,
-              });
-            }
-          }
-        }
-        conversation.push({ role: "assistant", content: assistantBlocks });
-
-        const resultBlocks: Anthropic.Messages.ToolResultBlockParam[] = [];
-        const toolCallsForStorage: Array<{
-          type: string;
-          toolCallId: string;
-          toolName: string;
-          args: unknown;
-        }> = [];
-        const toolResultsForStorage: Array<{
-          type: string;
-          toolCallId: string;
-          toolName: string;
-          result?: unknown;
-          error?: string;
-        }> = [];
-
-        for (const acc of toolAcc.values()) {
-          let args: Record<string, unknown>;
-          try {
-            args = acc.inputJson
-              ? (JSON.parse(acc.inputJson) as Record<string, unknown>)
-              : {};
-          } catch {
-            args = {};
-          }
-          toolCallsForStorage.push({
-            type: "tool-call",
-            toolCallId: acc.id,
-            toolName: acc.name,
-            args,
+          emitToolEndFromStepFinish(
+            emitter,
+            toolResultsForStorage.map((tr) => ({
+              toolName: tr.toolName,
+              result: "result" in tr ? tr.result : undefined,
+              error: "error" in tr ? tr.error : undefined,
+            })),
+          );
+          this.handleToolExecutionStorage(
+            toolCallsForStorage,
+            toolResultsForStorage,
+            options,
+            new Date(),
+          ).catch((storageErr: unknown) => {
+            logger.warn("[AnthropicProvider] Failed to store tool executions", {
+              provider: this.providerName,
+              error:
+                storageErr instanceof Error
+                  ? storageErr.message
+                  : String(storageErr),
+            });
           });
-          toolsUsed.push(acc.name);
+          return baseAdapter.buildToolResultMessages(
+            conversation,
+            stepResult,
+            toolResults,
+            engineStep,
+          );
+        },
+      };
 
-          // Live record lookup, then deferred-catalog auto-hydration: with
-          // tools.discovery on, the model may call a cataloged tool it never
-          // loaded via search_tools — a real tool, not a hallucination.
-          const tool = (toolsRecord[acc.name] ??
-            resolveDeferredTool(toolsRecord, acc.name)) as
-            | {
-                execute?: (
-                  input: Record<string, unknown>,
-                  ctx: { toolCallId: string; messages: unknown[] },
-                ) => Promise<unknown>;
-              }
-            | undefined;
-          try {
-            if (!tool?.execute) {
-              throw new Error(`Tool not found: ${acc.name}`);
-            }
-            const result = await tool.execute(args, {
-              toolCallId: acc.id,
+      // Presented in the shape the engine dispatches through. The engine
+      // supplies `{ toolCallId, abortSignal }`; the loop this replaces also
+      // supplied `messages: []`, so it is kept — a tool that reads it would
+      // otherwise see undefined where it used to see an empty array.
+      const engineTools: Record<
+        string,
+        {
+          execute: (
+            args: Record<string, unknown>,
+            opts: unknown,
+          ) => Promise<unknown>;
+        }
+      > = {};
+      for (const [name, tool] of Object.entries(toolsRecord)) {
+        const execute = tool.execute;
+        if (!execute) {
+          continue;
+        }
+        engineTools[name] = {
+          execute: async (args: Record<string, unknown>, opts: unknown) => {
+            const ctx = opts as {
+              toolCallId?: string;
+              abortSignal?: AbortSignal;
+            };
+            return execute(args, {
+              toolCallId: ctx.toolCallId ?? "",
+              ...(ctx.abortSignal ? { abortSignal: ctx.abortSignal } : {}),
               messages: [],
-            });
-            toolResultsForStorage.push({
-              type: "tool-result",
-              toolCallId: acc.id,
-              toolName: acc.name,
-              result,
-            });
-            resultBlocks.push({
-              type: "tool_result",
-              tool_use_id: acc.id,
-              content: stringifyAnthropicToolOutput(result),
-            });
-          } catch (toolErr) {
-            const message =
-              toolErr instanceof Error ? toolErr.message : String(toolErr);
-            toolResultsForStorage.push({
-              type: "tool-result",
-              toolCallId: acc.id,
-              toolName: acc.name,
-              error: message,
-            });
-            resultBlocks.push({
-              type: "tool_result",
-              tool_use_id: acc.id,
-              content: `Error: ${message}`,
-              is_error: true,
-            });
+            } as Parameters<typeof execute>[1]);
+          },
+        };
+      }
+
+      // The active span goes with it. Before this loop moved onto the shared
+      // engine it called
+      //   withProviderRetry(fn, trace.getActiveSpan() ?? undefined, label)
+      // and that span is where gen_ai.provider.total_attempts is recorded.
+      // The engine passed `undefined` in its place, so the attribute silently
+      // stopped being emitted for every native Anthropic turn.
+      const activeSpan = trace.getActiveSpan();
+      const { stream, resultPromise } = runAgenticLoop(
+        adapter,
+        payload.messages.slice(),
+        {
+          tools: engineTools,
+          ...(abortSignal ? { abortSignal } : {}),
+          ...(activeSpan ? { span: activeSpan } : {}),
+        },
+      );
+
+      // Structured turns buffer their text rather than streaming it: a caller
+      // that passed a schema needs parseable JSON, and deltas emitted before
+      // the model calls final_result would prefix the payload with prose.
+      // Reasoning is forwarded either way — it is not part of the payload.
+      const pump = (async () => {
+        for await (const chunk of stream) {
+          if (chunk.reasoning) {
+            pushChunk({ content: "", reasoning: chunk.reasoning });
+          }
+          if (chunk.content) {
+            if (finalResultActive) {
+              bufferedText += chunk.content;
+            } else {
+              pushChunk({ content: chunk.content });
+            }
           }
         }
+      })();
 
-        // Emit tool:end events for Pipeline B and persist tool executions —
-        // the same hooks the streamText onStepFinish callback used to drive.
-        emitToolEndFromStepFinish(
-          emitter,
-          toolResultsForStorage.map((tr) => ({
-            toolName: tr.toolName,
-            result: tr.result,
-            error: tr.error,
-          })),
-        );
-        this.handleToolExecutionStorage(
-          toolCallsForStorage,
-          toolResultsForStorage,
-          options,
-          new Date(),
-        ).catch((storageErr: unknown) => {
-          logger.warn("[AnthropicProvider] Failed to store tool executions", {
-            provider: this.providerName,
-            error:
-              storageErr instanceof Error
-                ? storageErr.message
-                : String(storageErr),
-          });
-        });
+      // `pump` is detached: it starts draining the engine's channel the moment
+      // it is created, and `await pump` below is the only thing that adopts its
+      // rejection. When resultPromise rejects, that line is never reached, so
+      // pump's rejection stays unhandled — and an unhandled rejection
+      // TERMINATES the consumer's process. Measured: a caller that correctly
+      // try/catches a streaming error still died with ERR_UNHANDLED_REJECTION,
+      // exit code 1, with no way to defend against it from outside this
+      // library. The rejection carried the raw SDK error, distinct from the
+      // formatted one the caller received, which is why the existing
+      // `loopPromise.catch` guard below does not cover it.
+      //
+      // Every detached-drain site in the codebase now goes through
+      // drainDetachedPump(), which adopts the rejection and logs the reason at
+      // debug instead of discarding it silently.
+      let result;
+      try {
+        result = await resultPromise;
+      } catch (error) {
+        await drainDetachedPump(pump, "Anthropic");
+        throw error;
+      }
+      await pump;
 
-        conversation.push({ role: "user", content: resultBlocks });
+      totalInput += result.usage.inputTokens;
+      totalOutput += result.usage.outputTokens;
+      totalCacheRead += result.usage.cacheReadTokens ?? 0;
+      totalCacheWrite += result.usage.cacheWriteTokens ?? 0;
+      lastStop = result.rawStopReason ?? lastStop;
+
+      turnMetadata.finishReason = result.finishReason;
+      if (result.rawStopReason) {
+        turnMetadata.rawFinishReason = result.rawStopReason;
+      }
+      // "tool-calls" after a drained turn means the model still wanted tools
+      // when the step budget ran out — the engine breaks at maxSteps, and a
+      // model turn that finished normally maps to "stop". The one other
+      // producer of stop_reason "tool_use" at turn end is a final_result
+      // call (structured output), which `finalResultText` identifies, so it
+      // must not read as a capped turn.
+      if (
+        result.finishReason === "tool-calls" &&
+        finalResultText === undefined
+      ) {
+        turnMetadata.stopReason = "step-cap";
       }
 
       resolveUsage(buildDeferredUsage());
@@ -2443,11 +2549,11 @@ export class AnthropicProvider extends BaseProvider {
           }
         }
         timeoutController?.cleanup();
-        pushChunk({ done: true });
+        channel.close();
       });
     loopPromise.catch(() => {
       // Swallowed by design: the generator below surfaces loop errors after
-      // draining the queue; this guard only prevents an unhandled-rejection
+      // draining the channel; this guard only prevents an unhandled-rejection
       // crash when the consumer abandons the stream early.
     });
 
@@ -2455,11 +2561,7 @@ export class AnthropicProvider extends BaseProvider {
     const transformedStream = async function* () {
       let contentYielded = 0;
       try {
-        for (;;) {
-          const chunk = await nextChunk();
-          if ("done" in chunk) {
-            break;
-          }
+        for await (const chunk of channel.iterable) {
           if (
             "content" in chunk &&
             typeof chunk.content === "string" &&
@@ -2469,7 +2571,7 @@ export class AnthropicProvider extends BaseProvider {
           }
           yield chunk;
         }
-        // Surface any error the loop threw after draining the queue.
+        // Surface any error the loop threw after draining the channel.
         await loopPromise;
         // No-output path: stream completed normally but yielded zero text.
         if (contentYielded === 0 && toolsUsed.length === 0) {
@@ -2511,6 +2613,7 @@ export class AnthropicProvider extends BaseProvider {
       model: this.modelName,
       toolCalls: [],
       toolResults: [],
+      metadata: turnMetadata,
       // Wire the deferred usage/finish promises into the analytics collector
       // (mirrors openaiChatCompletionsBase). Without this the loop computed a
       // fully correct aggregate that was consumed only by the OTel span —

@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **isAnthropicConfig**(`config`): `config is AnthropicProviderConfig`
 
-Defined in: [types/providers.ts:498](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L498)
+Defined in: [types/providers.ts:618](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L618)
 
 Type guard to check if a configuration is an AnthropicProviderConfig
 

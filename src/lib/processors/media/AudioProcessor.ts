@@ -45,6 +45,10 @@ import type {
   ProcessOptions,
 } from "../../types/index.js";
 import { SIZE_LIMITS_MB } from "../config/index.js";
+import {
+  extensionsForModality,
+  mimeTypesForModality,
+} from "../config/fileTypeRegistry.js";
 import { FileErrorCode } from "../errors/index.js";
 import { withTimeout } from "../../utils/timeout.js";
 import { formatMediaDuration } from "../../utils/mediaDuration.js";
@@ -99,52 +103,30 @@ const AUDIO_CONFIG = {
 
 /**
  * Supported MIME types for audio files.
- * Covers all major audio formats including common variants and aliases.
+ *
+ * Derived from the canonical registry so this processor cannot claim a format
+ * the detector standing in front of it does not recognise. It previously did:
+ * .aiff, .amr, .ape, .wv and .oga were all declared here and all resolved to
+ * "unknown" during detection, so a file in one of those formats never reached
+ * this processor at all.
+ *
+ * `audio/webm` is appended because WebM is registered as a video container and
+ * an audio-only .webm is legitimate input. Only the MIME type is accepted, not
+ * the extension: `isFileSupported` matches on extension OR mimetype, so
+ * claiming `.webm` here made `isAudioFile("video/webm", "clip.webm")` accept a
+ * video-only WebM as audio on its filename alone.
  */
-const SUPPORTED_AUDIO_MIME_TYPES = [
-  "audio/mpeg",
-  "audio/mp3",
-  "audio/wav",
-  "audio/x-wav",
-  "audio/wave",
-  "audio/ogg",
-  "audio/vorbis",
-  "audio/opus",
-  "audio/flac",
-  "audio/x-flac",
-  "audio/mp4",
-  "audio/x-m4a",
-  "audio/aac",
-  "audio/x-ms-wma",
+const SUPPORTED_AUDIO_MIME_TYPES: readonly string[] = [
+  ...mimeTypesForModality("audio"),
   "audio/webm",
-  "audio/aiff",
-  "audio/x-aiff",
-  "audio/amr",
-  "audio/3gpp",
-] as const;
+];
 
 /**
  * Supported file extensions for audio files.
- * Includes common audio container formats and lossless variants.
+ * Derived from the canonical registry — see the note above.
  */
-const SUPPORTED_AUDIO_EXTENSIONS = [
-  ".mp3",
-  ".wav",
-  ".ogg",
-  ".oga",
-  ".opus",
-  ".flac",
-  ".m4a",
-  ".aac",
-  ".wma",
-  ".webm",
-  ".aiff",
-  ".aif",
-  ".amr",
-  ".3gp",
-  ".ape",
-  ".wv",
-] as const;
+const SUPPORTED_AUDIO_EXTENSIONS: readonly string[] =
+  extensionsForModality("audio");
 
 // =============================================================================
 // AUDIO PROCESSOR CLASS
@@ -439,34 +421,82 @@ export class AudioProcessor extends BaseFileProcessor<ProcessedAudio> {
     }
 
     try {
-      // Dynamic imports to avoid loading these modules when transcription is not needed
-      const [{ createOpenAI }, { experimental_transcribe }] = await Promise.all(
-        [import("@ai-sdk/openai"), import("../../utils/generation.js")],
-      );
+      // Native multipart POST to OpenAI's transcription endpoint. This used to
+      // go through @ai-sdk/openai's createOpenAI().transcription() plus the ai
+      // package's experimental_transcribe; both were dropped, and this is the
+      // only wire behaviour of theirs the processor ever depended on. The same
+      // request is already made natively by voice/providers/OpenAISTT.ts.
+      // Only `text` is read off the response, as before.
+      const baseUrl = (
+        process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1"
+      ).replace(/\/+$/, "");
 
-      const openai = createOpenAI({ apiKey });
-      const model = openai.transcription("whisper-1");
+      const form = new FormData();
+      form.append(
+        "file",
+        new Blob([new Uint8Array(buffer)], {
+          type: mimetype || "audio/mpeg",
+        }),
+        filename,
+      );
+      form.append("model", "whisper-1");
+      form.append("response_format", "verbose_json");
 
       // Wrap in withTimeout — large audio files can take a while, but a
       // stalled request shouldn't block the processor forever. A TimeoutError
       // lands in the same handler as other failures below, which reports it as
       // the reason rather than discarding it.
-      const result = await withTimeout(
-        experimental_transcribe({
-          model,
-          audio: buffer,
-        }),
+      // `withTimeout` only races the promise against a timer — it cannot
+      // cancel the operation. This code owns the raw fetch now, so without an
+      // abort the socket and its in-flight upload (up to 25MB) stay alive
+      // after the timeout has already resolved the caller.
+      const transcriptionAbort = new AbortController();
+      const transcriptionTimer = setTimeout(
+        () => transcriptionAbort.abort(),
         AUDIO_CONFIG.TRANSCRIPTION_TIMEOUT_MS,
-        "openai-whisper",
-        "generate",
       );
+      let response: Response;
+      try {
+        response = await withTimeout(
+          fetch(`${baseUrl}/audio/transcriptions`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${apiKey}` },
+            body: form,
+            signal: transcriptionAbort.signal,
+          }),
+          AUDIO_CONFIG.TRANSCRIPTION_TIMEOUT_MS,
+          "openai-whisper",
+          "generate",
+        );
+      } finally {
+        clearTimeout(transcriptionTimer);
+      }
 
-      if (result.text && result.text.trim().length > 0) {
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        // Mirrors the old behaviour: a non-2xx used to surface as a thrown
+        // APICallError caught by the handler below and reported as the reason.
+        return skipped(
+          `transcription request failed — HTTP ${response.status}${
+            detail ? `: ${detail.slice(0, 200)}` : ""
+          }`,
+        );
+      }
+
+      const payload: unknown = await response.json();
+      const rawText =
+        typeof payload === "object" &&
+        payload !== null &&
+        typeof (payload as { text?: unknown }).text === "string"
+          ? (payload as { text: string }).text
+          : "";
+
+      if (rawText.trim().length > 0) {
         logger.debug(
-          `[AudioProcessor] Transcribed ${filename} via openai-whisper (${result.text.trim().length} chars)`,
+          `[AudioProcessor] Transcribed ${filename} via openai-whisper (${rawText.trim().length} chars)`,
         );
         return {
-          transcript: result.text.trim(),
+          transcript: rawText.trim(),
           hasTranscript: true,
           transcriptionProvider: "openai-whisper",
           transcriptionSkippedReason: undefined,

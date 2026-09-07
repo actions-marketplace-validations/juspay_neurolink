@@ -17,13 +17,13 @@ const nodeBuiltins = [
 const npmStubs = [
   'sharp','canvas','ffmpeg-static','ffprobe-static','@resvg/resvg-wasm','satori','satori-html',
   'better-sqlite3','node-pty','redis','@google-cloud/text-to-speech','google-auth-library',
-  '@google-cloud/vertexai','cors','fastify','fastify-plugin','express','koa','@fastify/cors',
+  'cors','fastify','fastify-plugin','express','koa','@fastify/cors',
   'mammoth','pdf-parse','exceljs','adm-zip','tar-stream','music-metadata','fluent-ffmpeg',
   'pptxgenjs','csv-parser','@juspay/hippocampus','@aws-sdk/client-bedrock',
   '@aws-sdk/client-bedrock-runtime','@aws-sdk/client-sagemaker-runtime','@hapi/bourne',
   'ajv','ajv-formats','chardet','debug','iconv-lite','inherits','ip-address','pkce-challenge','qs',
   'which','pdf-to-img','express-rate-limit','@hono/node-server','powershell-utils',
-  'wsl-utils','default-browser','default-browser-id','run-applescript','open',
+  'wsl-utils','default-browser','default-browser-id','run-applescript',
   '@langfuse/langfuse','undici','bullmq','croner','ioredis',
   // Optional peer of @anthropic-ai/sdk's beta webhooks module (server-only
   // webhook signature verification) — irrelevant in the browser bundle.
@@ -230,7 +230,7 @@ const PROXY_STUB_JS = `
 const handler={get(t,p){if(p==='__esModule')return true;if(p==='default')return new Proxy({},{get:handler.get});return new Proxy(function(...a){return new Proxy({},{get:handler.get})},{get:handler.get,apply(t,th,a){return new Proxy({},{get:handler.get})},construct(t,a){return new Proxy({},{get:handler.get})}})}};
 const mod=new Proxy({},handler);
 export default mod;
-export const {BedrockClient,ListFoundationModelsCommand,BedrockRuntimeClient,ConverseCommand,ConverseStreamCommand,ImageFormat}=mod;
+export const {BedrockClient,ListFoundationModelsCommand,BedrockRuntimeClient,ConverseCommand,ConverseStreamCommand,ImageFormat,InvokeModelCommand}=mod;
 export const {SageMakerRuntimeClient,InvokeEndpointCommand,InvokeEndpointWithResponseStreamCommand}=mod;
 export const {GoogleAuth,VertexAI,TextToSpeechClient}=mod;
 export const {Webhook}=mod;
@@ -319,10 +319,10 @@ const catchAllPlugin = {
 
     build.onResolve({ filter: /.*/ }, (args) => {
       const p = args.path;
-      if (p.startsWith('.') || p.startsWith('/')) return undefined;
-      if (isNodeBuiltin(p)) return { path: p, namespace: 'node-stub' };
-      if (isOtel(p)) return { path: p, namespace: 'otel-stub' };
-      if (isNpmStub(p) || isHono(p)) return { path: p, namespace: 'npm-stub' };
+      if (p.startsWith('.') || p.startsWith('/')) {return undefined;}
+      if (isNodeBuiltin(p)) {return { path: p, namespace: 'node-stub' };}
+      if (isOtel(p)) {return { path: p, namespace: 'otel-stub' };}
+      if (isNpmStub(p) || isHono(p)) {return { path: p, namespace: 'npm-stub' };}
       return undefined;
     });
 
@@ -334,35 +334,73 @@ const catchAllPlugin = {
 
 // Build
 const dev = process.argv.includes('--dev');
+const outFile = dev ? 'dist/browser/neurolink.js' : 'dist/browser/neurolink.min.js';
 
+// Bundle WITHOUT minification first. esbuild's minifier renames every local
+// identifier that isn't part of the module's public surface — including its
+// own `__esm` / `__getOwnPropNames` helper names — so a regex written against
+// those literal names can never match minified output. Patching has to run on
+// the unminified bundle; minification (when not --dev) happens afterwards as
+// a separate transform over the already-patched source, so the injected
+// try/catch survives renamed but functionally intact.
 const result = await esbuild.build({
   entryPoints: ['./src/browser/entry.ts'],
   bundle: true,
   platform: 'neutral',
   format: 'esm',
-  outfile: dev ? 'dist/browser/neurolink.js' : 'dist/browser/neurolink.min.js',
   target: 'es2022',
   logLimit: 0,
-  minify: !dev,
+  minify: false,
   treeShaking: true,
   plugins: [catchAllPlugin],
   loader: { '.ts': 'ts' },
   nodePaths: ['./node_modules'],
+  write: false,
 });
 
-const outFile = dev ? 'dist/browser/neurolink.js' : 'dist/browser/neurolink.min.js';
+const unminifiedSrc = result.outputFiles[0].text;
 
-// Post-process: patch __esm to be resilient to init failures
-const originalSrc = readFileSync(outFile, 'utf8');
-// Match esbuild's __esm pattern and wrap the init call in try/catch
-const patchedSrc = originalSrc.replace(
-  /var __esm\s*=\s*\(fn,\s*res\)\s*=>\s*function __init\(\)\s*\{\s*return fn\s*&&\s*\(res\s*=\s*\(0,\s*fn\[__getOwnPropNames\(fn\)\[0\]\]\)\(fn\s*=\s*0\)\),\s*res;\s*\}/,
-  `var __esm = (fn, res) => function __init() { try { return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res; } catch(e) { console.warn("[NeuroLink:browser] module init skipped:", String(e)); fn = 0; return res; } }`
-);
-if (patchedSrc === originalSrc) {
-  console.warn('[NeuroLink:browser] Warning: __esm pattern not found, patch not applied');
+// Post-process: patch __esm to be resilient to module init failures.
+// Current esbuild emits (fn, res, err) and RETHROWS on failure (both on the
+// first call and, via `if (err) throw err[0]`, on every call after) — the
+// opposite of the swallow-and-continue behaviour this bundle depends on to
+// survive its ~40 stubbed Node builtins and ~35 stubbed npm packages.
+const esmPattern =
+  /var __esm = \(fn, res, err\) => function __init\(\) \{\s*if \(err\) throw err\[0\];\s*try \{\s*return fn && \(res = \(0, fn\[__getOwnPropNames\(fn\)\[0\]\]\)\(fn = 0\)\), res;\s*\} catch \(e\) \{\s*throw err = \[e\], e;\s*\}\s*\};/;
+
+if (!esmPattern.test(unminifiedSrc)) {
+  console.error(
+    '[NeuroLink:browser] FATAL: __esm pattern not found — esbuild\'s emitted lazy-init ' +
+      'wrapper shape has changed again. The resilience patch (try/catch around module init ' +
+      'so stubbed builtins/packages cannot crash the whole bundle) was NOT applied. Update ' +
+      'the `esmPattern` regex in scripts/build-browser.mjs to match the new shape before ' +
+      'shipping this bundle.',
+  );
+  process.exit(1);
 }
-writeFileSync(outFile, patchedSrc);
+
+const patchedSrc = unminifiedSrc.replace(
+  esmPattern,
+  `var __esm = (fn, res, err) => function __init() {
+  try {
+    return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+  } catch (e) {
+    console.warn("[NeuroLink:browser] module init skipped:", String(e));
+    fn = 0;
+    return res;
+  }
+};`,
+);
+
+// Minify the already-patched source as a separate pass so the try/catch we
+// just injected survives (with its identifiers renamed, same as everything
+// else) instead of never being written to a file that gets minified out from
+// under it.
+const finalSrc = dev
+  ? patchedSrc
+  : (await esbuild.transform(patchedSrc, { minify: true, target: 'es2022', loader: 'js' })).code;
+
+writeFileSync(outFile, finalSrc);
 
 const raw = readFileSync(outFile);
 const gz = gzipSync(raw);

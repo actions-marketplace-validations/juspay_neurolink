@@ -13,7 +13,7 @@ description: Use when adding tests for a new modality (vision/embeddings/TTS/STT
 
 Tests are **plain `tsx` scripts** — no Jest/Vitest. Every suite is a single
 `test/continuous-test-suite-<domain>.ts` file invoked via
-`npx tsx <path>` or `pnpm run test:<domain>`. All shared logic lives in
+`pnpm exec tsx <path>` or `pnpm run test:<domain>`. All shared logic lives in
 `test/helpers/*.ts`. The harness defines a tri-state result:
 
 - **PASS** — test fn returns/resolves normally
@@ -92,7 +92,7 @@ import "dotenv/config";
  *
  * <1-3 sentence description of what's covered>
  *
- * Run: pnpm run build && npx tsx test/continuous-test-suite-<name>.ts
+ * Run: pnpm run build && pnpm exec tsx test/continuous-test-suite-<name>.ts
  *      pnpm run test:<name>
  */
 
@@ -204,8 +204,9 @@ exactly these files:
      are forbidden — they swallow real bugs. Tag the framing with the
      provider name (`/\[my-provider\]\s+error:\s*…/`) or with the exact
      wording from the upstream SDK (`/specific framing/`).
-   - Add a fixture in `test/helpers/envGuard.test.ts`. Patterns with zero
-     coverage fail `pnpm run test:envguard`.
+   - There is no longer a coverage self-check for these patterns
+     (`envGuard.test.ts` was removed with the unit suites), so read the
+     warning at the top of `envGuard.ts` and verify the anchor by hand.
 
 ### Verify
 
@@ -213,7 +214,6 @@ exactly these files:
 pnpm run build
 pnpm run test:matrix --provider=new-provider
 pnpm run test:new-providers --provider=new-provider
-pnpm run test:envguard
 ```
 
 ---
@@ -348,8 +348,8 @@ broke triage:
 
 Always route through `isExpectedProviderError(msg)` from
 `./helpers/harness.js`. If it doesn't catch your case, extend
-`EXPECTED_PROVIDER_ERROR_PATTERNS` with an anchored regex and add a
-fixture to `envGuard.test.ts`.
+`EXPECTED_PROVIDER_ERROR_PATTERNS` with an anchored regex. There is no
+fixture suite to add to any more — anchor it tightly and check by hand.
 
 ---
 
@@ -367,7 +367,7 @@ Add the new `test:<name>` script alias to `package.json` and slot it
 into the right pipeline string. Example for a new live suite:
 
 ```jsonc
-"test:my-feature": "npx tsx test/continuous-test-suite-my-feature.ts",
+"test:my-feature": "pnpm exec tsx test/continuous-test-suite-my-feature.ts",
 "test:live": "pnpm run test:providers && ... && pnpm run test:my-feature"
 ```
 
@@ -384,7 +384,7 @@ pnpm run envguard      # envGuard pattern coverage (80/80 must PASS)
 pnpm run build         # CLI + SDK
 
 # Direct invocation of the affected suite:
-npx tsx test/continuous-test-suite-<name>.ts --provider=<p>
+pnpm exec tsx test/continuous-test-suite-<name>.ts --provider=<p>
 
 # If you added a provider:
 pnpm run test:matrix
@@ -421,8 +421,8 @@ them and they must not return:
       `providerRegistry.ts` (rule 1). Dynamic-import inside the factory.
 - [ ] Hard-coded `1x1` PNG placeholders for vision tests. Use real
       fixtures under `test/fixtures/`.
-- [ ] Added a SKIP pattern to `envGuard.ts` without a corresponding
-      fixture in `envGuard.test.ts`.
+- [ ] Added a loose SKIP pattern to `envGuard.ts`. Nothing tests these any
+      more, and an overmatching pattern turns real failures into silent skips.
 - [ ] Mixed `test()` and `recordTest()` forms within one suite.
 - [ ] Forgot the `finally { await sdk.shutdown?.()... }` cleanup. Leaked
       SDK instances starve subsequent tests of subprocess slots.
@@ -443,7 +443,7 @@ When in doubt, copy the existing canonical example:
 | Live half + e2e half in one suite    | `test/continuous-test-suite-autoresearch.ts`       |
 | New-provider smoke shape             | `test/continuous-test-suite-new-providers.ts`      |
 | Real fixture multimodal              | `test/continuous-test-suite-new-providers.ts` (C1) |
-| Anchored skip pattern + fixture      | `test/helpers/envGuard.ts` + `envGuard.test.ts`    |
+| Anchored skip pattern                | `test/helpers/envGuard.ts`                         |
 
 For the full inventory of suites, tiers, and shared infrastructure,
 read `test/README.md`. This skill summarises the **how**; that file

@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ConversationData** = [`RedisConversationObject`](RedisConversationObject.md) & `object`
 
-Defined in: [types/conversation.ts:570](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/conversation.ts#L570)
+Defined in: [types/conversation.ts:687](https://github.com/juspay/neurolink/blob/release/src/lib/types/conversation.ts#L687)
 
 Full conversation data for session restoration and manipulation
 Extends Redis storage object with additional loop mode metadata

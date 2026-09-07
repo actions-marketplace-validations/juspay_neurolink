@@ -185,13 +185,16 @@ export type OpenAICompatChatStreamChunk = {
   usage?: OpenAICompatUsage;
 };
 
+export type OpenAICompatErrorMessage = string | ReadonlyArray<{ msg?: string }>;
+
 export type OpenAICompatErrorBody = {
   error?: {
-    message?: string;
+    message?: OpenAICompatErrorMessage;
     type?: string;
     code?: string | number;
     param?: string | null;
   };
+  detail?: string;
 };
 
 export type OpenAICompatConfig = {
@@ -265,14 +268,18 @@ export type OpenAICompatSSEResult = {
     | "content_filter"
     | null;
   usage?: OpenAICompatUsage;
+  /** Response id from the first stream chunk that carried one. */
+  id?: string;
+  /** Served model from the first stream chunk that carried one. */
+  model?: string;
 };
 
 // Reasoning deltas ride alongside an always-present (empty) `content` string
 // so every existing `chunk.content` consumer stays type- and crash-safe;
-// reasoning-aware consumers read `chunk.reasoning`.
-export type OpenAICompatStreamChunk =
-  | { content: string; reasoning?: string }
-  | { done: true };
+// reasoning-aware consumers read `chunk.reasoning`. Stream completion used to
+// be signaled in-band via a `{done: true}` member of this union; that is now
+// carried out-of-band by `StreamChannel.close()` (see streamChannel.ts).
+export type OpenAICompatStreamChunk = { content: string; reasoning?: string };
 
 // Per-execution tool record kept internally during the streaming multi-step
 // loop. Public shape lives in `ToolExecutionSummary` (src/lib/types/tools.ts).
@@ -305,6 +312,8 @@ export type StreamLoopArgs = {
   toolsUsed: string[];
   toolExecutionSummaries: ToolExecutionSummaryInternal[];
   pushChunk: (chunk: OpenAICompatStreamChunk) => void;
+  /** Signals the channel that no further chunks will arrive (success or error path alike). */
+  closeChannel: () => void;
   resolveUsage: (u: {
     promptTokens: number;
     completionTokens: number;

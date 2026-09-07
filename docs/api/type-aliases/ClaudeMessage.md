@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **ClaudeMessage** = `object`
 
-Defined in: [types/proxy.ts:89](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L89)
+Defined in: [types/proxy.ts:102](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L102)
 
 A single message in a Claude conversation.
 
@@ -18,7 +18,7 @@ A single message in a Claude conversation.
 
 > **role**: `"user"` \| `"assistant"`
 
-Defined in: [types/proxy.ts:90](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L90)
+Defined in: [types/proxy.ts:103](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L103)
 
 ---
 
@@ -26,4 +26,4 @@ Defined in: [types/proxy.ts:90](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **content**: `string` \| [`ClaudeContentBlock`](ClaudeContentBlock.md)[]
 
-Defined in: [types/proxy.ts:91](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L91)
+Defined in: [types/proxy.ts:104](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L104)

@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **SageMakerGenerationResponse** = `object`
 
-Defined in: [types/providers.ts:1349](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1349)
+Defined in: [types/providers.ts:1701](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1701)
 
 Generation response from SageMaker
 
@@ -18,7 +18,7 @@ Generation response from SageMaker
 
 > **text**: `string`
 
-Defined in: [types/providers.ts:1351](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1351)
+Defined in: [types/providers.ts:1703](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1703)
 
 Generated text content
 
@@ -28,7 +28,7 @@ Generated text content
 
 > **usage**: [`SageMakerUsage`](SageMakerUsage.md)
 
-Defined in: [types/providers.ts:1353](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1353)
+Defined in: [types/providers.ts:1705](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1705)
 
 Token usage information
 
@@ -38,7 +38,7 @@ Token usage information
 
 > **finishReason**: `"stop"` \| `"length"` \| `"tool-calls"` \| `"content-filter"` \| `"unknown"`
 
-Defined in: [types/providers.ts:1355](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1355)
+Defined in: [types/providers.ts:1707](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1707)
 
 Finish reason for generation
 
@@ -48,7 +48,7 @@ Finish reason for generation
 
 > `optional` **toolCalls?**: [`SageMakerToolCall`](SageMakerToolCall.md)[]
 
-Defined in: [types/providers.ts:1357](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1357)
+Defined in: [types/providers.ts:1709](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1709)
 
 Tool calls made during generation
 
@@ -58,7 +58,7 @@ Tool calls made during generation
 
 > `optional` **toolResults?**: [`SageMakerToolResult`](SageMakerToolResult.md)[]
 
-Defined in: [types/providers.ts:1359](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1359)
+Defined in: [types/providers.ts:1711](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1711)
 
 Tool results if tools were executed
 
@@ -68,7 +68,7 @@ Tool results if tools were executed
 
 > `optional` **metadata?**: `Record`\<`string`, `unknown`\>
 
-Defined in: [types/providers.ts:1361](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1361)
+Defined in: [types/providers.ts:1713](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1713)
 
 Additional metadata
 
@@ -78,6 +78,6 @@ Additional metadata
 
 > `optional` **modelVersion?**: `string`
 
-Defined in: [types/providers.ts:1363](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1363)
+Defined in: [types/providers.ts:1715](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1715)
 
 Model version or identifier

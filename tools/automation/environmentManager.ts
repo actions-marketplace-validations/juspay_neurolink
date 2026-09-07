@@ -9,6 +9,20 @@
 import fs from "fs/promises";
 import path from "path";
 import crypto from "crypto";
+import { PROVIDER_DESCRIPTORS } from "../../src/lib/factories/providerDescriptors.js";
+import { satisfiesFallbacks } from "../../src/lib/utils/providerConfig.js";
+
+/** Parsed contents of a .env-style file: raw key/value string pairs. */
+type EnvMap = Record<string, string>;
+
+/** Report produced by {@link EnvironmentManager.validateEnvironment}. */
+type EnvironmentValidation = {
+  configured: string[];
+  missing: string[];
+  providers: Record<string, boolean>;
+  warnings: string[];
+  recommendations: string[];
+};
 
 class EnvironmentManager {
   envFile: string;
@@ -172,11 +186,11 @@ class EnvironmentManager {
     }
   }
 
-  async parseEnvFile(filePath: string) {
+  async parseEnvFile(filePath: string): Promise<EnvMap> {
     try {
       const content = await fs.readFile(filePath, "utf-8");
       const lines = content.split("\n");
-      const env = {};
+      const env: EnvMap = {};
 
       for (const line of lines) {
         const trimmed = line.trim();
@@ -241,29 +255,32 @@ class EnvironmentManager {
     }
   }
 
-  async validateEnvironment() {
+  async validateEnvironment(): Promise<EnvironmentValidation> {
     console.log("\n🔍 Validating environment configuration...");
 
     const env = await this.parseEnvFile(this.envFile);
 
-    const validation = {
+    const providers: Record<string, boolean> = {};
+    for (const d of PROVIDER_DESCRIPTORS) {
+      if (d.envVars.optional || d.localRuntime) {
+        providers[d.name] =
+          d.name === "ollama" ? await this.checkOllamaStatus() : true;
+        continue;
+      }
+      const { apiKey, fallbacks, extraRequired, extraRequiredFallbacks } =
+        d.envVars;
+      const hasPrimary =
+        !!apiKey && (!!env[apiKey] || (fallbacks ?? []).some((v) => !!env[v]));
+      const requiredOk =
+        (extraRequired ?? []).every((v) => !!env[v]) ||
+        satisfiesFallbacks(extraRequiredFallbacks, env);
+      providers[d.name] = hasPrimary && requiredOk;
+    }
+
+    const validation: EnvironmentValidation = {
       configured: [],
       missing: [],
-      providers: {
-        openai: !!env.OPENAI_API_KEY,
-        anthropic: !!env.ANTHROPIC_API_KEY,
-        "google-ai": !!env.GOOGLE_AI_API_KEY,
-        vertex: !!(
-          env.GOOGLE_APPLICATION_CREDENTIALS ||
-          env.GOOGLE_SERVICE_ACCOUNT_KEY ||
-          env.GOOGLE_AUTH_CLIENT_EMAIL
-        ),
-        bedrock: !!(env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY),
-        azure: !!(env.AZURE_OPENAI_API_KEY && env.AZURE_OPENAI_ENDPOINT),
-        huggingface: !!env.HUGGINGFACE_API_KEY,
-        ollama: await this.checkOllamaStatus(),
-        mistral: !!env.MISTRAL_API_KEY,
-      },
+      providers,
       warnings: [],
       recommendations: [],
     };
@@ -313,11 +330,16 @@ class EnvironmentManager {
     }
   }
 
-  reportValidation(validation: any) {
+  reportValidation(validation: EnvironmentValidation) {
     console.log("\n📊 ENVIRONMENT VALIDATION RESULTS");
     console.log("=".repeat(50));
-    console.log(`✅ Configured providers: ${validation.configured.length}/9`);
-    console.log(`⚠️  Missing providers: ${validation.missing.length}/9`);
+    const totalProviders = Object.keys(validation.providers).length;
+    console.log(
+      `✅ Configured providers: ${validation.configured.length}/${totalProviders}`,
+    );
+    console.log(
+      `⚠️  Missing providers: ${validation.missing.length}/${totalProviders}`,
+    );
 
     if (validation.configured.length > 0) {
       console.log(`\n🟢 Configured providers:`);
@@ -352,13 +374,14 @@ class EnvironmentManager {
     );
   }
 
-  calculateScore(validation: any) {
+  calculateScore(validation: EnvironmentValidation) {
     const configuredWeight = 70; // 70% for having providers configured
     const diversityWeight = 20; // 20% for provider diversity
     const bestPracticeWeight = 10; // 10% for following best practices
 
+    const totalProviders = Object.keys(validation.providers).length;
     const configuredScore =
-      (validation.configured.length / 9) * configuredWeight;
+      (validation.configured.length / totalProviders) * configuredWeight;
     const diversityScore =
       Math.min(validation.configured.length / 3, 1) * diversityWeight;
     const bestPracticeScore = validation.configured.includes("openai")

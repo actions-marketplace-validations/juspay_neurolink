@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **prepareRAGTool**(`ragConfig`, `fallbackProvider?`): `Promise`\<[`RAGPreparedTool`](../type-aliases/RAGPreparedTool.md)\>
 
-Defined in: [rag/ragIntegration.ts:189](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/rag/ragIntegration.ts#L189)
+Defined in: [rag/ragIntegration.ts:181](https://github.com/juspay/neurolink/blob/release/src/lib/rag/ragIntegration.ts#L181)
 
 Prepare RAG tools from the provided configuration.
 

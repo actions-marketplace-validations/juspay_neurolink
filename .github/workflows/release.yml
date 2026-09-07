@@ -31,24 +31,21 @@ jobs:
           cache: "pnpm"
           registry-url: https://registry.npmjs.org/
 
-      - name: Install ffmpeg
-        uses: AnimMouse/setup-ffmpeg@v1
-        with:
-          # Pin to a known-good release, matching ci.yml. The unpinned default
-          # resolves to a version BtbN/FFmpeg-Builds has no Linux asset for, so
-          # the download 404s and fails the job at extract ("xz: (stdin): File
-          # format not recognized"). Revert once upstream publishes it.
-          version: "7.1"
-
-      - name: Verify ffmpeg installation
-        run: |
-          echo "🎬 Verifying ffmpeg installation..."
-          ffmpeg -version || {
-            echo "❌ ffmpeg installation failed!"
-            echo "Please check the setup-ffmpeg action configuration."
-            exit 1
-          }
-          echo "✅ ffmpeg installed successfully"
+      # ffmpeg is deliberately NOT installed in this workflow. Nothing these
+      # jobs run needs it: no package script invokes it, and src/ shells out to
+      # ffmpeg only at runtime (frame extraction, video merge, audio playback),
+      # never during install, lint, typecheck, build or pack. provider-safety-net
+      # has always built and run its suites without it.
+      #
+      # Removed after the apt install broke CI three ways in one day: a corrupt
+      # published asset, a version pin that stopped resolving, and an Ubuntu
+      # mirror returning Ign: for every index while apt sat for 14 minutes.
+      # Because build-check is a required check, each of those blocked every
+      # open pull request on a dependency none of these jobs use.
+      #
+      # If a job here ever runs a suite that genuinely exercises media, install
+      # ffmpeg in THAT job only, and bound every wait (DPkg::Lock::Timeout,
+      # Acquire::*::Timeout) plus a step timeout-minutes.
 
       - name: Install dependencies
         run: pnpm i
@@ -86,25 +83,6 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           cache: "pnpm"
 
-      - name: Install ffmpeg
-        uses: AnimMouse/setup-ffmpeg@v1
-        with:
-          # Pin to a known-good release, matching ci.yml. The unpinned default
-          # resolves to a version BtbN/FFmpeg-Builds has no Linux asset for, so
-          # the download 404s and fails the job at extract ("xz: (stdin): File
-          # format not recognized"). Revert once upstream publishes it.
-          version: "7.1"
-
-      - name: Verify ffmpeg installation
-        run: |
-          echo "🎬 Verifying ffmpeg installation..."
-          ffmpeg -version || {
-            echo "❌ ffmpeg installation failed!"
-            echo "Please check the setup-ffmpeg action configuration."
-            exit 1
-          }
-          echo "✅ ffmpeg installed successfully"
-
       - name: Upgrade npm for native OIDC publish support
         run: |
           npx -y npm@11 install -g npm@11
@@ -120,7 +98,7 @@ jobs:
         run: pnpm run build:action
 
       - name: Release with semantic-release
-        run: npx semantic-release
+        run: pnpm exec semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HUSKY: "0" # Disable git hooks during automated release commits

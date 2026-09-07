@@ -2,6 +2,7 @@ import type {
   ProxyActivitySnapshot,
   ProxyResponseTerminalOutcome,
   ProxyResponseTrackingObserver,
+  RequestLogEntry,
 } from "../types/index.js";
 import { withTimeout } from "../utils/async/withTimeout.js";
 import { logger } from "../utils/logger.js";
@@ -10,6 +11,54 @@ const PROXY_RESPONSE_CANCEL_TIMEOUT_MS = 1_000;
 
 let activeRequests = 0;
 let lastActivityAtMs: number | null = null;
+
+// Route handlers can attach terminal observers to their request context without
+// wrapping the response body a second time. The HTTP runtime drains every
+// response through one tracker, which fans these observers out at the point
+// where bytes actually leave the proxy.
+const responseObserversByMetadata = new WeakMap<
+  object,
+  ProxyResponseTrackingObserver[]
+>();
+
+const finalLogObservers = new Map<string, (entry: RequestLogEntry) => void>();
+
+/** Join route accounting to the HTTP lifecycle without relying on write order. */
+export function observeProxyFinalLog(
+  requestId: string,
+  observer: (entry: RequestLogEntry) => void,
+): () => void {
+  finalLogObservers.set(requestId, observer);
+  return () => {
+    if (finalLogObservers.get(requestId) === observer) {
+      finalLogObservers.delete(requestId);
+    }
+  };
+}
+
+export function notifyProxyFinalLog(entry: RequestLogEntry): void {
+  finalLogObservers.get(entry.requestId)?.(entry);
+}
+
+export function registerProxyResponseObserver(
+  metadata: object,
+  observer: ProxyResponseTrackingObserver,
+): void {
+  const existing = responseObserversByMetadata.get(metadata);
+  if (existing) {
+    existing.push(observer);
+    return;
+  }
+  responseObserversByMetadata.set(metadata, [observer]);
+}
+
+export function takeProxyResponseObservers(
+  metadata: object,
+): ProxyResponseTrackingObserver[] {
+  const observers = responseObserversByMetadata.get(metadata) ?? [];
+  responseObserversByMetadata.delete(metadata);
+  return observers;
+}
 
 function touchActivity(): void {
   lastActivityAtMs = Date.now();
@@ -73,14 +122,16 @@ export function trackProxyResponse(
   observer?: ProxyResponseTrackingObserver,
 ): Response {
   if (!response.body) {
-    finishRequest();
-    safelyNotifyObserver(() =>
-      observer?.onTerminal?.({
+    try {
+      const notified = observer?.onTerminal?.({
         outcome: "bodyless",
         observedBodyBytes: 0,
         responseChunks: 0,
-      }),
-    );
+      });
+      void Promise.resolve(notified).then(finishRequest, finishRequest);
+    } catch {
+      finishRequest();
+    }
     return response;
   }
 
@@ -88,20 +139,38 @@ export function trackProxyResponse(
   let observedBodyBytes = 0;
   let responseChunks = 0;
   let settled = false;
+  let sourceClosed = false;
+  // A framework can cancel its adapter after the upstream stream has already
+  // closed. Snapshot reader.closed before cancel() so that normal cleanup is
+  // not recorded as a client-aborted request.
+  void reader.closed.then(
+    () => {
+      sourceClosed = true;
+    },
+    () => undefined,
+  );
 
-  const settle = (outcome: ProxyResponseTerminalOutcome): void => {
+  const settle = (
+    outcome: ProxyResponseTerminalOutcome,
+    error?: unknown,
+  ): void => {
     if (settled) {
       return;
     }
     settled = true;
-    finishRequest();
-    safelyNotifyObserver(() =>
-      observer?.onTerminal?.({
+    // Keep drain accounting open through bounded terminal bookkeeping, but
+    // never hold back the client's response body while telemetry is written.
+    try {
+      const notified = observer?.onTerminal?.({
         outcome,
+        error,
         observedBodyBytes,
         responseChunks,
-      }),
-    );
+      });
+      void Promise.resolve(notified).then(finishRequest, finishRequest);
+    } catch {
+      finishRequest();
+    }
   };
 
   const trackedBody = new ReadableStream<Uint8Array>({
@@ -125,12 +194,16 @@ export function trackProxyResponse(
           );
         }
       } catch (error) {
-        settle("stream_error");
+        settle("stream_error", error);
         controller.error(error);
       }
     },
     async cancel(reason) {
-      settle("client_cancelled");
+      // Read the state before cancelling: reader.cancel() itself rejects the
+      // closed promise for a genuinely active source, which is too late to
+      // distinguish it from a source that had already ended normally.
+      await Promise.resolve();
+      settle(sourceClosed ? "completed" : "client_cancelled");
       await withTimeout(
         reader.cancel(reason),
         PROXY_RESPONSE_CANCEL_TIMEOUT_MS,

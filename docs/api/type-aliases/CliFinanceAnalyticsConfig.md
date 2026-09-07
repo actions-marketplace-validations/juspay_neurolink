@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **CliFinanceAnalyticsConfig** = `object`
 
-Defined in: [types/cli.ts:1664](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1664)
+Defined in: [types/cli.ts:1834](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1834)
 
 Analytics config for the finance evaluation domain.
 
@@ -18,7 +18,7 @@ Analytics config for the finance evaluation domain.
 
 > **trackRiskMetrics**: `boolean`
 
-Defined in: [types/cli.ts:1665](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1665)
+Defined in: [types/cli.ts:1835](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1835)
 
 ---
 
@@ -26,7 +26,7 @@ Defined in: [types/cli.ts:1665](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **trackRegulatory**: `boolean`
 
-Defined in: [types/cli.ts:1666](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1666)
+Defined in: [types/cli.ts:1836](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1836)
 
 ---
 
@@ -34,4 +34,4 @@ Defined in: [types/cli.ts:1666](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **trackPortfolioImpact**: `boolean`
 
-Defined in: [types/cli.ts:1667](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/cli.ts#L1667)
+Defined in: [types/cli.ts:1837](https://github.com/juspay/neurolink/blob/release/src/lib/types/cli.ts#L1837)

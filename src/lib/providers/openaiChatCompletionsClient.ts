@@ -26,7 +26,6 @@ import type {
   OpenAICompatMessageContent,
   OpenAICompatResponseFormat,
   OpenAICompatSSEResult,
-  OpenAICompatStreamChunk,
   OpenAICompatToolCallWire,
   OpenAICompatToolChoiceWire,
   OpenAICompatUsage,
@@ -203,18 +202,22 @@ export const stringifyToolOutput = (output: unknown): string => {
   }
 };
 
-export const imageDataToURL = (data: unknown): string | undefined => {
+export const imageDataToURL = (
+  data: unknown,
+  mediaType?: string,
+): string | undefined => {
+  const mime = mediaType && mediaType.includes("/") ? mediaType : "image/png";
   if (typeof data === "string") {
     if (data.startsWith("data:") || /^https?:\/\//i.test(data)) {
       return data;
     }
-    return `data:image/png;base64,${data}`;
+    return `data:${mime};base64,${data}`;
   }
   if (data instanceof URL) {
     return data.toString();
   }
   if (data instanceof Uint8Array) {
-    return `data:image/png;base64,${Buffer.from(data).toString("base64")}`;
+    return `data:${mime};base64,${Buffer.from(data).toString("base64")}`;
   }
   return undefined;
 };
@@ -251,6 +254,21 @@ export const convertContentForOpenAI = (
       const url = imageDataToURL(data);
       if (url) {
         out.push({ type: "image_url", image_url: { url } });
+      }
+    } else if (p.type === "file") {
+      // ai@6 delivers images as FILE parts ({type:"file", mediaType, data}),
+      // not "image" parts. The hand-rolled client that replaced
+      // @ai-sdk/openai-compatible only handled "image"/"image_url", so every
+      // image reaching a catalog provider was silently dropped — the wire
+      // carried a text-only message (found live on sambanova/gemma-4-31B-it,
+      // 2026-08-28; affected xai vision too). Non-image file parts are still
+      // skipped: the OpenAI chat wire format has no generic file slot.
+      const fp = part as { mediaType?: string; data?: unknown };
+      if (fp.mediaType?.startsWith("image/")) {
+        const url = imageDataToURL(fp.data, fp.mediaType);
+        if (url) {
+          out.push({ type: "image_url", image_url: { url } });
+        }
       }
     }
   }
@@ -620,7 +638,12 @@ export const buildBody = (
   if (tools) {
     body.tools = tools;
   }
-  if (toolChoice !== undefined) {
+  // tool_choice is only meaningful alongside a non-empty tools array, and
+  // strict OpenAI-compatible backends (probed live on Cerebras 2026-08-27)
+  // reject it outright with 400 wrong_api_format when tools are absent:
+  // "'tool_choice' is only allowed when 'tools' are specified". Omitting it
+  // is behavior-identical on lenient backends.
+  if (toolChoice !== undefined && tools && tools.length > 0) {
     body.tool_choice = toolChoice;
   }
   if (responseFormat) {
@@ -665,6 +688,12 @@ export const parseSSEStream = async (
     }
     if (chunk.usage) {
       result.usage = chunk.usage;
+    }
+    if (chunk.id && !result.id) {
+      result.id = chunk.id;
+    }
+    if (chunk.model && !result.model) {
+      result.model = chunk.model;
     }
     const choice = chunk.choices?.[0];
     if (!choice) {
@@ -731,6 +760,26 @@ export const parseSSEStream = async (
   return result;
 };
 
+function extractOpenAICompatErrorMessage(
+  parsed: OpenAICompatErrorBody | undefined,
+): string | undefined {
+  const message = parsed?.error?.message;
+  if (typeof message === "string" && message.trim().length > 0) {
+    return message;
+  }
+  if (Array.isArray(message)) {
+    const pydanticMessages = message
+      .map((item) => item.msg?.trim())
+      .filter((item): item is string => item !== undefined && item.length > 0);
+    if (pydanticMessages.length > 0) {
+      return pydanticMessages.join("; ");
+    }
+  }
+  return typeof parsed?.detail === "string" && parsed.detail.trim().length > 0
+    ? parsed.detail
+    : undefined;
+}
+
 export const buildAPIError = async (
   url: string,
   body: OpenAICompatChatRequest,
@@ -747,7 +796,7 @@ export const buildAPIError = async (
     parsed = undefined;
   }
   const msg =
-    parsed?.error?.message ??
+    extractOpenAICompatErrorMessage(parsed) ??
     `OpenAI-compatible request failed with status ${res.status}`;
   const err = new Error(msg) as Error & {
     statusCode?: number;
@@ -796,32 +845,6 @@ export const createDeferredAnalytics = () => {
     resolveFinish = r;
   });
   return { usagePromise, finishPromise, resolveUsage, resolveFinish };
-};
-
-// Single-producer / single-consumer chunk queue. The streaming loop pushes
-// `{content}` deltas as they arrive from SSE and a final `{done:true}` when
-// it finishes; the consumer's AsyncIterable pulls from `nextChunk()`.
-export const createChunkQueue = () => {
-  const chunkQueue: OpenAICompatStreamChunk[] = [];
-  let pendingResolve: ((chunk: OpenAICompatStreamChunk) => void) | undefined;
-  const pushChunk = (c: OpenAICompatStreamChunk) => {
-    if (pendingResolve) {
-      const r = pendingResolve;
-      pendingResolve = undefined;
-      r(c);
-    } else {
-      chunkQueue.push(c);
-    }
-  };
-  const nextChunk = (): Promise<OpenAICompatStreamChunk> =>
-    new Promise((resolve) => {
-      if (chunkQueue.length > 0) {
-        resolve(chunkQueue.shift() as OpenAICompatStreamChunk);
-      } else {
-        pendingResolve = resolve;
-      }
-    });
-  return { pushChunk, nextChunk };
 };
 
 export const mergeUsage = (

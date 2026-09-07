@@ -9,7 +9,11 @@ import {
   IMAGE_GENERATION_MODELS,
   TOOL_STORAGE_TIMEOUT_MS,
 } from "../../core/constants.js";
-import { processUnifiedFilesArray } from "../../utils/messageBuilder.js";
+import {
+  mergeMediaFileAliases,
+  normalizeVisionImageFormats,
+  processUnifiedFilesArray,
+} from "../../utils/messageBuilder.js";
 import type { NeuroLink } from "../../neurolink.js";
 import {
   ATTR,
@@ -44,6 +48,11 @@ import {
 } from "../../types/index.js";
 import { ERROR_CODES, NeuroLinkError } from "../../utils/errorHandling.js";
 import { logger } from "../../utils/logger.js";
+import { drainDetachedPump } from "../../utils/drainDetachedPump.js";
+import { createGeminiLoopAdapter } from "../../core/geminiLoopAdapter.js";
+import { runAgenticLoop } from "../../core/loopEngine.js";
+import { DEFAULT_TOOL_MAX_RETRIES } from "../../core/constants.js";
+import { isToolsSchemaExclusionInForce } from "../../core/modules/structuredOutputPolicy.js";
 import {
   GEMINI_ELISION_NOTE,
   planGeminiLoopReclaim,
@@ -63,33 +72,30 @@ import { estimateTokens } from "../../utils/tokenEstimation.js";
 import { transformToolExecutions } from "../../utils/transformationUtils.js";
 import { resolveToolExecutionRecords } from "../../core/toolExecutionRecorder.js";
 import {
+  buildDedupedEngineTools,
   buildGeminiResponseSchema,
   buildNativeConfig,
-  buildNativeToolDeclarations,
-  collectStreamChunks,
-  collectStreamChunksIncremental,
   computeMaxSteps,
   createContextGuard,
-  createTextChannel,
   buildUserPartsWithMultimodal,
-  executeNativeToolCalls,
-  extractTextFromParts,
   extractThoughtSignature,
   handleMaxStepsTermination,
   prependConversationMessages,
-  pushModelResponseToHistory,
-  refreshNativeToolDeclarations,
-  DedupExecuteMap,
 } from "../googleNativeGemini3/index.js";
-import { createProxyFetch } from "../../proxy/proxyFetch.js";
-import type { LanguageModel, Schema, Tool } from "../../types/index.js";
+import { createStreamChannel } from "../../core/streamChannel.js";
+import { toNativeToolDeclarations } from "../../core/nativeToolFormat.js";
+import { warnGoogleSdkIgnoresProxy } from "../../proxy/proxyFetch.js";
+import type { LanguageModel, Schema } from "../../types/index.js";
 
 // Google AI Live API types now imported from ../types/providerSpecific.js
 
 // Import proper types for multimodal message handling
 
 // Create Google GenAI client
-async function createGoogleGenAIClient(apiKey: string): Promise<GenAIClient> {
+async function createGoogleGenAIClient(
+  apiKey: string,
+  baseURL?: string,
+): Promise<GenAIClient> {
   const mod: unknown = await import("@google/genai");
   const ctor = (mod as Record<string, unknown>).GoogleGenAI as unknown;
   if (!ctor) {
@@ -103,11 +109,21 @@ async function createGoogleGenAIClient(apiKey: string): Promise<GenAIClient> {
     });
   }
   const Ctor = ctor as GoogleGenAIClass;
-  // Include httpOptions with proxy fetch for corporate network support
+  // httpOptions carries the endpoint override and nothing else. It used to
+  // also pass a proxy fetch, which the SDK silently ignored — see
+  // warnGoogleSdkIgnoresProxy for why that is not fixable here.
+  //
+  // baseUrl is only included when resolved — verified against
+  // @google/genai's ApiClient (dist/node/index.cjs) that it falls back to
+  // its own default whenever httpOptions.baseUrl is undefined, so omitting
+  // the key and passing `baseUrl: undefined` behave identically; the key is
+  // still omitted outright for a cleaner outbound config object.
+  warnGoogleSdkIgnoresProxy("GoogleAIStudio");
+
   return new Ctor({
     apiKey,
     httpOptions: {
-      fetch: createProxyFetch(),
+      ...(baseURL ? { baseUrl: baseURL } : {}),
     },
   });
 }
@@ -226,12 +242,12 @@ function reclaimAiStudioContext(
 }
 
 export class GoogleAIStudioProvider extends BaseProvider {
-  private credentials?: { apiKey?: string };
+  private credentials?: { apiKey?: string; baseURL?: string };
 
   constructor(
     modelName?: string,
     sdk?: unknown,
-    credentials?: { apiKey?: string },
+    credentials?: { apiKey?: string; baseURL?: string },
   ) {
     super(
       modelName,
@@ -374,6 +390,14 @@ export class GoogleAIStudioProvider extends BaseProvider {
   protected async executeImageGeneration(
     options: TextGenerationOptions,
   ): Promise<EnhancedGenerateResult> {
+    // Image-to-image generation takes reference images through the same
+    // `input.images` array, and generate() routes here BEFORE reaching its own
+    // normalization call — so a reference photo in HEIC/BMP/AVIF would arrive
+    // at the API untranscoded. Normalizing at the top of this method covers
+    // every route in, rather than relying on each caller to remember.
+    // Idempotent, so a request that was already normalized pays nothing.
+    await normalizeVisionImageFormats(options.input);
+
     const prompt = options.prompt || options.input?.text || "";
     const imageModelName = options.model || this.modelName;
     const startTime = Date.now();
@@ -388,7 +412,7 @@ export class GoogleAIStudioProvider extends BaseProvider {
     // Use the @google/genai client for image generation
     let client: GenAIClient;
     try {
-      client = await createGoogleGenAIClient(apiKey);
+      client = await createGoogleGenAIClient(apiKey, this.getBaseURL());
     } catch {
       throw new AuthenticationError(
         "Missing '@google/genai'. Install with: npm install @google/genai",
@@ -696,6 +720,55 @@ export class GoogleAIStudioProvider extends BaseProvider {
   }
 
   // executeGenerate removed - BaseProvider handles all generation with tools
+  /**
+   * Run the file preprocessing this provider's native paths depend on.
+   *
+   * AI Studio overrides both `generate()` and `executeStream()` and routes
+   * straight to the native SDK, so neither reaches
+   * `buildMultimodalMessagesArray` — the place that turns `input.files` into
+   * text, images, PDFs and `nativeAudioFiles`. `BaseProvider.stream()` does
+   * build messages, but onto a throwaway clone whose result is discarded, so
+   * the real `options.input` came through untouched.
+   *
+   * The consequence was asymmetric and easy to miss: `generate()` did this
+   * inline and worked, while `stream()` silently dropped every attached file —
+   * not just audio, but the metadata summary too. Vertex hit the identical bug
+   * (#1258) and solved it with exactly this shape, called from both entry
+   * points.
+   */
+  private async preprocessNativeFileInput(
+    options: TextGenerationOptions | StreamOptions,
+  ): Promise<void> {
+    // The user-facing aliases (`input.audioFiles`, `input.videoFiles`) are
+    // folded into `input.files` here, exactly as the Vertex client does. Only
+    // `files` is processed below, so without this a caller who used the
+    // documented `audioFiles` field had it silently ignored on both of this
+    // provider's paths.
+    if (options.input) {
+      mergeMediaFileAliases(options.input);
+    }
+    if (options.input?.files && options.input.files.length > 0) {
+      try {
+        // Mutates options.input.text / .images / .pdfFiles / .nativeAudioFiles
+        // in place.
+        await processUnifiedFilesArray(
+          options as Parameters<typeof processUnifiedFilesArray>[0],
+          100 * 1024 * 1024,
+          this.providerName,
+        );
+      } catch (fileError) {
+        logger.warn(
+          `[GoogleAIStudio] processUnifiedFilesArray threw, continuing without file content: ${fileError instanceof Error ? fileError.message : String(fileError)}`,
+        );
+      }
+    }
+
+    // Runs even without input.files: a caller can populate input.images
+    // directly, and this native path never reaches the shared multimodal
+    // builder that would otherwise normalize the formats.
+    await normalizeVisionImageFormats(options.input);
+  }
+
   protected async executeStream(
     options: StreamOptions,
     analysisSchema?: ZodUnknownSchema | Schema<unknown>,
@@ -707,9 +780,14 @@ export class GoogleAIStudioProvider extends BaseProvider {
       return await this.executeAudioStreamViaGeminiLive(options);
     }
 
+    // #1258, for this provider: stream() must run the same file preprocessing
+    // generate() does, or attached files are dropped on this path alone.
+    await this.preprocessNativeFileInput(options);
+
     // Structured output (analysisSchema, JSON format, or schema) is incompatible with tools on Gemini.
-    const wantsStructuredOutput =
-      analysisSchema || options.output?.format === "json" || options.schema;
+    const wantsStructuredOutput = Boolean(
+      analysisSchema || options.output?.format === "json" || options.schema,
+    );
 
     // Tool filter (a0269210): trust options.tools — caller (BaseProvider.stream)
     // already merged MCP/built-in tools with user tools and applied any
@@ -725,14 +803,15 @@ export class GoogleAIStudioProvider extends BaseProvider {
       tools: optionTools,
     };
 
-    // Check for tools + JSON schema conflict (Gemini limitation)
+    // Tools + JSON conflict (Gemini), via the shared predicate.
     const wantsJsonOutput = options.output?.format === "json" || options.schema;
-    if (
-      wantsJsonOutput &&
-      mergedOptions.tools &&
-      Object.keys(mergedOptions.tools).length > 0 &&
-      !mergedOptions.disableTools
-    ) {
+    const exclusionInForce = isToolsSchemaExclusionInForce(
+      this.providerName,
+      modelName,
+      !mergedOptions.disableTools,
+      Object.keys(mergedOptions.tools ?? {}).length,
+    );
+    if (wantsJsonOutput && exclusionInForce) {
       logger.warn(
         "[GoogleAIStudio] Gemini does not support tools and JSON schema output simultaneously. Disabling tools for this request.",
       );
@@ -790,7 +869,10 @@ export class GoogleAIStudioProvider extends BaseProvider {
 
         try {
           const apiKey = this.getApiKey();
-          const client = await createGoogleGenAIClient(apiKey);
+          const client = await createGoogleGenAIClient(
+            apiKey,
+            this.getBaseURL(),
+          );
 
           logger.debug(
             "[GoogleAIStudio] Using native @google/genai for Gemini 3",
@@ -831,8 +913,6 @@ export class GoogleAIStudioProvider extends BaseProvider {
 
           // Convert tools
           let toolsConfig: NativeToolsConfig | undefined;
-          let executeMap: Map<string, Tool["execute"]> = new DedupExecuteMap();
-          let originalNameMap = new Map<string, string>();
           let declarationsResult: NativeToolDeclarationsResult | undefined;
 
           if (
@@ -840,11 +920,12 @@ export class GoogleAIStudioProvider extends BaseProvider {
             Object.keys(options.tools).length > 0 &&
             !options.disableTools
           ) {
-            const result = buildNativeToolDeclarations(options.tools);
+            const result = toNativeToolDeclarations(
+              options.tools,
+              "functionDeclarations",
+            );
             declarationsResult = result;
             toolsConfig = result.toolsConfig;
-            executeMap = result.executeMap;
-            originalNameMap = result.originalNameMap;
 
             logger.debug("[GoogleAIStudio] Converted tools for native SDK", {
               toolCount: toolsConfig[0].functionDeclarations.length,
@@ -886,7 +967,7 @@ export class GoogleAIStudioProvider extends BaseProvider {
 
           // Create a push-based text channel so the caller receives tokens as
           // they arrive from the network rather than after full buffering.
-          const channel = createTextChannel();
+          const channel = createStreamChannel<{ content: string }>();
 
           // Shared mutable state updated by the background agentic loop.
           const allToolCalls: Array<{
@@ -929,11 +1010,6 @@ export class GoogleAIStudioProvider extends BaseProvider {
             let totalCacheReadTokens = 0;
             let totalReasoningTokens = 0;
             let step = 0;
-            let completedWithFinalAnswer = false;
-            const failedTools = new Map<
-              string,
-              { count: number; lastError: string }
-            >();
             // Cheap trigger for the in-turn reclaim, mirroring the Vertex twin.
             // Planning serializes the WHOLE accumulated history to estimate it,
             // so running it unconditionally charges that once per step for the
@@ -946,145 +1022,118 @@ export class GoogleAIStudioProvider extends BaseProvider {
 
             try {
               // Agentic loop for tool calling
-              while (step < maxSteps) {
-                // In-turn context guard: this loop appends a model turn plus a
-                // tool turn every step with nothing bounding growth. No-op
-                // while the request still fits, so a loop that fits never pays
-                // a cache invalidation. Step 0 still plans unconditionally —
-                // the guard has no usage to go on yet, and the incoming history
-                // can already be oversized before the first call.
-                if (step === 0 || contextGuard.shouldStop()) {
+              // The turn itself now runs on the shared engine: the step cap,
+              // tool dispatch, the failure breaker and usage accumulation are
+              // engine-owned. Everything below is the provider half — building
+              // one request, and the per-step side effects the old loop
+              // performed inline.
+              const baseAdapter = createGeminiLoopAdapter({
+                providerLabel: "GoogleAIStudio",
+                maxSteps,
+                // Same threshold the hand-rolled dispatcher used, which is
+                // what makes an always-failing tool dispatch exactly twice.
+                toolFailureBreaker: { maxRetries: DEFAULT_TOOL_MAX_RETRIES },
+                liveTools: options.tools ?? {},
+                ...(declarationsResult
+                  ? { declarations: declarationsResult }
+                  : {}),
+                buildRequest: (contents) => ({
+                  model: modelName,
+                  contents,
+                  config,
+                  ...(composedSignal
+                    ? { httpOptions: { signal: composedSignal } }
+                    : {}),
+                }),
+                sendStep: async (request) =>
+                  client.models.generateContentStream(
+                    request as Parameters<
+                      typeof client.models.generateContentStream
+                    >[0],
+                  ),
+                noteUsage: (inputTokens, outputTokens) => {
+                  contextGuard.noteUsage(inputTokens, outputTokens);
+                },
+                // Pure: the engine assigns what this returns. The old loop
+                // reclaimed in place because it owned `currentContents`.
+                planReclaim: (contents, stepIndex) => {
+                  if (stepIndex !== 0 && !contextGuard.shouldStop()) {
+                    return undefined;
+                  }
+                  const working = [...contents];
                   if (
-                    reclaimAiStudioContext(
-                      currentContents,
+                    !reclaimAiStudioContext(
+                      working,
                       modelName,
                       contextGuard.projectedNextPromptTokens,
                     )
                   ) {
-                    contextGuard.resetAfterReclaim();
+                    return undefined;
                   }
-                }
-                if (composedSignal?.aborted) {
-                  throw composedSignal.reason instanceof Error
-                    ? composedSignal.reason
-                    : new Error("Request aborted");
-                }
-                step++;
-                // Mid-turn discovery sync: advertise tools hydrated into the
-                // live record by search_tools during the previous step.
-                if (declarationsResult) {
-                  refreshNativeToolDeclarations(
-                    options.tools,
-                    declarationsResult,
-                  );
-                }
-                logger.debug(
-                  `[GoogleAIStudio] Native SDK step ${step}/${maxSteps}`,
-                );
+                  contextGuard.resetAfterReclaim();
+                  return { conversation: working };
+                },
+              });
 
-                try {
-                  const rawStream = await client.models.generateContentStream({
-                    model: modelName,
-                    contents: currentContents,
-                    config,
-                    ...(composedSignal
-                      ? { httpOptions: { signal: composedSignal } }
-                      : {}),
-                  });
-
-                  // For every step, use incremental collection so text parts
-                  // are pushed to the channel as they arrive.  For intermediate
-                  // steps (those that produce function calls) we still need the
-                  // complete rawResponseParts for pushModelResponseToHistory,
-                  // which collectStreamChunksIncremental provides at stream end.
-                  const chunkResult = await collectStreamChunksIncremental(
-                    rawStream,
-                    channel,
-                  );
-                  totalInputTokens += chunkResult.inputTokens;
-                  totalOutputTokens += chunkResult.outputTokens;
-                  totalCacheReadTokens += chunkResult.cacheReadTokens ?? 0;
-                  totalReasoningTokens += chunkResult.reasoningTokens ?? 0;
-                  // `inputTokens` is this step's promptTokenCount — the FULL
-                  // prompt size for the request just made, which is what the
-                  // guard projects the next request from.
-                  contextGuard.noteUsage(
-                    chunkResult.inputTokens,
-                    chunkResult.outputTokens,
-                  );
-
-                  const stepText = extractTextFromParts(
-                    chunkResult.rawResponseParts,
-                  );
-
-                  // If no function calls, this was the final step — channel
-                  // already received all text parts incrementally.
-                  if (chunkResult.stepFunctionCalls.length === 0) {
-                    completedWithFinalAnswer = true;
-                    break;
-                  }
-
-                  lastStepText = stepText;
-
-                  // Record tool call events on the span
-                  for (const fc of chunkResult.stepFunctionCalls) {
+              // Wrapped because these fire once PER STEP in the loop this
+              // replaces, and buildToolResultMessages is the only hook that
+              // runs per step with exactly that step's results. Reading them
+              // off the turn's final result would batch every step into one
+              // late write and lose the per-step thought signature.
+              const adapter: typeof baseAdapter = {
+                ...baseAdapter,
+                buildToolResultMessages: (
+                  contents,
+                  stepResult,
+                  toolResults,
+                  engineStep,
+                ) => {
+                  // The engine's own step, not a count of times this hook ran.
+                  // The two agree only while nothing skips the hook mid-turn:
+                  // a malformed-call retry `continue`s before it and still
+                  // consumes a step, so a self-incrementing counter drifts by
+                  // exactly the number of retries and mislabels every row
+                  // after the first. Values are unchanged for this provider
+                  // today — it enables no such retry — and stay correct if it
+                  // ever does.
+                  step = engineStep + 1;
+                  for (const call of stepResult.toolCalls) {
                     span.addEvent("gen_ai.tool_call", {
-                      "tool.name": fc.name as string,
+                      "tool.name": call.name,
                       "tool.step": step,
                     });
                   }
-
-                  logger.debug(
-                    `[GoogleAIStudio] Executing ${chunkResult.stepFunctionCalls.length} function calls`,
-                  );
-
-                  // Add model response with ALL parts (including thoughtSignature) to history
-                  pushModelResponseToHistory(
-                    currentContents,
-                    chunkResult.rawResponseParts,
-                    chunkResult.stepFunctionCalls,
-                  );
-
-                  const toolCallsBefore = allToolCalls.length;
-                  const toolExecsBefore = toolExecutions.length;
-                  const functionResponses = await executeNativeToolCalls(
-                    "[GoogleAIStudio]",
-                    chunkResult.stepFunctionCalls,
-                    executeMap,
-                    failedTools,
-                    allToolCalls,
-                    {
-                      abortSignal: composedSignal,
-                      originalNameMap,
-                      toolExecutions,
-                      liveTools: options.tools,
-                      declarations: declarationsResult,
-                    },
-                  );
-
-                  // Persist this step's tool calls/results into conversation
-                  // memory. Without this, tool_call / tool_result rows never
-                  // reach Redis and the chat-history UI loses every tool
-                  // invocation.
-                  const stepToolCalls = allToolCalls.slice(toolCallsBefore);
-                  const stepToolExecs = toolExecutions.slice(toolExecsBefore);
-                  if (stepToolCalls.length > 0 || stepToolExecs.length > 0) {
+                  lastStepText = stepResult.text || lastStepText;
+                  for (const call of stepResult.toolCalls) {
+                    allToolCalls.push({
+                      toolName: call.name,
+                      args: call.args,
+                    });
+                  }
+                  for (const result of toolResults) {
+                    toolExecutions.push({
+                      name: result.name,
+                      input: result.args,
+                      output: result.output,
+                    });
+                  }
+                  if (toolResults.length > 0) {
                     const stepThoughtSig = extractThoughtSignature(
-                      chunkResult.rawResponseParts,
+                      stepResult.raw.rawResponseParts,
                     );
                     withTimeout(
                       this.handleToolExecutionStorage(
-                        stepToolCalls.map((tc, i) => ({
-                          toolName: tc.toolName,
-                          args: tc.args,
+                        stepResult.toolCalls.map((call, i) => ({
+                          toolName: call.name,
+                          args: call.args,
                           ...(i === 0 && stepThoughtSig
                             ? { thoughtSignature: stepThoughtSig }
                             : {}),
                           stepIndex: step,
                         })),
-                        stepToolExecs.map((te) => ({
-                          toolName: te.name,
-                          output: te.output,
+                        toolResults.map((result) => ({
+                          toolName: result.name,
+                          output: result.output,
                           stepIndex: step,
                         })),
                         options,
@@ -1104,29 +1153,69 @@ export class GoogleAIStudioProvider extends BaseProvider {
                       );
                     });
                   }
-
-                  // Add function responses to history — the @google/genai SDK
-                  // only accepts "user" and "model" as valid roles in contents.
-                  // Function/tool responses must use role: "user" (matching the
-                  // SDK's own automaticFunctionCalling implementation).
-                  currentContents.push({
-                    role: "user",
-                    parts: functionResponses as unknown[],
-                  });
+                  const next = baseAdapter.buildToolResultMessages(
+                    contents,
+                    stepResult,
+                    toolResults,
+                    engineStep,
+                  );
                   // Project this step's growth: the appended tool results ride
                   // the next prompt, which the provider has not reported on yet.
                   try {
+                    const appended = next[next.length - 1];
                     contextGuard.noteAppendedChars(
-                      JSON.stringify(functionResponses).length,
+                      JSON.stringify(appended?.parts ?? []).length,
                     );
                   } catch {
                     /* estimation is best-effort — never break the loop */
                   }
-                } catch (error) {
-                  logger.error("[GoogleAIStudio] Native SDK error", error);
-                  throw this.handleProviderError(error);
+                  return next;
+                },
+              };
+
+              // Through the turn's DedupExecuteMap, NOT the raw executors:
+              // `.get()` returns the dedup wrapper that answers an identical
+              // repeated {name, args} from the per-turn cache (BZ-3327).
+              const engineTools = buildDedupedEngineTools(
+                declarationsResult,
+                options.tools,
+              );
+
+              const { stream: engineStream, resultPromise } = runAgenticLoop(
+                adapter,
+                currentContents,
+                {
+                  tools: engineTools,
+                  ...(composedSignal ? { abortSignal: composedSignal } : {}),
+                },
+              );
+
+              const pump = (async () => {
+                for await (const chunk of engineStream) {
+                  channel.push(chunk);
                 }
+              })();
+
+              let engineResult;
+              try {
+                engineResult = await resultPromise;
+              } catch (error) {
+                await drainDetachedPump(pump, "GoogleAIStudio");
+                logger.error("[GoogleAIStudio] Native SDK error", error);
+                throw this.handleProviderError(error);
               }
+              await pump;
+
+              totalInputTokens += engineResult.usage.inputTokens;
+              totalOutputTokens += engineResult.usage.outputTokens;
+              totalCacheReadTokens += engineResult.usage.cacheReadTokens ?? 0;
+              totalReasoningTokens += engineResult.usage.reasoningTokens ?? 0;
+              // The turn produced a final answer when the model stopped
+              // calling tools of its own accord, rather than being cut off at
+              // the cap.
+              const completedWithFinalAnswer =
+                engineResult.toolCalls.length === 0 ||
+                engineResult.finishReason !== "tool-calls";
 
               // Handle max-steps termination: if the model was still calling
               // tools when we hit the limit, push a synthetic final message.
@@ -1141,7 +1230,7 @@ export class GoogleAIStudioProvider extends BaseProvider {
                   lastStepText,
                 );
                 if (fallback) {
-                  channel.push(fallback);
+                  channel.push({ content: fallback });
                 }
               }
 
@@ -1268,7 +1357,10 @@ export class GoogleAIStudioProvider extends BaseProvider {
 
         try {
           const apiKey = this.getApiKey();
-          const client = await createGoogleGenAIClient(apiKey);
+          const client = await createGoogleGenAIClient(
+            apiKey,
+            this.getBaseURL(),
+          );
 
           logger.debug(
             "[GoogleAIStudio] Using native @google/genai for Gemini 3 generate",
@@ -1310,20 +1402,48 @@ export class GoogleAIStudioProvider extends BaseProvider {
 
           // Convert tools (a0269210: trust options.tools — already merged + filtered upstream)
           let toolsConfig: NativeToolsConfig | undefined;
-          let executeMap: Map<string, Tool["execute"]> = new DedupExecuteMap();
-          let originalNameMap = new Map<string, string>();
           let declarationsResult: NativeToolDeclarationsResult | undefined;
 
           const shouldUseTools = !options.disableTools;
-          if (shouldUseTools) {
+          // Structured output (JSON format or schema) is incompatible with
+          // tools on Gemini — routed through the shared predicate so this
+          // decision matches stream()'s orchestrator (previously this path
+          // had no proactive check and silently dropped the schema instead).
+          const wantsNativeJsonRequested = Boolean(
+            options.output?.format === "json" || options.schema,
+          );
+          const exclusionInForce = isToolsSchemaExclusionInForce(
+            this.providerName,
+            modelName,
+            shouldUseTools,
+            Object.keys(options.tools || {}).length,
+          );
+          if (wantsNativeJsonRequested && exclusionInForce) {
+            logger.warn(
+              "[GoogleAIStudio] Gemini does not support tools and JSON schema output simultaneously. Disabling tools for this request (generate()).",
+            );
+          }
+          // Both conjuncts, matching the warning directly above and the
+          // stream path's gate. `isToolsSchemaExclusionInForce` answers "does
+          // the tools/schema exclusion APPLY to this provider and model", and
+          // is true for any Gemini request that has tools at all — it is not
+          // "the exclusion is triggered". Testing `!exclusionInForce` alone
+          // therefore made this branch reachable only when there were NO
+          // tools, so every caller-supplied tool was dropped on the generate
+          // path whether or not structured output was ever requested.
+          if (
+            shouldUseTools &&
+            !(wantsNativeJsonRequested && exclusionInForce)
+          ) {
             const tools = options.tools || {};
 
             if (Object.keys(tools).length > 0) {
-              const result = buildNativeToolDeclarations(tools);
+              const result = toNativeToolDeclarations(
+                tools,
+                "functionDeclarations",
+              );
               declarationsResult = result;
               toolsConfig = result.toolsConfig;
-              executeMap = result.executeMap;
-              originalNameMap = result.originalNameMap;
 
               logger.debug(
                 "[GoogleAIStudio] Converted tools for native SDK generate",
@@ -1340,9 +1460,7 @@ export class GoogleAIStudioProvider extends BaseProvider {
           // Native JSON / schema enforcement (generate path). Mirrors the
           // stream block above; only set when no tools are being sent
           // because Gemini cannot combine function calling with JSON mime.
-          const wantsNativeJson =
-            !toolsConfig &&
-            (options.output?.format === "json" || !!options.schema);
+          const wantsNativeJson = !toolsConfig && wantsNativeJsonRequested;
           const nativeResponseSchema =
             wantsNativeJson && options.schema
               ? buildGeminiResponseSchema(options.schema as ZodUnknownSchema)
@@ -1382,132 +1500,101 @@ export class GoogleAIStudioProvider extends BaseProvider {
             output: unknown;
           }> = [];
           let step = 0;
-          const failedTools = new Map<
-            string,
-            { count: number; lastError: string }
-          >();
           // Cheap reclaim trigger — see the stream twin.
           const contextGuard = createContextGuard(
             getContextWindowSize("googleAiStudio", modelName),
           );
 
           // Agentic loop for tool calling
-          while (step < maxSteps) {
-            // In-turn context guard — see the stream twin.
-            if (step === 0 || contextGuard.shouldStop()) {
+          // Same shared engine as the streaming twin. This path has no
+          // consumer channel — generate() returns one result rather than
+          // streaming — so the engine's stream is drained and discarded, and
+          // the turn's text comes from the result.
+          const baseAdapter = createGeminiLoopAdapter({
+            providerLabel: "GoogleAIStudio",
+            maxSteps,
+            toolFailureBreaker: { maxRetries: DEFAULT_TOOL_MAX_RETRIES },
+            liveTools: options.tools ?? {},
+            ...(declarationsResult ? { declarations: declarationsResult } : {}),
+            buildRequest: (contents) => ({
+              model: modelName,
+              contents,
+              config,
+              ...(composedSignal
+                ? { httpOptions: { signal: composedSignal } }
+                : {}),
+            }),
+            sendStep: async (request) =>
+              client.models.generateContentStream(
+                request as Parameters<
+                  typeof client.models.generateContentStream
+                >[0],
+              ),
+            noteUsage: (inputTokens, outputTokens) => {
+              contextGuard.noteUsage(inputTokens, outputTokens);
+            },
+            planReclaim: (contents, stepIndex) => {
+              if (stepIndex !== 0 && !contextGuard.shouldStop()) {
+                return undefined;
+              }
+              const working = [...contents];
               if (
-                reclaimAiStudioContext(
-                  currentContents,
+                !reclaimAiStudioContext(
+                  working,
                   modelName,
                   contextGuard.projectedNextPromptTokens,
                 )
               ) {
-                contextGuard.resetAfterReclaim();
+                return undefined;
               }
-            }
-            if (composedSignal?.aborted) {
-              throw composedSignal.reason instanceof Error
-                ? composedSignal.reason
-                : new Error("Request aborted");
-            }
-            step++;
-            // Mid-turn discovery sync — see the stream twin.
-            if (declarationsResult) {
-              refreshNativeToolDeclarations(options.tools, declarationsResult);
-            }
-            logger.debug(
-              `[GoogleAIStudio] Native SDK generate step ${step}/${maxSteps}`,
-            );
+              contextGuard.resetAfterReclaim();
+              return { conversation: working };
+            },
+          });
 
-            try {
-              const stream = await client.models.generateContentStream({
-                model: modelName,
-                contents: currentContents,
-                config,
-                ...(composedSignal
-                  ? { httpOptions: { signal: composedSignal } }
-                  : {}),
-              });
-
-              const chunkResult = await collectStreamChunks(stream);
-              totalInputTokens += chunkResult.inputTokens;
-              totalOutputTokens += chunkResult.outputTokens;
-              totalCacheReadTokens += chunkResult.cacheReadTokens ?? 0;
-              totalReasoningTokens += chunkResult.reasoningTokens ?? 0;
-              contextGuard.noteUsage(
-                chunkResult.inputTokens,
-                chunkResult.outputTokens,
-              );
-
-              const stepText = extractTextFromParts(
-                chunkResult.rawResponseParts,
-              );
-
-              // If no function calls, we're done
-              if (chunkResult.stepFunctionCalls.length === 0) {
-                finalText = stepText;
-                break;
-              }
-
-              lastStepText = stepText;
-
-              // Record tool call events on the span
-              for (const fc of chunkResult.stepFunctionCalls) {
+          const adapter: typeof baseAdapter = {
+            ...baseAdapter,
+            buildToolResultMessages: (
+              contents,
+              stepResult,
+              toolResults,
+              engineStep,
+            ) => {
+              // Same as the streaming twin: the engine's step, not a count of
+              // hook invocations. See the comment there.
+              step = engineStep + 1;
+              for (const call of stepResult.toolCalls) {
                 span.addEvent("gen_ai.tool_call", {
-                  "tool.name": fc.name as string,
+                  "tool.name": call.name,
                   "tool.step": step,
                 });
+                allToolCalls.push({ toolName: call.name, args: call.args });
               }
-
-              logger.debug(
-                `[GoogleAIStudio] Executing ${chunkResult.stepFunctionCalls.length} function calls in generate`,
-              );
-
-              // Add model response with ALL parts (including thoughtSignature) to history
-              // This is critical for Gemini 3 - it requires thought signatures in subsequent turns
-              pushModelResponseToHistory(
-                currentContents,
-                chunkResult.rawResponseParts,
-                chunkResult.stepFunctionCalls,
-              );
-
-              const toolCallsBefore = allToolCalls.length;
-              const toolExecsBefore = toolExecutions.length;
-              const functionResponses = await executeNativeToolCalls(
-                "[GoogleAIStudio]",
-                chunkResult.stepFunctionCalls,
-                executeMap,
-                failedTools,
-                allToolCalls,
-                {
-                  toolExecutions,
-                  abortSignal: composedSignal,
-                  originalNameMap,
-                  liveTools: options.tools,
-                  declarations: declarationsResult,
-                },
-              );
-
-              // Persist this step's tool calls/results into conversation memory.
-              const stepToolCalls = allToolCalls.slice(toolCallsBefore);
-              const stepToolExecs = toolExecutions.slice(toolExecsBefore);
-              if (stepToolCalls.length > 0 || stepToolExecs.length > 0) {
+              lastStepText = stepResult.text || lastStepText;
+              for (const result of toolResults) {
+                toolExecutions.push({
+                  name: result.name,
+                  input: result.args,
+                  output: result.output,
+                });
+              }
+              if (toolResults.length > 0) {
                 const stepThoughtSig = extractThoughtSignature(
-                  chunkResult.rawResponseParts,
+                  stepResult.raw.rawResponseParts,
                 );
                 withTimeout(
                   this.handleToolExecutionStorage(
-                    stepToolCalls.map((tc, i) => ({
-                      toolName: tc.toolName,
-                      args: tc.args,
+                    stepResult.toolCalls.map((call, i) => ({
+                      toolName: call.name,
+                      args: call.args,
                       ...(i === 0 && stepThoughtSig
                         ? { thoughtSignature: stepThoughtSig }
                         : {}),
                       stepIndex: step,
                     })),
-                    stepToolExecs.map((te) => ({
-                      toolName: te.name,
-                      output: te.output,
+                    toolResults.map((result) => ({
+                      toolName: result.name,
+                      output: result.output,
                       stepIndex: step,
                     })),
                     options,
@@ -1517,7 +1604,7 @@ export class GoogleAIStudioProvider extends BaseProvider {
                   "tool storage write timed out",
                 ).catch((error: unknown) => {
                   logger.warn(
-                    "[GoogleAIStudio] Failed to store native generate tool executions",
+                    "[GoogleAIStudio] Failed to store native tool executions",
                     {
                       error:
                         error instanceof Error ? error.message : String(error),
@@ -1525,29 +1612,62 @@ export class GoogleAIStudioProvider extends BaseProvider {
                   );
                 });
               }
-
-              // Add function responses to history — the @google/genai SDK
-              // only accepts "user" and "model" as valid roles in contents.
-              // Function/tool responses must use role: "user" (matching the
-              // SDK's own automaticFunctionCalling implementation).
-              currentContents.push({
-                role: "user",
-                parts: functionResponses,
-              });
-              // Project this step's growth: the appended tool results ride
-              // the next prompt, which the provider has not reported on yet.
+              const next = baseAdapter.buildToolResultMessages(
+                contents,
+                stepResult,
+                toolResults,
+                engineStep,
+              );
               try {
+                const appended = next[next.length - 1];
                 contextGuard.noteAppendedChars(
-                  JSON.stringify(functionResponses).length,
+                  JSON.stringify(appended?.parts ?? []).length,
                 );
               } catch {
                 /* estimation is best-effort — never break the loop */
               }
-            } catch (error) {
-              logger.error("[GoogleAIStudio] Native SDK generate error", error);
-              throw this.handleProviderError(error);
+              return next;
+            },
+          };
+
+          // Same dedup routing as the streaming twin above.
+          const engineTools = buildDedupedEngineTools(
+            declarationsResult,
+            options.tools,
+          );
+
+          const { stream: engineStream, resultPromise } = runAgenticLoop(
+            adapter,
+            currentContents,
+            {
+              tools: engineTools,
+              ...(composedSignal ? { abortSignal: composedSignal } : {}),
+            },
+          );
+
+          // Drained, not consumed: nothing streams out of generate(), but an
+          // undrained channel would stall the engine mid-turn.
+          const drain = (async () => {
+            for await (const chunk of engineStream) {
+              void chunk;
             }
+          })();
+
+          let engineResult;
+          try {
+            engineResult = await resultPromise;
+          } catch (error) {
+            await drainDetachedPump(drain, "GoogleAIStudio");
+            logger.error("[GoogleAIStudio] Native SDK generate error", error);
+            throw this.handleProviderError(error);
           }
+          await drain;
+
+          totalInputTokens += engineResult.usage.inputTokens;
+          totalOutputTokens += engineResult.usage.outputTokens;
+          totalCacheReadTokens += engineResult.usage.cacheReadTokens ?? 0;
+          totalReasoningTokens += engineResult.usage.reasoningTokens ?? 0;
+          finalText = engineResult.text;
 
           finalText = handleMaxStepsTermination(
             "[GoogleAIStudio]",
@@ -1664,25 +1784,7 @@ export class GoogleAIStudioProvider extends BaseProvider {
       return this.handleDirectTTSSynthesis(options, Date.now());
     }
 
-    // Process the unified `input.files` array before routing to the
-    // native SDK. BaseProvider.generate() runs this preprocessing via
-    // buildMultimodalMessagesArray, but AI Studio's override skips it,
-    // which would otherwise drop text-file content (and the
-    // mimetype-hint contract) on the floor. Mutates options.input.text /
-    // options.input.images / options.input.pdfFiles in place.
-    if (options.input?.files && options.input.files.length > 0) {
-      try {
-        await processUnifiedFilesArray(
-          options as Parameters<typeof processUnifiedFilesArray>[0],
-          100 * 1024 * 1024,
-          this.providerName,
-        );
-      } catch (fileError) {
-        logger.warn(
-          `[GoogleAIStudio] processUnifiedFilesArray threw, continuing without file content: ${fileError instanceof Error ? fileError.message : String(fileError)}`,
-        );
-      }
-    }
+    await this.preprocessNativeFileInput(options);
 
     // Merge registered (built-in / MCP) tools with caller-supplied tools.
     // AI Studio's generate() bypasses BaseProvider.generate(), so the
@@ -1843,7 +1945,7 @@ export class GoogleAIStudioProvider extends BaseProvider {
     // Dynamic import to avoid hard dependency unless audio streaming is used
     let client: GenAIClient;
     try {
-      client = await createGoogleGenAIClient(apiKey);
+      client = await createGoogleGenAIClient(apiKey, this.getBaseURL());
     } catch {
       throw new AuthenticationError(
         "Missing '@google/genai'. Install with: pnpm add @google/genai",
@@ -2053,7 +2155,7 @@ export class GoogleAIStudioProvider extends BaseProvider {
 
     try {
       const apiKey = this.getApiKey();
-      const client = await createGoogleGenAIClient(apiKey);
+      const client = await createGoogleGenAIClient(apiKey, this.getBaseURL());
 
       const result = await client.models.embedContent({
         model: embeddingModelName,
@@ -2104,7 +2206,7 @@ export class GoogleAIStudioProvider extends BaseProvider {
 
     try {
       const apiKey = this.getApiKey();
-      const client = await createGoogleGenAIClient(apiKey);
+      const client = await createGoogleGenAIClient(apiKey, this.getBaseURL());
 
       const result = await client.models.embedContent({
         model: embeddingModelName,
@@ -2148,6 +2250,17 @@ export class GoogleAIStudioProvider extends BaseProvider {
     }
 
     return apiKey;
+  }
+
+  // Mirrors mistral.ts's baseURL precedence (credentials override, then env,
+  // then unset — the SDK's own default applies when unset). Blank/whitespace
+  // values are treated as unset so an empty override can't accidentally
+  // clobber the default.
+  private getBaseURL(): string | undefined {
+    const baseURL =
+      this.credentials?.baseURL?.trim() ||
+      process.env.GOOGLE_AI_BASE_URL?.trim();
+    return baseURL && baseURL.length > 0 ? baseURL : undefined;
   }
 }
 

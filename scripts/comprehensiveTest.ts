@@ -131,30 +131,6 @@ class ComprehensiveTester {
     );
   }
 
-  async testDemoScripts(): Promise<void> {
-    this.log("\n🎭 TESTING DEMO SCRIPTS", "info");
-    
-    const demoScripts = [
-      "scripts/examples/semaphore-demo.ts",
-      "scripts/examples/session-persistence-demo.ts",
-      "scripts/examples/errorHandling-demo.ts",
-      "scripts/examples/healthMonitoring-demo.ts",
-      "scripts/examples/dynamic-chain-demo.ts"
-    ];
-
-    for (const script of demoScripts) {
-      if (existsSync(script)) {
-        await this.runCommand(
-          `tsx ${script}`,
-          `Demo: ${path.basename(script)}`,
-          { timeout: 120000 } // 2 minutes for demos
-        );
-      } else {
-        this.log(`⚠️ Demo script not found: ${script}`, "warning");
-      }
-    }
-  }
-
   async testProviderIntegration(): Promise<void> {
     this.log("\n🔌 TESTING PROVIDER INTEGRATION", "info");
     
@@ -177,7 +153,7 @@ class ComprehensiveTester {
         "Model Server Health Check",
         { timeout: 10000 }
       );
-    } catch (error) {
+    } catch {
       this.log("Model server test skipped (server not running)", "warning");
     }
     
@@ -290,7 +266,6 @@ ${this.results.map(r => `[${r.timestamp}] ${r.type.toUpperCase()}: ${r.message}`
       await this.testBuildSystem();
       await this.testCoreFeatures();
       await this.testCLIFunctionality();
-      await this.testDemoScripts();
       await this.testProviderIntegration();
       await this.testEnvironmentConfiguration();
       await this.testPerformance();

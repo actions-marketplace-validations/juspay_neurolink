@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > `const` **Scorers**: `object`
 
-Defined in: [evaluation/scorers/scorerBuilder.ts:482](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/evaluation/scorers/scorerBuilder.ts#L482)
+Defined in: [evaluation/scorers/scorerBuilder.ts:482](https://github.com/juspay/neurolink/blob/release/src/lib/evaluation/scorers/scorerBuilder.ts#L482)
 
 Quick builder factory functions
 

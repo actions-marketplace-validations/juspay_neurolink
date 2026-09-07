@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **BackupMetadata** = `object`
 
-Defined in: [types/config.ts:315](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L315)
+Defined in: [types/config.ts:446](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L446)
 
 Backup metadata
 
@@ -18,7 +18,7 @@ Backup metadata
 
 > **reason**: `string`
 
-Defined in: [types/config.ts:316](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L316)
+Defined in: [types/config.ts:447](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L447)
 
 ---
 
@@ -26,7 +26,7 @@ Defined in: [types/config.ts:316](https://github.com/juspay/neurolink/blob/ff50c
 
 > **timestamp**: `number`
 
-Defined in: [types/config.ts:317](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L317)
+Defined in: [types/config.ts:448](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L448)
 
 ---
 
@@ -34,7 +34,7 @@ Defined in: [types/config.ts:317](https://github.com/juspay/neurolink/blob/ff50c
 
 > **version**: `string`
 
-Defined in: [types/config.ts:318](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L318)
+Defined in: [types/config.ts:449](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L449)
 
 ---
 
@@ -42,7 +42,7 @@ Defined in: [types/config.ts:318](https://github.com/juspay/neurolink/blob/ff50c
 
 > **originalPath**: `string`
 
-Defined in: [types/config.ts:319](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L319)
+Defined in: [types/config.ts:450](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L450)
 
 ---
 
@@ -50,7 +50,7 @@ Defined in: [types/config.ts:319](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **hash?**: `string`
 
-Defined in: [types/config.ts:320](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L320)
+Defined in: [types/config.ts:451](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L451)
 
 ---
 
@@ -58,7 +58,7 @@ Defined in: [types/config.ts:320](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **size?**: `number`
 
-Defined in: [types/config.ts:321](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L321)
+Defined in: [types/config.ts:452](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L452)
 
 ---
 
@@ -66,4 +66,4 @@ Defined in: [types/config.ts:321](https://github.com/juspay/neurolink/blob/ff50c
 
 > `optional` **createdBy?**: `string`
 
-Defined in: [types/config.ts:322](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/config.ts#L322)
+Defined in: [types/config.ts:453](https://github.com/juspay/neurolink/blob/release/src/lib/types/config.ts#L453)

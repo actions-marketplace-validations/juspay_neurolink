@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **SSEContentBlockDelta** = `object`
 
-Defined in: [types/proxy.ts:188](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L188)
+Defined in: [types/proxy.ts:201](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L201)
 
 ## Properties
 
@@ -16,7 +16,7 @@ Defined in: [types/proxy.ts:188](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **type**: `"content_block_delta"`
 
-Defined in: [types/proxy.ts:189](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L189)
+Defined in: [types/proxy.ts:202](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L202)
 
 ---
 
@@ -24,7 +24,7 @@ Defined in: [types/proxy.ts:189](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **index**: `number`
 
-Defined in: [types/proxy.ts:190](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L190)
+Defined in: [types/proxy.ts:203](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L203)
 
 ---
 
@@ -32,4 +32,4 @@ Defined in: [types/proxy.ts:190](https://github.com/juspay/neurolink/blob/ff50c1
 
 > **delta**: [`SSEDeltaDescriptor`](SSEDeltaDescriptor.md)
 
-Defined in: [types/proxy.ts:191](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/proxy.ts#L191)
+Defined in: [types/proxy.ts:204](https://github.com/juspay/neurolink/blob/release/src/lib/types/proxy.ts#L204)

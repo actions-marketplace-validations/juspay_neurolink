@@ -26,6 +26,8 @@ import {
   log,
   logSection,
   type ColorName,
+  withCaseTimeout,
+  isCaseTimeout,
 } from "./helpers/harness.js";
 
 const { recordTest, runSuite } = defineSuite("Client");
@@ -159,9 +161,9 @@ function getServerUrl(): string {
 
 async function startServer(): Promise<boolean> {
   try {
-    const { NeuroLink } = await import("../src/lib/neurolink.js");
+    const { NeuroLink } = await import("../dist/index.js");
     const { createServer, registerAllRoutes } =
-      await import("../src/lib/server/index.js");
+      await import("../dist/index.js");
 
     const sdk = new NeuroLink();
 
@@ -209,7 +211,7 @@ async function testClientHealthCheck(): Promise<boolean | null> {
   logTest("Client connects to server", "TESTING");
 
   try {
-    const { createClient } = await import("../src/lib/client/index.js");
+    const { createClient } = await import("../dist/index.js");
 
     const client = createClient({
       baseUrl: getServerUrl(),
@@ -256,7 +258,7 @@ async function testClientGenerate(): Promise<boolean | null> {
   }
 
   try {
-    const { createClient } = await import("../src/lib/client/index.js");
+    const { createClient } = await import("../dist/index.js");
 
     const client = createClient({ baseUrl: getServerUrl() });
 
@@ -308,7 +310,7 @@ async function testClientStream(): Promise<boolean | null> {
   }
 
   try {
-    const { createClient } = await import("../src/lib/client/index.js");
+    const { createClient } = await import("../dist/index.js");
 
     const client = createClient({ baseUrl: getServerUrl() });
 
@@ -375,7 +377,7 @@ async function testMiddlewareComposition(): Promise<boolean | null> {
 
   try {
     const { createClient, composeMiddleware } =
-      await import("../src/lib/client/index.js");
+      await import("../dist/index.js");
 
     const executionOrder: string[] = [];
 
@@ -446,7 +448,7 @@ async function testAuthInterceptor(): Promise<boolean | null> {
 
   try {
     const { createClient, createApiKeyAuthInterceptor } =
-      await import("../src/lib/client/index.js");
+      await import("../dist/index.js");
 
     let capturedHeaders: Record<string, string> = {};
 
@@ -506,8 +508,8 @@ async function testErrorHierarchy(): Promise<boolean | null> {
 
   try {
     const {
-      ErrorCode,
-      NeuroLinkError,
+      ClientErrorCode: ErrorCode,
+      ClientNeuroLinkError: NeuroLinkError,
       HttpError,
       ClientRateLimitError,
       ClientAuthenticationError,
@@ -517,7 +519,7 @@ async function testErrorHierarchy(): Promise<boolean | null> {
       mapStatusToErrorCode,
       isNeuroLinkError,
       createErrorFromResponse,
-    } = await import("../src/lib/client/index.js");
+    } = await import("../dist/index.js");
 
     const errors: string[] = [];
 
@@ -554,7 +556,7 @@ async function testErrorHierarchy(): Promise<boolean | null> {
     // Test 3: isRetryableError
     // Use ClientNetworkError (from errors.ts) which extends NeuroLinkError with retryable=true
     // The plain NetworkError from httpClient.ts is NOT a NeuroLinkError
-    const { ClientNetworkError } = await import("../src/lib/client/index.js");
+    const { ClientNetworkError } = await import("../dist/index.js");
     const retryable = new ClientNetworkError("connection reset");
     if (!isRetryableError(retryable)) {
       errors.push("NetworkError should be retryable");
@@ -634,7 +636,7 @@ async function testJWTUtilities(): Promise<boolean | null> {
 
   try {
     const { decodeJWTPayload, isJWTExpired, getJWTExpiry, JWTTokenManager } =
-      await import("../src/lib/client/index.js");
+      await import("../dist/index.js");
 
     const errors: string[] = [];
 
@@ -733,7 +735,7 @@ async function testAiSdkAdapter(): Promise<boolean | null> {
 
   try {
     const { createNeuroLinkProvider, createNeuroLinkModel } =
-      await import("../src/lib/client/index.js");
+      await import("../dist/index.js");
 
     const errors: string[] = [];
 
@@ -824,8 +826,7 @@ async function testAiSdkGenerate(): Promise<boolean | null> {
   logTest("AI SDK doGenerate() round-trip", "TESTING");
 
   try {
-    const { createNeuroLinkProvider } =
-      await import("../src/lib/client/index.js");
+    const { createNeuroLinkProvider } = await import("../dist/index.js");
 
     const provider = createNeuroLinkProvider({
       baseUrl: getServerUrl(),
@@ -894,7 +895,7 @@ async function testSSEClient(): Promise<boolean | null> {
   logTest("SSEClient streams real responses", "TESTING");
 
   try {
-    const { SSEClient } = await import("../src/lib/client/index.js");
+    const { SSEClient } = await import("../dist/index.js");
 
     const sseUrl = `${getServerUrl()}/api/agent/stream`;
 
@@ -1023,7 +1024,7 @@ async function testClientErrorHandling(): Promise<boolean | null> {
   logTest("Client produces typed errors on failures", "TESTING");
 
   try {
-    const { createClient } = await import("../src/lib/client/index.js");
+    const { createClient } = await import("../dist/index.js");
 
     const client = createClient({ baseUrl: getServerUrl() });
 
@@ -1075,7 +1076,21 @@ async function testReactHooksExports(): Promise<boolean | null> {
   logTest("React hooks are importable", "TESTING");
 
   try {
-    const clientModule = await import("../src/lib/client/index.js");
+    // Import the way a consumer does, through the published subpath.
+    //
+    // This asserted against "../dist/index.js" — the root barrel — where the
+    // hooks are not exported and should not be: putting React on the default
+    // entry would pull it into every consumer of the package. They are
+    // published under the "./client" subpath, so the test failed permanently
+    // while the code was correct.
+    //
+    // Using the package specifier rather than "../dist/client/index.js" covers
+    // one thing more: it resolves through the "exports" map in package.json, so
+    // a broken or mis-pathed subpath entry fails here too. Node resolves this
+    // by self-reference to this repo's own build — verified as
+    // <repo>/dist/client/index.js, with no @juspay in node_modules to shadow
+    // it — so it is still the built output rule 15 requires, not src.
+    const clientModule = await import("@juspay/neurolink/client");
 
     const hooks = [
       "NeuroLinkProvider",
@@ -1181,7 +1196,7 @@ async function testRetryInterceptor(): Promise<boolean | null> {
 
   try {
     const { createClient, createRetryInterceptor } =
-      await import("../src/lib/client/index.js");
+      await import("../dist/index.js");
 
     let retryCallbackCount = 0;
 
@@ -1287,7 +1302,7 @@ async function runAllTests(): Promise<void> {
 
   for (const test of tests) {
     try {
-      const result = await test.fn();
+      const result = await withCaseTimeout(test.name, test.fn);
       recordTest(
         test.name,
         result === true,
@@ -1298,6 +1313,19 @@ async function runAllTests(): Promise<void> {
       const msg = error instanceof Error ? error.message : String(error);
       logTest(test.name, "FAIL", `Uncaught: ${msg}`);
       recordTest(test.name, false, false, msg);
+
+      // A case bound is not an ordinary failure: Promise.race cannot cancel, so
+      // the abandoned case is still running. Continuing would run the loop's
+      // cleanup and inter-case delay underneath live work, and record every
+      // remaining case as "not run". Stop at the first one.
+      if (isCaseTimeout(error)) {
+        log(
+          `\n\u{1F6D1} ABORTING: "${test.name}" was abandoned by its timeout and is still executing. ` +
+            `Remaining cases are NOT run — this process no longer has clean state.`,
+          "red",
+        );
+        break;
+      }
     }
     await new Promise((r) => setTimeout(r, TEST_CONFIG.interTestDelay));
   }

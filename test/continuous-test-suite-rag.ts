@@ -62,18 +62,34 @@ import type {
   VectorQueryResult,
 } from "../src/lib/types/index.js";
 import type { z } from "zod";
-import { NeuroLink } from "../src/lib/neurolink.js";
-// Import RAG components
+import { NeuroLink } from "../dist/index.js";
+// RAG components.
+//
+// Everything the package exports comes from the built entry. The rest is
+// imported from `src/lib/` under the determinism exception to CLAUDE.md rule
+// 15: chunk boundaries, reranker ordering and registry metadata are exact,
+// table-driven outcomes, and `generate({ rag })` only ever shows the answer the
+// model produced — it cannot reveal where a chunker split a document or which
+// order a reranker chose.
+import {
+  ChunkerRegistry,
+  createChunker,
+  createHybridSearch,
+  createVectorQueryTool,
+  getAvailableStrategies,
+  InMemoryBM25Index,
+  InMemoryVectorStore,
+  linearCombination,
+  reciprocalRankFusion,
+} from "../dist/index.js";
 import {
   ChunkerFactory,
   chunkerFactory,
-  createChunker,
-  getAvailableStrategies,
   getChunkerMetadata,
   getDefaultConfig,
 } from "../src/lib/rag/ChunkerFactory.js";
 import {
-  ChunkerRegistry,
+  ChunkerRegistry as ChunkerRegistrySingleton,
   chunkerRegistry,
   getAvailableChunkers,
   getChunker,
@@ -94,16 +110,6 @@ import {
   RerankerRegistry,
   rerankerRegistry,
 } from "../src/lib/rag/reranker/RerankerRegistry.js";
-import {
-  createHybridSearch,
-  InMemoryBM25Index,
-  linearCombination,
-  reciprocalRankFusion,
-} from "../src/lib/rag/retrieval/hybridSearch.js";
-import {
-  createVectorQueryTool,
-  InMemoryVectorStore,
-} from "../src/lib/rag/retrieval/vectorQueryTool.js";
 // ============================================================================
 // Test Configuration
 // ============================================================================
@@ -389,7 +395,7 @@ async function testChunkerFactory(): Promise<boolean | null> {
   // Test 5: Metadata retrieval
   logSubsection("Metadata Retrieval");
   try {
-    const metadata = getChunkerMetadata("recursive");
+    const metadata = await getChunkerMetadata("recursive");
     if (
       metadata &&
       metadata.description &&
@@ -420,7 +426,7 @@ async function testChunkerFactory(): Promise<boolean | null> {
   // Test 6: Default config
   logSubsection("Default Configuration");
   try {
-    const config = getDefaultConfig("recursive");
+    const config = await getDefaultConfig("recursive");
     if (config && typeof config.maxSize === "number") {
       logTest("Get default config", "PASS", `maxSize: ${config.maxSize}`);
       recordResult({ name: "Get default config", status: "PASS" });
@@ -449,8 +455,8 @@ async function testChunkerRegistry(): Promise<boolean | null> {
   // Test 1: Singleton instance
   logSubsection("Singleton Pattern");
   try {
-    const instance1 = ChunkerRegistry.getInstance();
-    const instance2 = ChunkerRegistry.getInstance();
+    const instance1 = ChunkerRegistrySingleton.getInstance();
+    const instance2 = ChunkerRegistrySingleton.getInstance();
     if (instance1 === instance2) {
       logTest("ChunkerRegistry singleton", "PASS");
       recordResult({ name: "ChunkerRegistry singleton", status: "PASS" });
@@ -766,7 +772,7 @@ async function testRerankerFactory(): Promise<boolean | null> {
   // Test 4: Reranker metadata
   logSubsection("Reranker Metadata");
   try {
-    const metadata = getRerankerMetadata("simple");
+    const metadata = await getRerankerMetadata("simple");
     if (
       metadata &&
       metadata.description &&
@@ -841,7 +847,7 @@ async function testRerankerFactory(): Promise<boolean | null> {
   // Test 6: Model-free and local rerankers
   logSubsection("Model-Free Rerankers");
   try {
-    const modelFree = rerankerFactory.getModelFreeRerankers();
+    const modelFree = await rerankerFactory.getModelFreeRerankers();
     if (modelFree.includes("simple")) {
       logTest(
         "Get model-free rerankers",
@@ -3521,8 +3527,8 @@ async function testRAGGenerateWithFilesAPI(): Promise<boolean | null> {
         if (result && typeof result === "object" && "content" in result) {
           const content = ((result.content as string) || "").toLowerCase();
           // Check if expected keywords appear in response (flexible matching)
-          const matchedKeywords = fixture.expectedKeywords.filter((kw) =>
-            content.includes(kw.toLowerCase()),
+          const matchedKeywords = fixture.expectedKeywords.filter(
+            (kw: string) => content.includes(kw.toLowerCase()),
           );
           const keywordRatio =
             fixture.expectedKeywords.length > 0

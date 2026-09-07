@@ -9,10 +9,12 @@ import "dotenv/config";
  *
  * This file replaces the per-provider feature loops scattered across
  * `continuous-test-suite-providers.ts`. Adding a new provider becomes:
- *   1. Add an entry to `PROVIDERS` in providerMatrix.ts
- *   2. Set capability flags
- *   3. Set `defaultModel` and `envVars[]`
- *   4. Run `npx tsx test/continuous-test-suite-provider-matrix.ts`
+ *   - Catalog (Tier-2) provider: author `src/lib/providers/catalog/<id>.json`
+ *     and run `pnpm run codegen:catalog && pnpm run build` — its matrix row
+ *     derives from the JSON; nothing to edit here or in providerMatrix.ts.
+ *   - Non-catalog provider: add a hand row to `PROVIDERS` in
+ *     providerMatrix.ts (capability flags, `defaultModel`, `envVars[]`).
+ *   Then run `npx tsx test/continuous-test-suite-provider-matrix.ts`
  *
  * Run:  npx tsx test/continuous-test-suite-provider-matrix.ts
  *       npx tsx test/continuous-test-suite-provider-matrix.ts --provider=openai
@@ -92,7 +94,11 @@ async function runMatrix(): Promise<void> {
             const r = await sdk.generate({
               ...baseOpts,
               input: { text: "Reply with exactly: HELLO" },
-              maxTokens: 50,
+              // Several catalog defaults are reasoning models (Cerebras and Groq
+              // gpt-oss-120b, Fireworks kimi) that spend the whole budget on
+              // hidden reasoning at 50 and return empty text with
+              // finishReason "length". 200 matches the other cells.
+              maxTokens: 200,
               disableTools: true,
             } as never);
             lastContent = r.content;
@@ -115,7 +121,7 @@ async function runMatrix(): Promise<void> {
             const r = await sdk.stream({
               ...baseOpts,
               input: { text: "Count from 1 to 3." },
-              maxTokens: 50,
+              maxTokens: 200,
               disableTools: true,
             } as never);
             let count = 0;
@@ -217,22 +223,59 @@ async function runMatrix(): Promise<void> {
             greeting: zod.z.string(),
             count: zod.z.number(),
           });
-          let lastContent: string | undefined;
+          let last:
+            | {
+                content?: string;
+                structuredData?: unknown;
+                jsonTruncated?: boolean;
+              }
+            | undefined;
           for (let attempt = 1; attempt <= 2; attempt++) {
             const r = await sdk.generate({
               ...baseOpts,
               input: { text: 'Reply with greeting="hi" and count=42 in JSON.' },
               maxTokens: 200,
               disableTools: true,
-              structuredOutput: { schema },
-            } as never);
-            lastContent = r.content;
-            if (lastContent && lastContent.length > 0) {
+              // `schema` is the option generate() honours. The previous
+              // `structuredOutput: { schema }` was never a GenerateOptions
+              // field (the `as never` cast hid that) and was silently
+              // ignored, so this cell passed on plain text. The real
+              // parameter type replaces the `as never` cast here so a
+              // wrong option name is a compile error, not a silent no-op.
+              schema,
+            } as Parameters<NeuroLink["generate"]>[0]);
+            last = r;
+            if (
+              r.content &&
+              r.content.length > 0 &&
+              r.structuredData !== undefined
+            ) {
               break;
             }
           }
-          if (!lastContent || lastContent.length === 0) {
+          if (!last?.content || last.content.length === 0) {
             throw new Error("empty response");
+          }
+          // generate({ schema }) yields a parsed `structuredData` whenever the
+          // model produced anything JSON-shaped; a response cut off at the
+          // token cap yields a partial object and sets `jsonTruncated`, so
+          // only an untruncated result is held to the schema. Pure prose
+          // with no JSON at all leaves `structuredData` undefined (the SDK
+          // logs a WARN and returns the raw text). After two attempts that is
+          // the row's `structuredOutput: true` claim being false for this
+          // model, which must stay visible rather than downgrade to a skip.
+          if (last.structuredData === undefined) {
+            throw new Error(
+              "no JSON was recoverable from a schema request after two attempts",
+            );
+          }
+          if (
+            !last.jsonTruncated &&
+            !schema.safeParse(last.structuredData).success
+          ) {
+            throw new Error(
+              "structuredData did not satisfy the request schema",
+            );
           }
         } catch (err) {
           skipIfProviderError(err);
@@ -253,6 +296,34 @@ async function runMatrix(): Promise<void> {
           } as never);
           if (!r.content || r.content.length === 0) {
             throw new Error("empty response");
+          }
+        } catch (err) {
+          skipIfProviderError(err);
+        }
+      });
+    }
+
+    // ---------- vision ----------
+    if (p.vision) {
+      await test(`[${p.name}] vision describes an image`, async () => {
+        try {
+          const r = (await sdk.generate({
+            provider: p.name,
+            model: p.visionModel ?? p.defaultModel,
+            input: {
+              text: "What is the dominant color in this image? Answer with just the color name.",
+              images: ["test/fixtures/sample-screenshot.png"],
+            },
+            maxTokens: 300,
+            disableTools: true,
+          } as never)) as { content?: string };
+          // The fixture is a solid blue image. A reply without "blue" means
+          // the model never SAW it — exactly the silent image-drop failure
+          // this test exists to catch (found live 2026-08-28: the compat
+          // client dropped ai@6 file parts, so every catalog provider's
+          // vision was text-only and no suite noticed).
+          if (!r.content || !/blue/i.test(r.content)) {
+            throw new Error("response does not describe the fixture image");
           }
         } catch (err) {
           skipIfProviderError(err);

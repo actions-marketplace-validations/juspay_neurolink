@@ -12,6 +12,7 @@ import type { PPTGenerationResult } from "./ppt.js";
 import type { AvatarResult } from "./avatar.js";
 import type { MusicResult } from "./music.js";
 import type { OAuthTokens } from "./auth.js";
+import type { AccountQuota, ProxyPassthroughAccount } from "./proxy.js";
 import type { ClaudeSubscriptionTier } from "./subscription.js";
 import type { ServerFramework } from "./server.js";
 import type { AuthProviderType } from "./auth.js";
@@ -674,6 +675,8 @@ export type SetupArgs = {
   status?: boolean;
   interactive?: boolean;
   help?: boolean;
+  check?: boolean;
+  nonInteractive?: boolean;
 };
 
 /**
@@ -908,6 +911,8 @@ export namespace MistralSetup {
 /** Arguments accepted by `neurolink proxy start` */
 export type ProxyStartArgs = {
   port?: number;
+  /** Gate-only listener port. Defaults to `port + 1`. */
+  sharePort?: number;
   host?: string;
   strategy?: string;
   healthInterval?: number;
@@ -983,6 +988,7 @@ export type ProxyRollingState = {
   } | null;
   draining: Array<{ pid: number; version: string; generation: number }>;
   queuedSockets: number;
+  pendingTransfers?: number;
   rejectedSockets: number;
   failedTransfers: number;
   lastFailure: {
@@ -994,7 +1000,10 @@ export type ProxyRollingState = {
     workerPid?: number;
     workerExitCode?: number | null;
     workerExitSignal?: string | null;
-    supervisorAction?: "none" | "sigkill_after_transfer_failure";
+    supervisorAction?:
+      | "none"
+      | "sigkill_after_transfer_failure"
+      | "cancel_uncommitted_socket";
   } | null;
 };
 
@@ -1014,6 +1023,8 @@ export type ProxyState = {
   pid: number;
   port: number;
   host: string;
+  /** Gate-only listener port, present only while this node lends capacity. */
+  sharePort?: number;
   strategy: string;
   startTime: string;
   ready?: boolean;
@@ -1088,12 +1099,72 @@ export type AuthCommandArgs = BaseCommandArgs & {
   label?: string;
   account?: string;
   force?: boolean;
+  /** `auth list --refresh`: fetch fresh provider limits before listing */
+  refresh?: boolean;
   /** Path to the proxy config YAML, used by set-/get-/clear-primary */
   config?: string;
   /** Email passed to `auth set-primary <email>` */
   email?: string;
+  /** Why an account is being disabled, recorded by `auth disable` */
+  reason?: string;
+  /** Subcommand verb for `auth cooldown <action>` */
+  action?: string;
+  /** `auth cooldown clear --all` */
+  all?: boolean;
   /** Yargs positional arguments */
   _?: (string | number)[];
+};
+
+/** Refresh state for a provider-qualified account. */
+export type AuthListRefreshStatus =
+  | "refreshed"
+  | "snapshot"
+  | "unavailable"
+  | "not_supported";
+
+/** Fresh-limit result for one provider-qualified account. */
+export type AuthListRefreshAccountResult = {
+  /** Provider prefix parsed from the configured account key. */
+  provider: string;
+  /** A missing limit is explicit rather than being rendered as an unexplained dash. */
+  status: AuthListRefreshStatus;
+  error?: string;
+};
+
+/** One direct quota-adapter result used by `auth list --refresh`. */
+export type AuthListDirectQuotaRefreshResult =
+  | { status: "refreshed"; quota: AccountQuota }
+  | { status: "unavailable" | "not_supported"; error?: string };
+
+/** Provider-specific quota capability used by the generic auth-list refresh. */
+export type AuthListQuotaRefreshAdapter = {
+  /** A successful local proxy `/limits` response is authoritative for this provider. */
+  supportsProxyRefresh?: boolean;
+  listAccounts: () => Promise<ProxyPassthroughAccount[]>;
+  priorQuotaKeys: (account: ProxyPassthroughAccount) => readonly string[];
+  refreshAccount: (
+    account: ProxyPassthroughAccount,
+    options: { prior: AccountQuota | null },
+  ) => Promise<AuthListDirectQuotaRefreshResult>;
+};
+
+/** Applies one account's explicit auth-list refresh state. */
+export type AuthListRefreshResultSetter = (
+  key: string,
+  status: AuthListRefreshStatus,
+  error?: string,
+) => void;
+
+/** Outcome of the `auth list --refresh` fresh-limit fetch. */
+export type AuthListRefreshOutcome = {
+  /** How the fresh limits were obtained ("none" when every path failed). */
+  via: "proxy" | "direct" | "mixed" | "none";
+  /** Freshly fetched quotas keyed by provider-qualified account key. */
+  quotas: Record<string, AccountQuota> | null;
+  /** Per-account refresh status, also keyed by provider-qualified account key. */
+  accounts: Record<string, AuthListRefreshAccountResult>;
+  /** Per-account and transport errors, already formatted for display. */
+  errors: string[];
 };
 
 // ============================================================================
@@ -1415,8 +1486,8 @@ export type ProviderSetupConfig = {
 // AUTH COMMAND (from cli/commands/auth.ts)
 // =============================================================================
 
-/** Providers supported by the `neurolink auth` command. */
-export type SupportedProvider = "anthropic";
+/** Providers with first-class credential flows implemented by `neurolink auth`. */
+export type SupportedProvider = "anthropic" | "codex";
 
 // =============================================================================
 // AUTORESEARCH COMMAND (from cli/commands/autoresearch.ts)
@@ -2046,3 +2117,82 @@ export type CliValidatedFileOption =
   | "--pdf"
   | "--video"
   | "--file";
+
+/** Actions accepted by `neurolink proxy share`. */
+export type ProxyShareCliAction =
+  | "create"
+  | "list"
+  | "status"
+  | "pause"
+  | "resume"
+  | "revoke"
+  | "topup"
+  | "set"
+  | "link"
+  | "rotate"
+  | "level"
+  | "provision"
+  | "url"
+  | "note"
+  | "notes"
+  | "receipts"
+  | "delete";
+
+/** Named starting points for a grant's gate set. */
+export type ProxySharePresetName = "spare" | "spillover" | "metered" | "open";
+
+export type ProxyShareArgs = {
+  action?: ProxyShareCliAction;
+  /** Positional argument for actions that take one, e.g. `share url <url>`. */
+  value?: string;
+  /** `share url --clear`: forget this node's recorded public address. */
+  clear?: boolean;
+  peer?: string;
+  /** Lender account a complete share is minted from, for drift auditing. */
+  fromAccount?: string;
+  /** Authorization code from the lender's browser, for split provisioning. */
+  code?: string;
+  /** `share note`: how long the note stays redeemable. */
+  ttl?: string;
+  /** `share note`: free-text note carried on the coin note itself. */
+  memo?: string;
+  /** Complete-mode lease shape. */
+  offlineGrace?: string;
+  heartbeat?: string;
+  leaseTtl?: string;
+  /** Public URL this node is reachable at, used to mint a share link. */
+  publicUrl?: string;
+  level?: string;
+  preset?: string;
+  ledger?: string;
+  coins?: number;
+  refill?: string;
+  maxSlice?: string;
+  maxSlicePerAccount?: string;
+  reserve?: string;
+  spillover?: string;
+  models?: string[];
+  accounts?: string[];
+  rate?: string;
+  concurrency?: number;
+  schedule?: string;
+  expires?: string;
+  note?: string;
+  to?: string;
+  json?: boolean;
+  dev?: boolean;
+};
+
+export type ProxyExposeArgs = {
+  port?: number;
+  host?: string;
+  named?: string;
+  force?: boolean;
+};
+
+/** What `proxy expose` learned by asking the running proxy directly. */
+export type ProxyGateProbe = {
+  gated: boolean;
+  reachable: boolean;
+  detail: string;
+};

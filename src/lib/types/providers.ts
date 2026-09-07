@@ -26,7 +26,9 @@ import type {
   GenerateResult,
   TextGenerationOptions,
 } from "./generate.js";
+import type { MultimodalAudioEntry } from "./file.js";
 import type { StreamOptions, StreamResult } from "./stream.js";
+import type { ProviderError, ProviderErrorRule } from "./errors.js";
 import type { ExternalMCPToolInfo } from "./externalMcp.js";
 
 // Subscription types for Claude/Anthropic authentication and tier management
@@ -55,7 +57,7 @@ export type {
   LanguageModelUsage,
   LanguageModelRequestMetadata,
   LanguageModelResponseMetadata,
-} from "ai";
+} from "./aiCompat.js";
 
 // Re-export subscription types for convenience
 export type {
@@ -160,7 +162,7 @@ export type AWSCredentialConfig = {
 export type NeurolinkCredentials = {
   openai?: { apiKey?: string; baseURL?: string };
   anthropic?: { apiKey?: string; oauthToken?: string };
-  googleAiStudio?: { apiKey?: string };
+  googleAiStudio?: { apiKey?: string; baseURL?: string };
   vertex?: {
     projectId?: string;
     location?: string;
@@ -196,7 +198,6 @@ export type NeurolinkCredentials = {
     // best-effort deployment-name heuristic is used.
     useMaxCompletionTokens?: boolean;
   };
-  mistral?: { apiKey?: string; baseURL?: string };
   huggingFace?: { apiKey?: string; baseURL?: string };
   openrouter?: { apiKey?: string; baseURL?: string };
   litellm?: { apiKey?: string; baseURL?: string };
@@ -208,14 +209,30 @@ export type NeurolinkCredentials = {
   // behind an auth-proxying reverse-proxy.
   lmStudio?: { apiKey?: string; baseURL?: string };
   llamacpp?: { apiKey?: string; baseURL?: string };
-  xai?: { apiKey?: string; baseURL?: string };
-  groq?: { apiKey?: string; baseURL?: string };
-  cohere?: { apiKey?: string; baseURL?: string };
-  together?: { apiKey?: string; baseURL?: string };
+  // ── BEGIN GENERATED(credentials): provider catalog (pnpm run codegen:catalog) ──
+  baseten?: { apiKey?: string; baseURL?: string };
+  cerebras?: { apiKey?: string; baseURL?: string };
+  cloudflare?: { apiKey?: string; baseURL?: string; accountId?: string };
   fireworks?: { apiKey?: string; baseURL?: string };
+  gmicloud?: { apiKey?: string; baseURL?: string };
+  groq?: { apiKey?: string; baseURL?: string };
+  inceptionLabs?: { apiKey?: string; baseURL?: string };
+  ioIntelligence?: { apiKey?: string; baseURL?: string };
+  mancer?: { apiKey?: string; baseURL?: string };
+  mistral?: { apiKey?: string; baseURL?: string };
   perplexity?: { apiKey?: string; baseURL?: string };
-  cloudflare?: { apiKey?: string; accountId?: string; baseURL?: string };
-  replicate?: { apiToken?: string; baseUrl?: string };
+  sambanova?: { apiKey?: string; baseURL?: string };
+  together?: { apiKey?: string; baseURL?: string };
+  upstage?: { apiKey?: string; baseURL?: string };
+  xai?: { apiKey?: string; baseURL?: string };
+  // ── END GENERATED(credentials) ──
+  cohere?: { apiKey?: string; baseURL?: string };
+  replicate?: {
+    apiToken?: string;
+    baseUrl?: string;
+    apiKey?: string;
+    baseURL?: string;
+  };
   voyage?: { apiKey?: string; baseURL?: string };
   jina?: { apiKey?: string; baseURL?: string };
   stability?: { apiKey?: string; baseURL?: string };
@@ -690,6 +707,141 @@ export type ProviderConfigOptions = {
   optional?: boolean;
 };
 
+/**
+ * Minimal credential shape accepted by resolveOpenAICompatConfig() and
+ * ConfiguredOpenAICompatProvider. A structural superset of every real
+ * per-provider NeurolinkCredentials["<key>"] slice in this family (groq,
+ * xai, together, fireworks, perplexity, mistral, cloudflare) — all fields
+ * optional, so passing e.g. NeurolinkCredentials["groq"] (which has no
+ * accountId) here is always structurally valid.
+ */
+export type OpenAICompatCredentials = {
+  apiKey?: string;
+  baseURL?: string;
+  accountId?: string;
+};
+
+/**
+ * One row of the config-driven OpenAI-compatible provider catalog
+ * (OPENAI_COMPAT_CATALOG, src/lib/providers/openaiCompatCatalog.ts).
+ * Replaces a hand-written OpenAIChatCompletionsProvider subclass for
+ * providers whose only differences from every sibling are credentials,
+ * base URL, model defaults, and error-message classification.
+ */
+export type OpenAICompatCatalogEntry = {
+  /** Registry key / nl.generate({provider}) value, e.g. "groq". */
+  providerName: AIProviderName;
+  /** Registry aliases, e.g. ["together-ai", "together"]. */
+  aliases: string[];
+  /**
+   * Env var holding the API key, e.g. "GROQ_API_KEY".
+   *
+   * Declarative: the key is actually read through `configOptions.envVarName`,
+   * which `validateApiKey` consults. This field exists so an entry states its
+   * credential source without a caller having to reach into configOptions,
+   * and the catalog suite asserts the two always name the same variable — two
+   * fields describing one fact are worth nothing if they can disagree.
+   */
+  apiKeyEnvVar: string;
+  /**
+   * Env var that can override the base URL, e.g. "GROQ_BASE_URL". Omit
+   * for entries that use computedBaseURL instead (e.g. Cloudflare).
+   */
+  baseURLEnvVar?: string;
+  /** Static default base URL. Omit for computedBaseURL entries. */
+  defaultBaseURL?: string;
+  /**
+   * Present only for providers whose base URL is computed from an extra
+   * required credential value instead of a static default (Cloudflare's
+   * accountId). Deliberately narrow (accountId-shaped) rather than a
+   * generic extra-field mechanism — Cloudflare is the only current user.
+   */
+  computedBaseURL?: {
+    /** Env var fallback for the extra value, e.g. "CLOUDFLARE_ACCOUNT_ID". */
+    envVar: string;
+    /** Thrown when neither credentials.accountId nor envVar supply a value. */
+    missingValueMessage: string;
+    /** Builds the base URL from the resolved accountId. */
+    build: (accountId: string) => string;
+  };
+  /** Setup/help metadata, passed to validateApiKey(). Not consumed by
+   *  classifyProviderError() — that function's ProviderErrorContext has no
+   *  docsUrl field; any URL a rule's message needs is inlined in the rule
+   *  itself (see Task 4). */
+  configOptions: ProviderConfigOptions;
+  /** Env var for the default model, e.g. "GROQ_MODEL". */
+  modelEnvVar: string;
+  /** Default model when modelEnvVar is unset. */
+  defaultModel: string;
+  /**
+   * Whether the vendor accepts native tool definitions, from the catalog's
+   * `capabilities.tools`. `false` makes the provider's `supportsTools()`
+   * answer false, so no `tools` array ever reaches a wire that rejects one
+   * (Mancer's free model answers 400 BAD_PARAMETERS to any tool list).
+   * Omitted means "not declared": fall through to the model registry, the
+   * same default every hand-written provider uses.
+   */
+  supportsTools?: boolean;
+  /**
+   * The literal passed as ProviderFactory.registerProvider()'s defaultModel
+   * argument (resolved before the provider is constructed). Preserves each
+   * provider's exact pre-migration registry behavior.
+   */
+  registryDefaultModel: string;
+  /**
+   * True for every provider except Mistral: whether the registry-level
+   * default also consults modelEnvVar before falling back to
+   * registryDefaultModel. False is a pre-existing, intentionally-preserved
+   * quirk unique to Mistral's registration (see plan's Design reference).
+   */
+  registryDefaultModelChecksEnvVar: boolean;
+  /** Fallback model name (getFallbackModelName()). */
+  fallbackModelName: string;
+  /** Fallback model list (getFallbackModels()). */
+  fallbackModels: string[];
+  /**
+   * Error-classification rules, consumed by classifyProviderError. Typed
+   * as a mutable array — not readonly — because plan 07's
+   * `classifyProviderError(error, rules: ProviderErrorRule[], provider, modelName?)`
+   * declares `rules` as `ProviderErrorRule[]`; a `readonly` array here
+   * would not be assignable to that parameter without a cast, which rule
+   * 14 (no double assertions) and general hygiene both rule out. Each
+   * entry's array is still constructed as a fresh literal per provider in
+   * Task 4, so nothing actually mutates it at runtime.
+   */
+  errorRules: ProviderErrorRule[];
+  /**
+   * Optional override for the Error subclass a TimeoutError should produce
+   * for this entry. classifyProviderError() hard-codes
+   * TimeoutError -> NetworkError unconditionally, ahead of any rule table,
+   * and does not make that mapping overridable per-provider (see
+   * errorClassifier.ts). Groq's pre-migration subclass predates that
+   * shared classifier and intercepted TimeoutError itself, returning a
+   * plain ProviderError instead — this field lets
+   * ConfiguredOpenAICompatProvider reproduce that one documented
+   * divergence as data (see its formatProviderError), rather than adding a
+   * class-level hook back in. Omit for every entry whose timeout should use
+   * the classifier's default (six of the seven catalog entries).
+   */
+  timeoutErrorClass?: new (message: string, provider?: string) => ProviderError;
+  /** See CatalogQuirks.messageContentFormat — a vendor that accepts
+   *  `messages[].content` only as a plain string. */
+  messageContentFormat?: "string";
+};
+
+/** The subset of OpenAICompatCatalogEntry that resolveOpenAICompatConfig()
+ *  needs — lets call sites pass a minimal object without the full catalog
+ *  entry (e.g. in tests, or a future non-catalog caller). */
+export type OpenAICompatConfigInput = Pick<
+  OpenAICompatCatalogEntry,
+  | "providerName"
+  | "apiKeyEnvVar"
+  | "baseURLEnvVar"
+  | "defaultBaseURL"
+  | "computedBaseURL"
+  | "configOptions"
+>;
+
 // ============================================================================
 // CORE PROVIDER INTERFACES
 // ============================================================================
@@ -893,6 +1045,23 @@ export type BedrockContentBlock = {
 };
 
 /**
+ * A Bedrock content block still being assembled from a ConverseStream event
+ * sequence. `_inputBuffer` holds the partial tool-call JSON that arrives
+ * across several `contentBlockDelta` events and is parsed away at
+ * `contentBlockStop`, so it never appears on a finished block.
+ */
+export type BedrockPendingContentBlock = BedrockContentBlock & {
+  _inputBuffer?: string;
+};
+
+/** A tool_use block being assembled across Anthropic `input_json_delta` events. */
+export type AnthropicPendingToolUse = {
+  id: string;
+  name: string;
+  inputJson: string;
+};
+
+/**
  * Bedrock message structure
  */
 export type BedrockMessage = {
@@ -1054,6 +1223,8 @@ export type GenAIClient = {
 export type GoogleGenAIHttpOptions = {
   /** Custom fetch implementation for proxy support */
   fetch?: typeof fetch;
+  /** Override the API base URL (e.g. a corporate proxy or mock endpoint) */
+  baseUrl?: string;
 };
 
 /**
@@ -1095,6 +1266,19 @@ export type GoogleVertexProviderSettings = {
  * Anthropic Vertex AI settings for Claude models on Vertex
  * Used with @anthropic-ai/vertex-sdk
  */
+/**
+ * The two members `@anthropic-ai/vertex-sdk` actually uses off an auth client.
+ *
+ * Its declared `AuthClient` is far wider, but `prepareOptions()` only ever
+ * awaits `getRequestHeaders()` and reads `projectId` (client.js:109-111).
+ * Naming that narrow surface is what lets a caller supply a token directly
+ * instead of standing up Application Default Credentials.
+ */
+export type VertexAnthropicAuthClient = {
+  getRequestHeaders: () => Promise<Record<string, string>>;
+  projectId?: string | null;
+};
+
 export type AnthropicVertexSettings = {
   /** Google Cloud project ID */
   projectId: string;
@@ -1104,6 +1288,22 @@ export type AnthropicVertexSettings = {
   timeout?: number;
   /** SDK-internal retry budget (transport retries are the orchestrator's job) */
   maxRetries?: number;
+  /**
+   * Endpoint override. The SDK derives
+   * `https://${region}-aiplatform.googleapis.com/v1` by default; a gateway or
+   * a compatible endpoint is reached by setting this instead.
+   */
+  baseURL?: string;
+  /**
+   * Supply the request credentials directly, bypassing Application Default
+   * Credentials.
+   *
+   * Note that `accessToken` on the SDK's own options does NOT do this: the
+   * client stores it and never reads it for auth, so `prepareOptions()` still
+   * awaits ADC and a token-only caller fails with a credentials error that
+   * names nothing useful. `authClient` is the option that actually works.
+   */
+  authClient?: VertexAnthropicAuthClient;
 };
 
 // ============================================================================
@@ -1326,6 +1526,16 @@ export type InvokeEndpointParams = {
   TargetVariant?: string;
   /** Inference ID for request tracking */
   InferenceId?: string;
+  /**
+   * Cancels the in-flight HTTP request, not just the loop around it.
+   *
+   * Named in camelCase deliberately: every other field here mirrors an AWS
+   * `InvokeEndpointCommandInput` member and keeps its PascalCase, whereas this
+   * one is a transport option handed to `client.send()` as
+   * `@smithy/types` `HttpHandlerOptions` — it is never part of the command
+   * payload, and spelling it differently keeps that boundary visible.
+   */
+  abortSignal?: AbortSignal;
 };
 
 /**
@@ -1787,18 +1997,6 @@ export namespace TelemetryTypes {
 // ============================================================================
 
 /**
- * OpenRouter provider configuration
- */
-export type OpenRouterConfig = {
-  /** OpenRouter API key */
-  apiKey: string;
-  /** HTTP Referer header for attribution on openrouter.ai/activity */
-  referer?: string;
-  /** App name for X-Title header attribution */
-  appName?: string;
-};
-
-/**
  * OpenRouter model information from /api/v1/models endpoint
  */
 export type OpenRouterModelInfo = {
@@ -1878,9 +2076,20 @@ export type NativeFunctionResponse = {
 };
 
 /** Result from collectStreamChunks. */
+/**
+ * Which turn-level counter a per-chunk Vertex usage delta belongs to.
+ *
+ * Vertex updates its turn totals incrementally so they stay correct mid-stream
+ * — a step killed by an abort, the turn deadline or the stall watchdog still
+ * bills the tokens it already reported.
+ */
+export type VertexUsageCounter = "input" | "output" | "cacheRead" | "reasoning";
+
 export type CollectedChunkResult = {
   rawResponseParts: unknown[];
   stepFunctionCalls: NativeFunctionCall[];
+  /** Raw `Candidate.finishReason` from the last chunk that carried one. */
+  finishReason?: string;
   inputTokens: number;
   outputTokens: number;
   /**
@@ -1897,18 +2106,6 @@ export type CollectedChunkResult = {
    * totalTokenCount = prompt + candidates + thoughts.
    */
   reasoningTokens?: number;
-};
-
-/** Push-based text channel for incremental streaming. */
-export type TextChannel = {
-  /** Push a text chunk to the consumer. */
-  push: (text: string) => void;
-  /** Signal that no more chunks will arrive. */
-  close: () => void;
-  /** Signal that the producer encountered a fatal error. */
-  error: (err: unknown) => void;
-  /** Async iterable consumed by the StreamResult. */
-  iterable: AsyncIterable<{ content: string }>;
 };
 
 // =============================================================================
@@ -1974,6 +2171,98 @@ export type ProviderRegistration = {
   constructor: ProviderConstructor;
   defaultModel?: string;
   aliases?: string[];
+  descriptor?: ProviderDescriptor;
+};
+
+/**
+ * Single source of truth for one AI provider's static identity: how it's
+ * addressed (name/aliases), how it's authenticated (credentialsKey/envVars),
+ * what it defaults to (defaultModel), and how the rest of the codebase
+ * should treat it (toolSupport/localRuntime/healthCheck). Every consumer
+ * that used to hand-maintain its own provider table (CLI choices,
+ * CREDENTIAL_KEY_MAP, env-var checks, health-check dispatch, auto-select
+ * priority, PROMPT_ONLY_TOOL_PROVIDERS) derives from PROVIDER_DESCRIPTORS
+ * instead. See src/lib/factories/providerDescriptors.ts for the data.
+ */
+export type ProviderDescriptor = {
+  /** Canonical identity — matches an AIProviderName enum member (never AUTO). */
+  name: AIProviderName;
+  /** Alternate spellings accepted by the CLI and the alias index (kebab-case, shorthand, legacy names). Does not include `name` itself. */
+  aliases: readonly string[];
+  /** Key into NeurolinkCredentials for per-call/per-instance credential overrides. */
+  credentialsKey: keyof NeurolinkCredentials;
+  /** Environment variables this provider reads at runtime. */
+  envVars: {
+    /** Primary identity/secret env var. Absent for providers with no required credential (Ollama, LM Studio, llama.cpp) or that use extraRequired instead of a single key (Vertex). */
+    apiKey?: string;
+    /** Alternate env vars accepted in place of apiKey, checked in order after apiKey. */
+    fallbacks?: readonly string[];
+    baseURL?: string;
+    /** Alternate env vars accepted in place of baseURL. */
+    baseURLFallbacks?: readonly string[];
+    /** Env var that overrides the static defaultModel at runtime. */
+    model?: string;
+    /** Alternate env vars accepted in place of model, checked in order after model. */
+    modelFallbacks?: readonly string[];
+    /** Additional env vars required alongside apiKey (e.g. AWS secret key, Azure endpoint). */
+    extraRequired?: readonly string[];
+    /** Alternate ways to satisfy extraRequired when it isn't a plain env-var list (e.g. Vertex's file-path-OR-individual-fields auth). Each entry is either a single env var name (satisfied alone) or a nested array of names that must ALL be present together (e.g. Vertex's GOOGLE_AUTH_CLIENT_EMAIL + GOOGLE_AUTH_PRIVATE_KEY pair, which is only valid as a pair). Evaluate with `satisfiesFallbacks()` (providerConfig.ts) rather than re-deriving this logic at each call site. */
+    extraRequiredFallbacks?: readonly (string | readonly string[])[];
+    /** True when the provider is usable with zero configuration (local runtime with a documented default URL, or a documented non-secret default like LiteLLM's "sk-anything"). */
+    optional?: boolean;
+  };
+  /**
+   * Static fallback model. The empty string "" is a documented sentinel
+   * meaning "no static default — resolved at runtime via envVars.model or
+   * provider-side auto-discovery" (used by Bedrock, OpenAI-Compatible,
+   * LM Studio, llama.cpp, matching how providerRegistry.ts already passes
+   * `undefined` as their defaultModel argument today).
+   */
+  defaultModel: string;
+  toolSupport: "native" | "prompt-only" | "none" | "model-dependent";
+  /** True only for providers that run entirely on the caller's machine with no cloud account (Ollama, LM Studio, llama.cpp). LiteLLM is a local proxy but commonly points at cloud models, so it is deliberately false. */
+  localRuntime: boolean;
+  /** How ProviderHealthChecker should verify this provider is reachable. */
+  healthCheck: "env-only" | "models-probe" | "live-generate";
+  /**
+   * Membership + order in the default health sweep
+   * (`ProviderHealthChecker.checkAllProvidersHealth` with no explicit
+   * list). Lower number = checked and reported first; the sweep's array
+   * order is behaviour for its first-healthy fallback consumers. Absent =
+   * not part of the default sweep. Replaces the hand-maintained 8-provider
+   * array that lived in providerHealth.ts.
+   */
+  defaultHealthSweepPriority?: number;
+  /**
+   * Preference rank for `getBestHealthyProvider`'s default auto-selection
+   * (lower = tried first). Deliberately a SEPARATE ordering from the sweep:
+   * auto-select prefers local/cheap runtimes (litellm, ollama) before cloud
+   * providers, while the sweep reports the majors first. Absent = not in
+   * the default preference list. Replaces the second hand-maintained array
+   * that lived inline as getBestHealthyProvider's default parameter.
+   */
+  autoSelectPreference?: number;
+  setupUrl?: string;
+  timeouts?: { generateMs?: number; streamMs?: number };
+  /** Ascending priority (1 = tried first) in the auto-select fallback chain used by getBestProvider(). Undefined = not part of the auto-select chain. */
+  autoSelectPriority?: number;
+  /** Format-validation regex sourced from providerConfig.ts's API_KEY_FORMATS, when one exists for this provider. */
+  apiKeyFormatPattern?: RegExp;
+  /**
+   * True when this provider's credentials are resolved by an external chain
+   * or its own config validator rather than by plain env-var presence, so
+   * its required-env-vars can't be expressed as "every one of these exact
+   * names must be literally set". Examples: Vertex accepts a service-account
+   * file OR individual client-email/private-key fields OR a base64 key
+   * (an OR, not an AND, of auth paths); Bedrock falls back to the AWS SDK's
+   * own default credential chain (shared profile, IAM role) with no env
+   * vars required at all; LiteLLM is a documented zero-config local proxy.
+   * `ProviderHealthChecker.getRequiredEnvironmentVariables()` returns `[]`
+   * for these providers and defers to `checkProviderSpecificConfig()`'s
+   * dedicated per-provider check instead of deriving a flat AND-list from
+   * `envVars`.
+   */
+  credentialsResolvedExternally?: boolean;
 };
 
 // =============================================================================
@@ -2124,6 +2413,12 @@ export type GeminiMultimodalInput = {
   text?: string;
   pdfFiles?: Array<Buffer | string>;
   images?: Array<Buffer | string | { data: Buffer | string; altText?: string }>;
+  /**
+   * Audio collected during file detection, carried through to the native
+   * request as `inlineData`. Distinct from the user-facing `audioFiles`: these
+   * are already-materialised bytes with a resolved mime type.
+   */
+  nativeAudioFiles?: MultimodalAudioEntry[];
 };
 
 /**

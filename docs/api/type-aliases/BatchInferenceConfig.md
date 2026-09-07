@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **BatchInferenceConfig** = `object`
 
-Defined in: [types/providers.ts:1403](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1403)
+Defined in: [types/providers.ts:1755](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1755)
 
 Batch inference job configuration
 
@@ -18,7 +18,7 @@ Batch inference job configuration
 
 > **inputS3Uri**: `string`
 
-Defined in: [types/providers.ts:1405](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1405)
+Defined in: [types/providers.ts:1757](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1757)
 
 Input S3 location
 
@@ -28,7 +28,7 @@ Input S3 location
 
 > **outputS3Uri**: `string`
 
-Defined in: [types/providers.ts:1407](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1407)
+Defined in: [types/providers.ts:1759](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1759)
 
 Output S3 location
 
@@ -38,7 +38,7 @@ Output S3 location
 
 > **modelName**: `string`
 
-Defined in: [types/providers.ts:1409](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1409)
+Defined in: [types/providers.ts:1761](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1761)
 
 SageMaker model name
 
@@ -48,7 +48,7 @@ SageMaker model name
 
 > **instanceType**: `string`
 
-Defined in: [types/providers.ts:1411](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1411)
+Defined in: [types/providers.ts:1763](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1763)
 
 Instance type for batch job
 
@@ -58,7 +58,7 @@ Instance type for batch job
 
 > **instanceCount**: `number`
 
-Defined in: [types/providers.ts:1413](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1413)
+Defined in: [types/providers.ts:1765](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1765)
 
 Instance count for batch job
 
@@ -68,7 +68,7 @@ Instance count for batch job
 
 > `optional` **maxPayloadInMB?**: `number`
 
-Defined in: [types/providers.ts:1415](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1415)
+Defined in: [types/providers.ts:1767](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1767)
 
 Maximum payload size in MB
 
@@ -78,6 +78,6 @@ Maximum payload size in MB
 
 > `optional` **batchStrategy?**: `"MultiRecord"` \| `"SingleRecord"`
 
-Defined in: [types/providers.ts:1417](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/providers.ts#L1417)
+Defined in: [types/providers.ts:1769](https://github.com/juspay/neurolink/blob/release/src/lib/types/providers.ts#L1769)
 
 Batch strategy

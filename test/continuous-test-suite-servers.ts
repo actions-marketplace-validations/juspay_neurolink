@@ -49,9 +49,13 @@ import {
   log,
   logSection,
   type ColorName,
+  withCaseTimeout,
+  isCaseTimeout,
 } from "./helpers/harness.js";
 
-const { recordTest, runSuite } = defineSuite("Servers");
+const { recordTest, runSuite } = defineSuite("Servers", {
+  offline: true,
+});
 
 /** Print-only logTest shim. Counters are driven by recordTest in the runner. */
 function logTest(
@@ -677,7 +681,7 @@ async function testRateLimitMiddleware(): Promise<boolean | null> {
     [
       "createSlidingWindowRateLimitMiddleware",
       "InMemoryRateLimitStore",
-      "RateLimitError",
+      "ServerRateLimitError",
     ],
   );
 }
@@ -1159,10 +1163,10 @@ async function testErrorHandling(): Promise<boolean | null> {
       "ServerAdapterError",
       "ConfigurationError",
       "ServerValidationError",
-      "AuthenticationError",
-      "AuthorizationError",
+      "ServerAuthenticationError",
+      "ServerAuthorizationError",
       "ServerRateLimitError",
-      "TimeoutError",
+      "ServerTimeoutError",
       "StreamingError",
     ];
 
@@ -1394,9 +1398,13 @@ async function testRateLimitConfiguration(): Promise<boolean | null> {
       );
     }
 
-    // Check RateLimitError
-    if (typeof mod.RateLimitError === "function") {
-      logTest("Rate Limit Config - Error", "PASS", "RateLimitError exported");
+    // Check ServerRateLimitError
+    if (typeof mod.ServerRateLimitError === "function") {
+      logTest(
+        "Rate Limit Config - Error",
+        "PASS",
+        "ServerRateLimitError exported",
+      );
     }
 
     return true;
@@ -2208,6 +2216,92 @@ async function testRouteRegistration(): Promise<boolean | null> {
 // Base Server Adapter Tests
 // ============================================
 
+/**
+ * An SDK consumer must be able to mount the Codex proxy door.
+ *
+ * `createAllRoutes` is the documented way to assemble the server's routes, and
+ * it handled two of the three proxy doors: `createCodexProxyRoutes` was neither
+ * imported nor re-exported here, and no flag selected it. So Codex proxying was
+ * reachable only by running `neurolink proxy start` — an SDK consumer embedding
+ * the server could not expose it at all, not even deliberately.
+ *
+ * Driven through the published surface exactly as a consumer would: import from
+ * the built package, call createAllRoutes, and look for the door.
+ */
+async function testCodexProxyReachableFromSDK(): Promise<boolean | null> {
+  const mod = await getServerModule();
+  if (!mod) {
+    logTest(
+      "SDK seam - Codex proxy door",
+      "FAIL",
+      `Import failed: ${getServerModuleError()}`,
+    );
+    return false;
+  }
+
+  if (typeof mod.createCodexProxyRoutes !== "function") {
+    logTest(
+      "SDK seam - Codex proxy door",
+      "FAIL",
+      "createCodexProxyRoutes is not exported from the server entry",
+    );
+    return false;
+  }
+
+  // Signature is (basePath, options) — passing options first silently lands
+  // the object in basePath and stringifies it into every route path.
+  const createAllRoutes = mod.createAllRoutes as (
+    basePath?: string,
+    options?: Record<string, unknown>,
+  ) => Array<{ routes?: Array<{ method?: string; path?: string }> }>;
+
+  const hasCodexDoor = (
+    groups: Array<{ routes?: Array<{ method?: string; path?: string }> }>,
+  ): boolean =>
+    groups.some((g) =>
+      (g.routes ?? []).some((r) =>
+        (r.path ?? "").includes("/backend-api/codex/responses"),
+      ),
+    );
+
+  // The dedicated flag must select it.
+  if (!hasCodexDoor(createAllRoutes("/api", { codexProxy: true }))) {
+    logTest(
+      "SDK seam - Codex proxy door",
+      "FAIL",
+      "codexProxy: true did not mount the Codex door",
+    );
+    return false;
+  }
+
+  // And the unified flag must mean every door, not two of three.
+  if (!hasCodexDoor(createAllRoutes("/api", { proxy: true }))) {
+    logTest(
+      "SDK seam - Codex proxy door",
+      "FAIL",
+      "proxy: true mounted the other doors but not Codex",
+    );
+    return false;
+  }
+
+  // Off by default — a consumer who asked for no proxying gets none.
+  if (hasCodexDoor(createAllRoutes("/api", {}))) {
+    logTest(
+      "SDK seam - Codex proxy door",
+      "FAIL",
+      "the Codex door was mounted without any proxy flag",
+    );
+    return false;
+  }
+
+  logTest(
+    "SDK seam - Codex proxy door",
+    "PASS",
+    "codexProxy and proxy both mount it; absent by default",
+  );
+  return true;
+}
+
 async function testBaseServerAdapter(): Promise<boolean | null> {
   logSection("Testing Base Server Adapter");
 
@@ -2556,6 +2650,7 @@ async function runAllTests(): Promise<void> {
     { name: "Common Middleware", fn: testCommonMiddleware },
 
     // Core Infrastructure Tests
+    { name: "SDK seam: Codex proxy door", fn: testCodexProxyReachableFromSDK },
     { name: "Base Server Adapter", fn: testBaseServerAdapter },
     { name: "Type System", fn: testTypeSystem },
     { name: "Index Exports", fn: testIndexExports },
@@ -2596,7 +2691,7 @@ async function runAllTests(): Promise<void> {
   // Run all tests
   for (const test of tests) {
     try {
-      const result = await test.fn();
+      const result = await withCaseTimeout(test.name, test.fn);
       recordTest(
         test.name,
         result === true,
@@ -2607,6 +2702,19 @@ async function runAllTests(): Promise<void> {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
       recordTest(test.name, false, false, errorMessage);
+
+      // A case bound is not an ordinary failure: Promise.race cannot cancel, so
+      // the abandoned case is still running. Continuing would run the loop's
+      // cleanup and inter-case delay underneath live work, and record every
+      // remaining case as "not run". Stop at the first one.
+      if (isCaseTimeout(error)) {
+        log(
+          `\n\u{1F6D1} ABORTING: "${test.name}" was abandoned by its timeout and is still executing. ` +
+            `Remaining cases are NOT run — this process no longer has clean state.`,
+          "red",
+        );
+        break;
+      }
     }
   }
 }

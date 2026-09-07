@@ -36,6 +36,14 @@
 import { AIProviderFactory } from "./core/factory.js";
 export { AIProviderFactory };
 
+// Provider descriptor exports (single source of truth for provider identity)
+export { ProviderFactory } from "./factories/providerFactory.js";
+export {
+  PROVIDER_DESCRIPTORS,
+  PROVIDER_DESCRIPTORS_BY_NAME,
+  PROVIDER_ALIAS_INDEX,
+} from "./factories/providerDescriptors.js";
+
 // Config Manager export
 export { NeuroLinkConfigManager as ConfigManager } from "./config/configManager.js";
 
@@ -62,6 +70,18 @@ export {
   createClient,
   NeuroLinkApiError,
 } from "./client/httpClient.js";
+
+// ============================================================================
+// ARTIFACT STORAGE — backends for externalized tool outputs and banked payloads.
+// Pick one with `artifacts.storage` / STORAGE_TYPE, or implement ArtifactStore.
+// ============================================================================
+
+export { LocalTempArtifactStore } from "./artifacts/artifactStore.js";
+export { RedisArtifactStore } from "./artifacts/redisArtifactStore.js";
+export {
+  createArtifactStore,
+  resolveArtifactStorageType,
+} from "./artifacts/artifactStoreFactory.js";
 
 export {
   // AI SDK Adapter
@@ -273,14 +293,15 @@ export {
   ReplicateAvatarHandler,
 } from "./avatar/index.js";
 
-// Video handlers (live under adapters/video; no separate video/ barrel)
-export { KlingVideoHandler } from "./adapters/video/klingVideoHandler.js";
-export { ReplicateVideoHandler } from "./adapters/video/replicateVideoHandler.js";
-export { RunwayVideoHandler } from "./adapters/video/runwayVideoHandler.js";
+// Video handlers
 export {
-  VertexVideoHandler,
   isVertexVideoConfigured,
-} from "./adapters/video/vertexVideoHandler.js";
+  KlingVideoHandler,
+  registerDefaultVideoHandlers,
+  ReplicateVideoHandler,
+  RunwayVideoHandler,
+  VertexVideoHandler,
+} from "./adapters/video/index.js";
 
 // Image generation + HITL — surfaced from their dedicated barrels
 export { ImageGenService } from "./image-gen/ImageGenService.js";
@@ -356,6 +377,11 @@ export {
 } from "./middleware/builtin/analytics.js";
 export { createLifecycleMiddleware } from "./middleware/builtin/lifecycle.js";
 export { MiddlewareFactory } from "./middleware/factory.js";
+
+// Tool + schema helpers. Previously a consumer reached for `tool()` and
+// `jsonSchema()` from the ai package to build tools for generate({tools}).
+// That package is no longer a dependency, so the equivalents ship here.
+export { tool, jsonSchema, stepCountIs } from "./utils/tool.js";
 export { ExporterRegistry } from "./observability/exporterRegistry.js";
 export { NoOpExporter } from "./observability/exporters/baseExporter.js";
 // Observability modules and types
@@ -1095,8 +1121,6 @@ export {
   // Validation
   AgentExecuteRequestSchema,
   AlreadyRunningError,
-  AuthenticationError,
-  AuthorizationError,
   // Framework Adapters
   BaseServerAdapter,
   ConfigurationError,
@@ -1150,7 +1174,6 @@ export {
   NotRunningError,
   // OpenAPI
   pipeAsyncIterableToDataStream,
-  RateLimitError,
   RouteConflictError,
   RouteNotFoundError,
   registerAllRoutes,
@@ -1158,15 +1181,17 @@ export {
   ServerAdapterError,
   ServerAdapterErrorCode,
   ServerAdapterFactory,
+  ServerAuthenticationError,
+  ServerAuthorizationError,
   ServerNameParamSchema,
   ServerRateLimitError,
   ServerStartError,
   ServerStopError,
+  ServerTimeoutError,
   ServerValidationError,
   SessionIdParamSchema,
   StreamAbortedError,
   StreamingError,
-  TimeoutError,
   ToolArgumentsSchema,
   ToolExecuteRequestSchema,
   ToolNameParamSchema,
@@ -1182,6 +1207,13 @@ export {
   WebSocketMessageRouter,
   wrapError,
 } from "./server/index.js";
+/**
+ * @deprecated Use `ServerTimeoutError` instead — renamed to end the naming
+ * collision with the canonical `utils/timeout.ts` `TimeoutError`. Kept as an
+ * alias so existing callers importing `TimeoutError` from `@juspay/neurolink`
+ * are not broken.
+ */
+export { ServerTimeoutError as TimeoutError } from "./server/index.js";
 
 // ============================================================================
 // RAG DOCUMENT PROCESSING - Retrieval-Augmented Generation
@@ -1412,3 +1444,17 @@ export {
   NetworkTopology,
   TopologyBuilder,
 } from "./agent/index.js";
+
+// ============================================================================
+// Local usage exports
+// ============================================================================
+// Token spend read from each CLI's own session logs, rather than from proxy
+// traffic. Exported because the proxy's ledger only sees CLIs that route
+// through it; this covers the rest, and covers history predating the proxy.
+export {
+  createLocalUsageReader,
+  getLocalUsageDescriptors,
+  getRegisteredLocalUsageCliIds,
+  readAllLocalUsage,
+  registerLocalUsageReader,
+} from "./localUsage/index.js";

@@ -57,6 +57,16 @@ By participating in this project, you agree to abide by our Code of Conduct (to 
    cp .env.example .env
    ```
 
+> **Note on `landing/` and `docs-site/`:** these are standalone pnpm projects
+> with their own lockfiles, not part of a workspace rooted here (there is no
+> root `pnpm-workspace.yaml`). Each declares its own `pnpm.overrides` in its
+> `package.json` (e.g. `landing/package.json`, `docs-site/package.json`) —
+> those overrides apply only when pnpm runs from inside that directory and are
+> silently ignored by a `pnpm install` run from the repo root. When bumping a
+> transitive dependency for a security fix, check whether it needs an override
+> in the root `package.json`, `landing/package.json`, and `docs-site/package.json`
+> independently; fixing one does not fix the others.
+
 ### Development Workflow
 
 1. Run the development server:
@@ -311,7 +321,7 @@ pnpm test:proxy           # Claude proxy
 pnpm test:bugfixes        # Regression fixtures
 
 # Run a single suite directly
-npx tsx test/continuous-test-suite-<name>.ts
+pnpm exec tsx test/continuous-test-suite-<name>.ts
 ```
 
 ### 📁 Test File Structure
@@ -363,11 +373,11 @@ pnpm cli --version
 pnpm test
 
 # Focus on a specific domain suite
-npx tsx test/continuous-test-suite-providers.ts
-npx tsx test/continuous-test-suite-rag.ts
+pnpm exec tsx test/continuous-test-suite-providers.ts
+pnpm exec tsx test/continuous-test-suite-rag.ts
 
 # Run an individual issue regression suite
-npx tsx test/continuous-test-suite-issue-01-model-access.ts
+pnpm exec tsx test/continuous-test-suite-issue-01-model-access.ts
 ```
 
 #### **CI/CD Workflow**
@@ -401,7 +411,7 @@ pnpm test:rag             # RAG pipeline validation
 
 ```bash
 # Run an individual suite directly with tsx
-npx tsx test/continuous-test-suite-<name>.ts
+pnpm exec tsx test/continuous-test-suite-<name>.ts
 
 # Check environment setup
 pnpm run env:validate

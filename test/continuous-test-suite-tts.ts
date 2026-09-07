@@ -25,7 +25,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { fileURLToPath } from "url";
-import type { ProcessResult } from "../dist/index.js";
+import type { ProcessResult, TTSMetadata } from "../dist/index.js";
 import { NeuroLink, ProviderRegistry, TTSProcessor } from "../dist/index.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -89,6 +89,8 @@ import {
   log,
   logSection,
   type ColorName,
+  withCaseTimeout,
+  isCaseTimeout,
 } from "./helpers/harness.js";
 
 import { assertDistFresh } from "./helpers/distFreshness.js";
@@ -1619,6 +1621,60 @@ async function testFishCartesiaRegistration(): Promise<boolean | null> {
   }
 }
 
+/**
+ * Explain an absent audio buffer using the result's own TTS diagnosis.
+ *
+ * `generate()` degrades gracefully when synthesis fails: it returns the text,
+ * omits `audio`, and records what went wrong on `result.ttsMetadata` — a public
+ * field on GenerateResult that no test referenced. Nothing is thrown, so the
+ * catch blocks below never run and `isExpectedProviderError()` never sees the
+ * upstream message.
+ *
+ * The result was a case that reported "no audio buffer in result" — a symptom
+ * with the cause visible only in a log line. An invalid Fish Audio token
+ * surfaced as an undiagnosable hard failure:
+ *
+ *   Fish Audio synthesis failed: 401 — {"status":401,"message":"Invalid Token"}
+ *
+ * Returns "skip" for an upstream credential/quota condition, "fail" otherwise,
+ * with the real reason either way.
+ *
+ * The reason text is deliberately kept out of the returned FAIL detail's
+ * leading position and never interpolated into an assertion message elsewhere:
+ * a message that merely quotes provider-ish content gets downgraded to a skip.
+ */
+function explainMissingAudio(ttsMetadata: TTSMetadata | undefined): {
+  verdict: "skip" | "fail";
+  reason: string;
+} {
+  if (!ttsMetadata) {
+    return {
+      verdict: "fail",
+      reason:
+        "no audio buffer and no ttsMetadata — synthesis was never attempted",
+    };
+  }
+  if (!ttsMetadata.attempted) {
+    return {
+      verdict: "fail",
+      reason: "no audio buffer because synthesis was never attempted",
+    };
+  }
+  const detail = ttsMetadata.error?.message ?? "no error detail recorded";
+  // A 401/403 from a synthesis call is a credential problem, which is
+  // environmental and belongs in the skip bucket. Neither this file's matcher
+  // nor the shared one in envGuard recognises Fish Audio's wording ("401 —
+  // {"status":401,"message":"Invalid Token"}"), and adding "invalid token" as a
+  // substring is the loose-matching envGuard explicitly warns against — it
+  // would swallow any future consumer-facing error phrased that way. The status
+  // code is the precise signal.
+  const authStatus = /\b(?:401|403)\b/.test(detail);
+  return {
+    verdict: authStatus || isExpectedProviderError(detail) ? "skip" : "fail",
+    reason: detail,
+  };
+}
+
 async function testFishAudioTTS(sdk: NeuroLink): Promise<boolean | null> {
   logTest("TTS - Fish Audio end-to-end", "TESTING");
   if (!process.env.FISH_AUDIO_API_KEY) {
@@ -1638,12 +1694,13 @@ async function testFishAudioTTS(sdk: NeuroLink): Promise<boolean | null> {
     });
     const buf = result.audio?.buffer;
     if (!buf || buf.length === 0) {
+      const { verdict, reason } = explainMissingAudio(result.ttsMetadata);
       logTest(
         "TTS - Fish Audio end-to-end",
-        "FAIL",
-        "no audio buffer in result",
+        verdict === "skip" ? "SKIP" : "FAIL",
+        `no audio buffer — ${reason.slice(0, 160)}`,
       );
-      return false;
+      return verdict === "skip" ? null : false;
     }
     if (!isValidMP3(buf)) {
       logTest(
@@ -1689,8 +1746,13 @@ async function testCartesiaTTS(sdk: NeuroLink): Promise<boolean | null> {
     });
     const buf = result.audio?.buffer;
     if (!buf || buf.length === 0) {
-      logTest("TTS - Cartesia end-to-end", "FAIL", "no audio buffer in result");
-      return false;
+      const { verdict, reason } = explainMissingAudio(result.ttsMetadata);
+      logTest(
+        "TTS - Cartesia end-to-end",
+        verdict === "skip" ? "SKIP" : "FAIL",
+        `no audio buffer — ${reason.slice(0, 160)}`,
+      );
+      return verdict === "skip" ? null : false;
     }
     if (!isValidMP3(buf)) {
       logTest(
@@ -1936,7 +1998,7 @@ async function runAllTests(): Promise<void> {
   for (const test of tests) {
     logSection(test.name);
     try {
-      const result = await test.fn();
+      const result = await withCaseTimeout(test.name, test.fn);
       recordTest(
         test.name,
         result === true,
@@ -1947,6 +2009,19 @@ async function runAllTests(): Promise<void> {
       const msg = error instanceof Error ? error.message : String(error);
       logTest(test.name, "FAIL", `Uncaught: ${msg}`);
       recordTest(test.name, false, false, msg);
+
+      // A case bound is not an ordinary failure: Promise.race cannot cancel, so
+      // the abandoned case is still running. Continuing would run the loop's
+      // cleanup and inter-case delay underneath live work, and record every
+      // remaining case as "not run". Stop at the first one.
+      if (isCaseTimeout(error)) {
+        log(
+          `\n\u{1F6D1} ABORTING: "${test.name}" was abandoned by its timeout and is still executing. ` +
+            `Remaining cases are NOT run — this process no longer has clean state.`,
+          "red",
+        );
+        break;
+      }
     }
     await globalCleanup();
     await new Promise((r) => setTimeout(r, TEST_CONFIG.interTestDelay));

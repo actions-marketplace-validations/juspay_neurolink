@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **McpCacheEntry**\<`T`\> = `object`
 
-Defined in: [types/mcp.ts:2565](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2565)
+Defined in: [types/mcp.ts:2584](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2584)
 
 Cached entry held by ToolCache. Named McpCacheEntry to disambiguate from
 the response-caching middleware's CacheEntry in server.ts (Rule 9).
@@ -25,7 +25,7 @@ the response-caching middleware's CacheEntry in server.ts (Rule 9).
 
 > **value**: `T`
 
-Defined in: [types/mcp.ts:2566](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2566)
+Defined in: [types/mcp.ts:2585](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2585)
 
 ---
 
@@ -33,7 +33,7 @@ Defined in: [types/mcp.ts:2566](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **expires**: `number`
 
-Defined in: [types/mcp.ts:2567](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2567)
+Defined in: [types/mcp.ts:2586](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2586)
 
 ---
 
@@ -41,7 +41,7 @@ Defined in: [types/mcp.ts:2567](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **createdAt**: `number`
 
-Defined in: [types/mcp.ts:2568](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2568)
+Defined in: [types/mcp.ts:2587](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2587)
 
 ---
 
@@ -49,7 +49,7 @@ Defined in: [types/mcp.ts:2568](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **accessedAt**: `number`
 
-Defined in: [types/mcp.ts:2569](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2569)
+Defined in: [types/mcp.ts:2588](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2588)
 
 ---
 
@@ -57,7 +57,7 @@ Defined in: [types/mcp.ts:2569](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **accessCount**: `number`
 
-Defined in: [types/mcp.ts:2570](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2570)
+Defined in: [types/mcp.ts:2589](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2589)
 
 ---
 
@@ -65,4 +65,4 @@ Defined in: [types/mcp.ts:2570](https://github.com/juspay/neurolink/blob/ff50c1e
 
 > **key**: `string`
 
-Defined in: [types/mcp.ts:2571](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/mcp.ts#L2571)
+Defined in: [types/mcp.ts:2590](https://github.com/juspay/neurolink/blob/release/src/lib/types/mcp.ts#L2590)

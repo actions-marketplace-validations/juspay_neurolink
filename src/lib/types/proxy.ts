@@ -33,6 +33,7 @@ import type {
   CloakingConfig,
 } from "./subscription.js";
 import type { RouteDeprecation } from "./server.js";
+import type { StoredOAuthTokens } from "./auth.js";
 
 /**
  * Type describing the ModelRouter contract.
@@ -211,7 +212,12 @@ export type SSEContentBlockStop = {
 export type SSEMessageDelta = {
   type: "message_delta";
   delta: { stop_reason: string | null; stop_sequence: string | null };
-  usage: { output_tokens: number };
+  usage: {
+    output_tokens: number;
+    input_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  };
 };
 
 export type SSEMessageStop = {
@@ -518,6 +524,45 @@ export type ProxyAccountRoutingReason =
 
 export type ProxyAccountType = (typeof PROXY_ACCOUNT_TYPES)[number];
 
+export type ProxyQuotaFreshness =
+  | "unknown"
+  | "fresh"
+  | "stale_known"
+  | "refresh_due";
+
+export type ProxyQuotaRefreshReason =
+  | "startup_unknown"
+  | "handoff_prewarm"
+  | "ambiguous_snapshot"
+  | "manual";
+
+export type ProxyQuotaSaturationKind = "none" | "soft" | "hard";
+
+export type ProxyTransportScope =
+  | "shared_provider_transport"
+  | "connection_transport"
+  | "account_specific";
+
+export type ProxyNetworkTransportScope = Exclude<
+  ProxyTransportScope,
+  "account_specific"
+>;
+
+export type ProxyProviderTransportProbeOutcome =
+  | "recovered"
+  | "failed"
+  | "abandoned";
+
+export type ProxyProviderTransportPermit =
+  | { allowed: true; probe: boolean; generation: number }
+  | {
+      allowed: false;
+      errorCode: string | null;
+      transportScope: ProxyNetworkTransportScope;
+      /** The degrading failure happened before any request byte was sent. */
+      connectPhase: boolean;
+    };
+
 export type ProxyAccountRoutingCandidate = {
   account: string;
   accountType: ProxyAccountType;
@@ -527,6 +572,16 @@ export type ProxyAccountRoutingCandidate = {
   usable: boolean;
   saturated: boolean;
   quotaObserved: boolean;
+  quotaStale: boolean;
+  quotaFreshness?: ProxyQuotaFreshness;
+  refreshNeeded?: boolean;
+  refreshReason?: ProxyQuotaRefreshReason | null;
+  refreshInFlight?: boolean;
+  lastRefreshAttemptAt?: number | null;
+  lastRefreshSuccessAt?: number | null;
+  nextRefreshEligibleAt?: number | null;
+  saturationKind?: ProxyQuotaSaturationKind;
+  softLimitOverrideReason?: "overage" | "weekly_expiry" | null;
   quotaLastUpdated: number | null;
   quotaAgeMs: number | null;
   coolingActive: boolean;
@@ -544,6 +599,13 @@ export type ProxyAccountRoutingCandidate = {
   weeklyStatus: string | null;
   weeklyUsed: number | null;
   weeklyResetAt: number | null;
+  /** Display name of the model-scoped window that matched the requested model
+   *  (e.g. "Fable"), or null when the account reports no scoped cap for it.
+   *  Optional so schema-v1 readers of older records stay valid. */
+  scopedModel?: string | null;
+  scopedStatus?: string | null;
+  scopedUsed?: number | null;
+  scopedResetAt?: number | null;
 };
 
 export type ProxyAccountRoutingDecision = {
@@ -567,6 +629,17 @@ export type ProxyAccountSortMetrics = {
   usable: boolean;
   saturated: boolean;
   hasQuota: boolean;
+  quotaEvidenceRank: number;
+  quotaStale: boolean;
+  quotaFreshness: ProxyQuotaFreshness;
+  refreshNeeded: boolean;
+  refreshReason: ProxyQuotaRefreshReason | null;
+  refreshInFlight: boolean;
+  lastRefreshAttemptAt: number | null;
+  lastRefreshSuccessAt: number | null;
+  nextRefreshEligibleAt: number | null;
+  saturationKind: ProxyQuotaSaturationKind;
+  softLimitOverrideReason: "overage" | "weekly_expiry" | null;
   quotaLastUpdated: number | null;
   quotaAgeMs: number | null;
   coolingActive: boolean;
@@ -585,9 +658,26 @@ export type ProxyAccountSortMetrics = {
   weeklyReset: number;
   weeklyUsed: number | null;
   weeklyUsedForSort: number;
+  /** Model-scoped weekly window matching the requested model. All null/false
+   *  when the account reports no scoped cap for it (the common case), which
+   *  makes every scoped comparator rung a no-op for unscoped traffic. */
+  scopedModel: string | null;
+  scopedStatus: string | null;
+  scopedUsed: number | null;
+  scopedReset: number;
+  scopedUsedForSort: number;
+  scopedSaturated: boolean;
 };
 
 export type RequestLogEntry = {
+  /** First output text or tool-argument delta, excluding SSE control frames. */
+  firstUsefulOutputMs?: number;
+  /** Small routing evidence retained even when response bodies are pruned. */
+  fallbackPlan?: Array<{
+    provider: string;
+    model: string;
+    reasoningEffort?: string;
+  }>;
   timestamp: string;
   requestId: string;
   method: string;
@@ -596,6 +686,8 @@ export type RequestLogEntry = {
   stream: boolean;
   toolCount: number;
   account: string;
+  /** Provider-qualified account key for collision-free reconstruction. */
+  accountKey?: string;
   accountType: string;
   responseStatus: number;
   responseTimeMs: number;
@@ -603,10 +695,37 @@ export type RequestLogEntry = {
   errorMessage?: string;
   /** Low-level transport code such as ETIMEDOUT or EADDRNOTAVAIL. */
   errorCode?: string;
+  /** Whether changing credentials can affect this transport failure. */
+  transportScope?: ProxyTransportScope;
   inputTokens?: number;
   outputTokens?: number;
   cacheCreationTokens?: number;
   cacheReadTokens?: number;
+  /**
+   * Provider that actually served the request, for costing. Absent on records
+   * written before this field existed; `proxyAnalysis` then falls back to a
+   * cross-provider model lookup rather than assuming Anthropic.
+   */
+  provider?: string;
+  /** Terminal state of the client-facing response when known. */
+  terminalOutcome?:
+    | "completed"
+    | "bodyless"
+    | "client_cancelled"
+    | "stream_error"
+    | "handler_error";
+  /**
+   * Which CLI made the request, derived from User-Agent, and the raw header it
+   * was derived from.
+   *
+   * Both are stored. The derived name is what a dashboard groups on, but the
+   * classifier only knows the clients it has seen — keeping the raw header
+   * means a client it does not recognise is still attributable rather than
+   * collapsing into "unknown" with everything else.
+   */
+  clientApp?: string;
+  /** Raw User-Agent, truncated. See clientApp. */
+  userAgent?: string;
   /** OTel trace ID for correlation with distributed traces */
   traceId?: string;
   /** OTel span ID for correlation with distributed traces */
@@ -615,9 +734,33 @@ export type RequestLogEntry = {
   routingDecision?: ProxyAccountRoutingDecision;
 };
 
+/** File-sink evidence is independent of model/request success counters. */
+export type ProxyRequestLogSinkSnapshot = {
+  attempted: number;
+  written: number;
+  inFlight: number;
+  pending: number;
+  /** Records not admitted because the bounded writer queue was full. */
+  dropped: number;
+  writeTimeouts: number;
+  unconfirmedWrites: number;
+  lastErrorCode?: string;
+};
+
+export type ProxyRequestLoggerSnapshot = {
+  enabled: boolean;
+  requests: ProxyRequestLogSinkSnapshot;
+  attempts: ProxyRequestLogSinkSnapshot;
+  debug: ProxyRequestLogSinkSnapshot;
+};
+
 export type RequestAttemptLogEntry = {
   timestamp: string;
   requestId: string;
+  /** Parent client request for an internal fallback invocation. */
+  parentRequestId?: string;
+  /** Requested effort retained independently of full body captures. */
+  reasoningEffort?: string;
   attempt: number;
   method: string;
   path: string;
@@ -625,6 +768,8 @@ export type RequestAttemptLogEntry = {
   stream: boolean;
   toolCount: number;
   account: string;
+  /** Provider-qualified account key for collision-free reconstruction. */
+  accountKey?: string;
   accountType: string;
   responseStatus: number;
   /** End-to-end request age when this attempt completed. */
@@ -635,8 +780,12 @@ export type RequestAttemptLogEntry = {
   errorMessage?: string;
   /** Low-level transport code such as ETIMEDOUT or EADDRNOTAVAIL. */
   errorCode?: string;
+  /** Whether changing credentials can affect this transport failure. */
+  transportScope?: ProxyTransportScope;
   /** Whether this failed attempt may be retried without changing the request. */
   retryable?: boolean;
+  /** The transport failure happened before any request byte was sent. */
+  connectPhase?: boolean;
   /** Distinguishes short-lived admission throttles from exhausted quota windows. */
   rateLimitKind?: "transient" | "quota";
   /** Reset-aware cooldown reason selected for a rate-limited attempt. */
@@ -645,11 +794,57 @@ export type RequestAttemptLogEntry = {
   outputTokens?: number;
   cacheCreationTokens?: number;
   cacheReadTokens?: number;
+  /** Provider that received this upstream attempt. */
+  provider?: string;
   /** OTel trace ID for correlation with distributed traces */
   traceId?: string;
   /** OTel span ID for correlation with distributed traces */
   spanId?: string;
 };
+
+/** Additional fields recorded when a Codex response becomes client-final. */
+export type CodexFinalLogExtra = Partial<
+  Pick<
+    RequestLogEntry,
+    | "errorType"
+    | "errorMessage"
+    | "errorCode"
+    | "transportScope"
+    | "inputTokens"
+    | "outputTokens"
+    | "cacheReadTokens"
+    | "cacheCreationTokens"
+    | "terminalOutcome"
+    | "firstUsefulOutputMs"
+  >
+>;
+
+/** Additional fields recorded for each upstream Codex account attempt. */
+export type CodexAttemptLogExtra = Partial<
+  Pick<
+    RequestAttemptLogEntry,
+    | "errorType"
+    | "errorMessage"
+    | "errorCode"
+    | "transportScope"
+    | "retryable"
+    | "rateLimitKind"
+    | "cooldownReason"
+  >
+>;
+
+/** Minimal persistence contract needed by Codex rotating-token refreshes. */
+export type CodexRefreshTokenStore = {
+  peekTokens(provider: string): Promise<StoredOAuthTokens | null>;
+  saveTokens(provider: string, tokens: StoredOAuthTokens): Promise<void>;
+};
+
+/** Result contract for a Codex OAuth refresh operation. */
+export type CodexTokenRefresher = (refreshToken: string) => Promise<{
+  accessToken: string;
+  refreshToken?: string;
+  expiresAt?: number;
+}>;
 
 export type ProxyBodyCaptureInput = {
   phase: string;
@@ -678,6 +873,8 @@ export type ClaudeFinalRequestLogger = (
     outputTokens?: number;
     cacheCreationTokens?: number;
     cacheReadTokens?: number;
+    errorCode?: string;
+    transportScope?: ProxyTransportScope;
   },
 ) => void;
 
@@ -689,6 +886,8 @@ export type ClaudeLoggedErrorBuilder = (
     account?: string;
     accountType?: string;
     attempt?: number;
+    errorCode?: string;
+    transportScope?: ProxyTransportScope;
   },
 ) => ClaudeErrorResponse;
 
@@ -714,8 +913,11 @@ export type AnthropicAttemptLogger = (
     cacheCreationTokens?: number;
     cacheReadTokens?: number;
     retryable?: boolean;
+    /** The transport failure happened before any request byte was sent. */
+    connectPhase?: boolean;
     /** Low-level transport code such as ETIMEDOUT or EADDRNOTAVAIL. */
     errorCode?: string;
+    transportScope?: ProxyTransportScope;
     rateLimitKind?: "transient" | "quota";
     cooldownReason?: "transient" | "session" | "weekly" | "unified";
     /** Override for nested retries whose attempt starts after this logger. */
@@ -737,8 +939,12 @@ export type AnthropicLoopState = {
   } | null;
   authFailureMessage: string | null;
   authCooldownMessage: string | null;
+  entitlementFailure: AnthropicEntitlementFailure | null;
+  scopedExhaustion: AnthropicScopedExhaustion | null;
   fallbackFailureMessage?: string;
   attemptNumber: number;
+  lastTransportErrorCode?: string;
+  lastTransportScope?: ProxyNetworkTransportScope;
 };
 
 export type AnthropicUpstreamBody = {
@@ -765,7 +971,7 @@ export type LoadedClaudeAccountContext = {
 export type AnthropicSuccessResult =
   | {
       retryNextAccount: true;
-      failure?: { message: string; rateLimit: boolean };
+      failure?: { message: string; rateLimit: boolean; retryDelayMs?: number };
     }
   | { response: Response | unknown; holdsAccountAdmission?: boolean };
 
@@ -816,8 +1022,11 @@ export type AnthropicAuthRetryResult = {
   response?: Response | unknown;
   holdsAccountAdmission?: boolean;
   continueLoop: boolean;
+  /** Failure-path pacing before rotating after provider-wide overload. */
+  retryDelayMs?: number;
   lastError: unknown;
   authFailureMessage: string | null;
+  entitlementFailure: AnthropicEntitlementFailure | null;
   sawRateLimit: boolean;
   sawTransientFailure: boolean;
   sawNetworkError: boolean;
@@ -828,6 +1037,8 @@ export type AnthropicNonOkResult = {
   response?: Response | unknown;
   continueLoop: boolean;
   retrySameAccount?: boolean;
+  /** Failure-path pacing before rotating after provider-wide overload. */
+  retryDelayMs?: number;
   lastError: unknown;
   authFailureMessage: string | null;
   sawTransientFailure: boolean;
@@ -836,6 +1047,7 @@ export type AnthropicNonOkResult = {
     body: string;
     contentType?: string;
   } | null;
+  entitlementFailure: AnthropicEntitlementFailure | null;
   upstreamSpan?: Span;
 };
 
@@ -856,7 +1068,13 @@ export type RateLimitCoolingReason = Exclude<AccountCoolingReason, "auth">;
 
 export type AccountCooldownPlan = {
   reason: RateLimitCoolingReason;
-  /** Epoch-ms until which the account should not be used. */
+  /**
+   * Whether this limit applies to every request on the account or only to the
+   * requested model. Model scope must never be persisted as an account
+   * cooldown; the quota window itself remains the routing evidence.
+   */
+  scope: "account" | "model";
+  /** Epoch-ms until which the limiting window is expected to recover. */
   coolingUntil: number;
   /** When true (unified/5h/7d rejected), rotate immediately — retrying the
    *  same account is futile until its window resets. When false (transient
@@ -881,6 +1099,11 @@ export type TransientRateLimitRetryBudget = {
 export type AnthropicUpstreamFetchResult = {
   continueLoop: boolean;
   retrySameAccount?: boolean;
+  transportScope?: ProxyNetworkTransportScope;
+  errorCode?: string;
+  /** The transport failure happened while connecting, before any request
+   *  byte was sent, so retrying it cannot duplicate provider work. */
+  connectPhase?: boolean;
   /** When set, the caller should wait this many ms before retrying (from upstream retry-after). */
   retryAfterMs?: number;
   /** Set on a genuine 429: how long / why to cool this account before rotating. */
@@ -927,6 +1150,8 @@ export type ProxyTerminalErrorSummary = {
   category: ProxyTerminalErrorCategory;
   requestId?: string;
   account?: string;
+  /** Provider-qualified account identity when the failure was attributable. */
+  accountKey?: string;
   accountType?: string;
   errorType?: string;
   errorCode?: string;
@@ -937,6 +1162,8 @@ export type ProxyTerminalErrorSummary = {
 /** Optional terminal context supplied when a final request error is recorded. */
 export type ProxyTerminalErrorDetails = {
   requestId?: string;
+  /** Exact provider-qualified account key when the caller has it. */
+  accountKey?: string;
   errorType?: string;
   errorCode?: string;
   terminalOutcome?: string;
@@ -944,6 +1171,12 @@ export type ProxyTerminalErrorDetails = {
 };
 
 export type AccountStats = {
+  /**
+   * Provider-qualified account identity for rows written by current builds.
+   * Omitted only by legacy snapshots whose bare map keys are intentionally
+   * treated as unattributed rather than guessed at during status rendering.
+   */
+  key?: string;
   label: string;
   type: string;
   attemptCount: number;
@@ -1102,8 +1335,191 @@ export type AccountQuota = {
   upgradePaths?: string;
   /** "allowed" | "rejected" */
   overageStatus: string;
+  /** Whether Anthropic reports that paid overage is actively serving traffic. */
+  overageInUse?: boolean;
+  /** Why overage is unavailable, verbatim from
+   *  anthropic-ratelimit-unified-overage-disabled-reason (e.g.
+   *  "org_level_disabled"). Present only when the provider states one. */
+  overageDisabledReason?: string;
+  /** Authoritative extra-usage switch from the usage API's
+   *  `extra_usage.is_enabled`. Unlike the header trio this is reported even for
+   *  an account that has never served a request. */
+  overageEnabled?: boolean;
+  /** Which window Anthropic considers binding right now, verbatim from
+   *  anthropic-ratelimit-unified-representative-claim (e.g. "five_hour"). */
+  representativeClaim?: string;
   /** Epoch ms when we last captured this data */
   lastUpdated: number;
+  /** Dynamic per-plan limit buckets from the usage API `limits[]` array
+   *  (session / weekly_all / model-scoped weeklies such as Fable / future
+   *  kinds). Absent on purely header-sourced snapshots. */
+  windows?: AccountQuotaWindow[];
+  /** Epoch ms when `windows` was last refreshed from the usage API. */
+  windowsUpdatedAt?: number;
+  /** Provenance of this snapshot's numbers. */
+  source?: AccountQuotaSource;
+};
+
+/** Where an AccountQuota snapshot came from.
+ *  - "headers"   : passive capture of anthropic-ratelimit-unified-* response
+ *                  headers on a routed request (the automatic path).
+ *  - "usage-api" : an explicit refresh against Anthropic's OAuth usage
+ *                  endpoint (manual refetch path). */
+export type AccountQuotaSource = "headers" | "usage-api";
+
+/** One dynamic limit bucket from the usage API. Provider vocabulary (`kind`,
+ *  `group`, `severity`) is preserved verbatim so buckets Anthropic adds later
+ *  survive storage and display without a code change. */
+export type AccountQuotaWindow = {
+  /** Provider kind, verbatim ("session", "weekly_all", "weekly_scoped", ...). */
+  kind: string;
+  /** Provider group, verbatim ("session" | "weekly" | future values). */
+  group?: string;
+  /** 0.0-1.0 utilization (provider percent / 100). */
+  used: number;
+  /** Provider severity, verbatim ("normal", ...). */
+  severity?: string;
+  /** Derived "allowed" | "rejected" (see usageToQuota status mapping). */
+  status: string;
+  /** Unix timestamp (seconds) when this window resets; 0 when unparseable. */
+  resetsAt: number;
+  isActive?: boolean;
+  /** Model display name for model-scoped windows (e.g. "Fable"). */
+  scopeModel?: string;
+  /** Wire model id for the scope when the provider reports one
+   *  (`scope.model.id`), which matches a request's `model` exactly and so beats
+   *  display-name matching. Often null in practice. */
+  scopeModelId?: string;
+  /** Surface scope when the provider reports one. */
+  scopeSurface?: string;
+  /** Epoch ms this individual window was observed. Lets a header-derived window
+   *  and a usage-API window on the same account age independently — the flat
+   *  `lastUpdated` refreshes on every response and would otherwise make a
+   *  days-old scoped window look current. */
+  updatedAt?: number;
+  /** Provenance of this window, mirroring AccountQuotaSource. */
+  source?: AccountQuotaSource;
+  /** Raw unified header token for header-derived windows, e.g. "7d_oi". */
+  headerWindow?: string;
+};
+
+/** One utilization window from the OAuth usage endpoint (wire shape, loose). */
+export type AnthropicUsageWindow = {
+  /** 0-100 percent (note: NOT the 0-1 fraction used by headers). */
+  utilization?: number | null;
+  /** ISO-8601 timestamp. */
+  resets_at?: string | null;
+};
+
+/** One entry of the usage endpoint's generic `limits[]` array (wire shape). */
+export type AnthropicUsageLimit = {
+  kind?: string;
+  group?: string;
+  /** 0-100 percent. */
+  percent?: number | null;
+  severity?: string | null;
+  resets_at?: string | null;
+  scope?: {
+    model?: { id?: string | null; display_name?: string | null } | null;
+    surface?: string | null;
+  } | null;
+  is_active?: boolean | null;
+};
+
+/** Response body of GET https://api.anthropic.com/api/oauth/usage (loose —
+ *  unknown keys are ignored, known keys may be absent or null). */
+export type AnthropicUsageResponse = {
+  five_hour?: AnthropicUsageWindow | null;
+  seven_day?: AnthropicUsageWindow | null;
+  limits?: AnthropicUsageLimit[] | null;
+  extra_usage?: { is_enabled?: boolean | null } | null;
+};
+
+/** Outcome of one account's usage-endpoint fetch. Return-not-throw. */
+export type AccountUsageFetchResult =
+  | { ok: true; usage: AnthropicUsageResponse }
+  | {
+      ok: false;
+      reason: "not_oauth" | "auth" | "http" | "network" | "parse";
+      error: string;
+      status?: number;
+    };
+
+export type ProxyQuotaRefreshRuntimeState = {
+  inFlight: boolean;
+  lastAttemptAt?: number;
+  lastSuccessAt?: number;
+  nextEligibleAt?: number;
+  consecutiveFailures: number;
+  lastFailureReason?: string;
+  lastCompletedTrigger?: string;
+  coalesced: number;
+};
+
+export type ProxyQuotaRefreshMetrics = {
+  attempted: number;
+  succeeded: number;
+  failed: number;
+  coalesced: number;
+  backoffSuppressed: number;
+  triggerDeduplicated: number;
+};
+
+export type ProxyQuotaRefreshRunResult =
+  | {
+      kind: "completed";
+      result: AccountUsageFetchResult;
+      /** Lower bound for the freshness of the returned usage snapshot. */
+      startedAt: number;
+    }
+  | { kind: "backoff"; nextEligibleAt: number }
+  | { kind: "not_due" };
+
+/** Per-account result inside a GET /limits response. */
+export type ProxyLimitsAccountResult = {
+  /** Account label (quota-store key). */
+  account: string;
+  /** Token-store key ("anthropic:<label>" or "codex:<label>"). */
+  key: string;
+  /**
+   * Which pool engine owns this login. Two logins can share a label — an
+   * operator may use one email for both — so the key, not the label, is the
+   * identity, and this names the engine without parsing the key's prefix.
+   */
+  provider: ProxyAccountProvider;
+  type: ProxyAccountType;
+  status: "refreshed" | "throttled" | "skipped_api_key" | "snapshot" | "error";
+  /** Fresh quota on "refreshed"; last known snapshot otherwise (may be null). */
+  quota: AccountQuota | null;
+  error?: string;
+  coolingUntil?: number;
+  coolingReason?: AccountCoolingReason;
+};
+
+/** The pool engine a login belongs to, as named on limits and accounts rows. */
+export type ProxyAccountProvider = "anthropic" | "codex";
+
+/**
+ * Test-only replacement for the token store behind the account-exposing
+ * routes. The token store is a module singleton bound to the real home at
+ * import, so a suite cannot redirect it; this lets a case state which logins
+ * exist (`knownKeys`, including disabled ones) and which are routable per
+ * engine, exactly as the real listers would answer.
+ */
+export type ProxyAccountDirectoryOverride = {
+  knownKeys: Set<string>;
+  anthropic: ProxyPassthroughAccount[];
+  codex: ProxyPassthroughAccount[];
+};
+
+/** Response body of the proxy's GET /limits endpoint. */
+export type ProxyLimitsRefreshResponse = {
+  fetchedAt: number;
+  /** True when served from stored state without contacting Anthropic. */
+  snapshot: boolean;
+  results: ProxyLimitsAccountResult[];
+  /** Process-local refresh activity; contains no credentials or response body. */
+  refreshMetrics?: ProxyQuotaRefreshMetrics;
 };
 
 /**
@@ -1268,6 +1684,7 @@ export type ClaudeProxyModelTier = "opus" | "sonnet" | "haiku" | "other";
 export type ProxyTranslationAttempt = {
   provider?: string;
   model?: string;
+  reasoningEffort?: FallbackEntry["reasoningEffort"];
   label: string;
 };
 
@@ -1320,6 +1737,12 @@ export type ProxyPaths = {
   cooldownFile: string;
   /** proxy-usage-stats.json — restart- and handoff-safe usage counters */
   statsFile?: string;
+  /** proxy-grants.json — grants this node has issued to borrowers */
+  grantsFile?: string;
+  /** proxy-share-ledger.json — coin balances, holds and settled spend */
+  ledgerFile?: string;
+  /** proxy-peers.json — lenders this node may borrow from */
+  peersFile?: string;
   /** Whether this is a dev-mode isolated instance */
   isDev: boolean;
 };
@@ -1361,6 +1784,13 @@ export type ProxyRequestContext = {
   sessionId?: string;
   userAgent?: string;
   clientApp?: string;
+  /**
+   * Provider that will serve the request, used for costing. Defaults to
+   * "anthropic" when omitted, which is correct for the /v1/messages engine;
+   * the OpenAI-compatible engine must pass whatever ModelRouter resolved, or
+   * every non-Anthropic model prices to $0.
+   */
+  provider?: string;
 };
 
 /** Response-side details parsed from the upstream reply (model, finish, tools). */
@@ -1483,10 +1913,12 @@ export type ProxyResponseTrackingObserver = {
   }) => void;
   onTerminal?: (details: {
     outcome: ProxyResponseTerminalOutcome;
+    /** Underlying read failure for structured transport diagnostics. */
+    error?: unknown;
     /** Decoded response-body bytes observed by the adapter. */
     observedBodyBytes: number;
     responseChunks: number;
-  }) => void;
+  }) => unknown;
 };
 
 /** Versioned lifecycle event names persisted by the proxy adapter. */
@@ -1499,7 +1931,8 @@ export type ProxyLifecycleEventName =
 /** Client-facing terminal classifications recorded by lifecycle metadata. */
 export type ProxyLifecycleTerminalOutcome =
   | ProxyResponseTerminalOutcome
-  | "handler_error";
+  | "handler_error"
+  | "unknown";
 
 /** Content-free lifecycle event accepted by the bounded metadata logger. */
 export type ProxyLifecycleEventInput = {
@@ -1513,6 +1946,17 @@ export type ProxyLifecycleEventInput = {
   sessionHash?: string;
   requestBytes?: number;
   responseStatus?: number;
+  /** Semantic final status; the HTTP status may already have been committed. */
+  finalStatus?: number;
+  /** Terminal bookkeeping health, separate from the model outcome. */
+  telemetryStatus?: "complete" | "timeout" | "observer_error" | "missing_final";
+  /** Transport completion is independent of successful model completion. */
+  transportOutcome?: ProxyResponseTerminalOutcome;
+  outcomeSource?:
+    | "final_request"
+    | "transport_error"
+    | "http_status"
+    | "unknown";
   /** Decoded response-body bytes observed by the adapter. */
   observedBodyBytes?: number;
   responseChunks?: number;
@@ -1540,6 +1984,10 @@ export type ProxyLifecycleLoggerSnapshot = {
   writeFailures: number;
   /** Events requeued after a transient lifecycle metadata write failure. */
   writeRetries: number;
+  /** Slow appends still owned by the original writer, never replayed on timeout. */
+  writeTimeouts: number;
+  /** Records in failed appends that may have partially reached the file. */
+  unconfirmedWrites: number;
   pending: number;
   inFlight: number;
   flushing: boolean;
@@ -1611,6 +2059,9 @@ export type ProxyAnalysisReport = {
     attemptLatency: boolean;
     cacheUsage: boolean;
     routingDecisions: boolean;
+    /** True only when every stream needed for cross-stream request/attempt
+     * reconciliation begins at or before the requested analysis window. */
+    comparableRequestAttempts: boolean;
   };
   dataQuality: {
     linesRead: number;
@@ -1618,12 +2069,20 @@ export type ProxyAnalysisReport = {
     unsupportedLifecycleLines: number;
     lifecycleSequenceGaps: number;
     lifecycleSequenceDuplicates: number;
+    conflictingLifecycleDuplicates: number;
+    duplicateAttempts: number;
+    finalOutcomeConflicts: number;
+    /** Missing evidence; may include in-flight or interrupted requests. */
+    acceptedWithoutFinal: number;
+    terminalWithoutFinal: number;
     streams: Record<
       ProxyAnalysisStreamName,
       {
         observedFrom: string | null;
         observedTo: string | null;
         startsAtOrBeforeRequestedWindow: boolean;
+        /** Whether this stream can support claims covering the full window. */
+        completeWindow: boolean;
       }
     >;
     bodyArtifacts: {
@@ -1665,6 +2124,7 @@ export type ProxyAnalysisReport = {
     errors: number;
     errorTypes: Record<string, number>;
     errorCodes: Record<string, number>;
+    transportScopes: Record<string, number>;
   };
   rateLimits: {
     attemptRateLimits: number;
@@ -1675,6 +2135,7 @@ export type ProxyAnalysisReport = {
   latencyMs: {
     headers: ProxyLatencySummary;
     firstChunk: ProxyLatencySummary;
+    firstUsefulOutput: ProxyLatencySummary;
     terminal: ProxyLatencySummary;
     finalRequest: ProxyLatencySummary;
     attempt: ProxyLatencySummary;
@@ -1686,7 +2147,27 @@ export type ProxyAnalysisReport = {
     cacheReadTokens: number;
     cacheCreationTokens: number;
     inputTokens: number;
+    outputTokens: number;
     requestHitRate: number | null;
+    /**
+     * Summed per-request cost in USD. Records that carry no model, or whose
+     * model matches no pricing table, contribute 0 — so this is a floor, not
+     * an exact bill. `requestsPriced` says how many records actually priced.
+     */
+    estimatedCostUsd: number;
+    requestsPriced: number;
+    /**
+     * Requests whose cost came from a longest-prefix fallback rather than an
+     * exact pricing row — the rate is inherited from a similarly-named model
+     * and may be wrong. Adding the real row makes these exact.
+     */
+    requestsPricedByPrefix: number;
+    /** Distinct models priced by prefix fallback, for the operator to chase. */
+    modelsPricedByPrefix: string[];
+    /** Requests carrying usage whose model matched no pricing row at all. */
+    requestsUnpriced: number;
+    /** Distinct models with no pricing row at all. */
+    unpricedModels: string[];
   };
   routing: {
     modes: Record<string, number>;
@@ -1720,17 +2201,62 @@ export type ProxyAnalysisAttemptRecord = {
 
 /** Final request fields retained while joining offline proxy log records. */
 export type ProxyAnalysisFinalRequestRecord = {
+  firstUsefulOutputMs: number | null;
   timestamp: string;
   status: number;
   durationMs: number | null;
   account: string;
   accountType: string;
+  model: string | null;
+  provider: string | null;
   inputTokens: number | null;
+  outputTokens: number | null;
   cacheReadTokens: number | null;
   cacheCreationTokens: number | null;
   errorType: string | null;
   errorCode: string | null;
   routingDecision: ProxyAccountRoutingDecision | null;
+};
+
+/**
+ * A stream transformer that also handles cancellation.
+ *
+ * The Streams standard gives `Transformer` a `cancel()` callback — invoked when
+ * the stream is aborted rather than closed cleanly — and Node implements it,
+ * but TypeScript's bundled lib does not declare it yet. Without it there is no
+ * way to observe a client hanging up mid-response.
+ */
+export type ProxyCancellableTransformer<I, O> = Transformer<I, O> & {
+  cancel?: (reason?: unknown) => void;
+};
+
+/**
+ * Token usage scraped from a Codex (OpenAI Responses) SSE stream.
+ *
+ * Verified against real traffic: captured from a live `codex exec` run through
+ * the proxy on 2026-08-21 (`test/fixtures/codex-response-usage.sse`). The
+ * shape is `response.completed` → `response.usage`, carrying `input_tokens`,
+ * `output_tokens`, and an `input_tokens_details` object with `cached_tokens`
+ * and `cache_write_tokens`. The parser also accepts the common variants. Treat
+ * a null result as "not observed", never as "zero tokens".
+ */
+export type CodexStreamUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  /** Cache writes, which bill at a premium over both reads and plain input. */
+  cacheCreationTokens: number;
+  reasoningTokens: number;
+};
+
+/** Semantic completion evidence observed in native Codex SSE bytes. */
+export type CodexStreamEvidence = {
+  completed: boolean;
+  terminalBytes: number;
+  firstUsefulOutputAt?: number;
+  errorType?: string;
+  errorMessage?: string;
+  errorCode?: string;
 };
 
 /** Validated account-routing evidence joined to a final request log. */
@@ -1756,6 +2282,12 @@ export type RuntimeRequestMetadata = {
   rejectForUpdate?: boolean;
   terminalErrorType?: string;
   terminalErrorCode?: string;
+  /** Canonical final record, populated synchronously before asynchronous I/O. */
+  terminalResult?: RequestLogEntry;
+  /** Releases this request's peer-share concurrency slot. Set by the share
+   *  gate for borrowed traffic; invoked once the response body completes, so a
+   *  long stream holds its slot for as long as it is actually streaming. */
+  shareRelease?: () => void;
 };
 
 // =============================================================================
@@ -1967,6 +2499,8 @@ export type SSEContentBlock = {
 
 /** Aggregated telemetry resolved when an SSE stream completes. */
 export type SSETelemetry = {
+  messageStopReceived: boolean;
+  firstUsefulOutputAt?: number;
   messageId: string;
   model: string;
   usage: {
@@ -2004,6 +2538,8 @@ export type StreamTerminalOutcomeTracker = {
 
 /** Mutable accumulator the SSE interceptor uses internally. */
 export type TelemetryAccumulator = {
+  messageStopReceived: boolean;
+  firstUsefulOutputAt?: number;
   messageId: string;
   model: string;
   inputTokens: number;
@@ -2045,6 +2581,15 @@ export type UpdateCheckResult = {
   currentVersion: string;
   latestVersion: string;
   updateAvailable: boolean;
+};
+
+/** Result of one local proxy health probe by the updater or fail-open guard. */
+export type ProxyHealthProbe = {
+  healthy: boolean;
+  durationMs: number;
+  failure: "http_status" | "network" | "timeout" | null;
+  statusCode: number | null;
+  errorCode: string | null;
 };
 
 /** Parsed major.minor.patch components of a semver string. */
@@ -2301,7 +2846,19 @@ export type RollingWorkerFailureDetails = {
   workerPid?: number;
   workerExitCode?: number | null;
   workerExitSignal?: string | null;
-  supervisorAction?: "none" | "sigkill_after_transfer_failure";
+  supervisorAction?:
+    | "none"
+    | "sigkill_after_transfer_failure"
+    | "cancel_uncommitted_socket";
+};
+
+export type RollingWorkerSupervisorEvent = {
+  at: string;
+  type: "activated" | "failure" | "failed_transfer" | "rejected_socket";
+  generation: number | null;
+  version: string | null;
+  phase?: "startup" | "activation" | "runtime" | "transfer";
+  reason?: string;
 };
 
 export type RollingWorkerSupervisorSnapshot = {
@@ -2314,8 +2871,12 @@ export type RollingWorkerSupervisorSnapshot = {
   } | null;
   draining: Array<{ pid: number; version: string; generation: number }>;
   queuedSockets: number;
+  /** Offered sockets awaiting acknowledgement or commit, across all workers. */
+  pendingTransfers?: number;
   rejectedSockets: number;
   failedTransfers: number;
+  /** Bounded generation-scoped evidence for attributing lifetime counters. */
+  recentEvents: RollingWorkerSupervisorEvent[];
   lastFailure:
     | ({
         at: string;
@@ -2334,13 +2895,15 @@ export type RollingWorkerSupervisorOptions = {
   ) => RollingWorkerHandle;
   readyTimeoutMs?: number;
   socketQueueLimit?: number;
+  /** Bound IPC socket offers independently of active HTTP requests. */
+  maxPendingTransfers?: number;
   socketQueueTimeoutMs?: number;
   shutdownTimeoutMs?: number;
   onStateChange?: (snapshot: RollingWorkerSupervisorSnapshot) => void;
   onReplacementRequested?: (request: {
     generation: number;
     pid: number;
-    reason: "environment";
+    reason: "environment" | "socket_offer_timeout";
   }) => void;
   log?: (message: string) => void;
 };
@@ -2355,6 +2918,7 @@ export type RollingProxyServerOptions = {
   ) => RollingWorkerHandle;
   readyTimeoutMs?: number;
   socketQueueLimit?: number;
+  maxPendingTransfers?: number;
   socketQueueTimeoutMs?: number;
   shutdownTimeoutMs?: number;
   recoveryDelayMs?: number;
@@ -2469,6 +3033,42 @@ export type ClaudeSnapshot = {
 export type ParsedClaudeError = {
   errorType?: string;
   message?: string;
+  /** `error.details.error_code`, e.g. "oauth_not_allowed_for_organization".
+   *  Absent on payloads that carry no details object. */
+  errorCode?: string;
+};
+
+/**
+ * Accounts rejected by an organization/plan entitlement policy during a single
+ * request. Anthropic answers such an account with a `permission_error` that no
+ * amount of retrying or token refreshing can fix, but which a *different*
+ * account may not hit at all — so it drives rotation, and is reported to the
+ * client only once every account has been tried.
+ */
+export type AnthropicEntitlementFailure = {
+  status: number;
+  /** Labels of every account that rejected this request on entitlement. */
+  accounts: string[];
+  /** Upstream message from the first such rejection. */
+  message: string;
+  errorCode?: string;
+};
+
+/**
+ * Every account's model-scoped window for the requested model is spent. Unlike
+ * a cooldown this is per-model: the same accounts stay healthy for every other
+ * model, so the client is told to switch model rather than to back off.
+ */
+export type AnthropicScopedExhaustion = {
+  /** Wire model id from the request. */
+  model: string;
+  /** Display name of the exhausted window, e.g. "Fable". */
+  scopeModel: string;
+  /** Epoch ms of the soonest reset across the exhausted accounts. */
+  earliestResetMs: number;
+  accounts: string[];
+  /** Provider reason overage is unavailable, e.g. "org_level_disabled". */
+  overageDisabledReason?: string;
 };
 
 // =============================================================================
@@ -2502,7 +3102,13 @@ export type ProxyRequestRoutingSnapshot = {
   quotaRoutingEnabled: boolean;
   sessionSoftLimit: number;
   sessionResetToleranceMs: number;
+  /** Operator policy on spending paid extra usage once a subscription window is
+   *  spent. Only "never" can override the provider's own signal. */
+  useOverage: ProxyOveragePolicy;
 };
+
+/** Operator policy for paid extra usage. */
+export type ProxyOveragePolicy = "auto" | "always" | "never";
 
 /** Immutable last-known-good proxy configuration published at runtime. */
 export type ProxyRuntimeConfigSnapshot = ProxyRequestRoutingSnapshot & {
@@ -2585,7 +3191,20 @@ export type ProxyNeurolinkRuntime = {
   neurolink: {
     getToolRegistry(): MCPToolRegistry;
   };
-  cleanupLogs: (daysToKeep?: number, maxFiles?: number) => void;
+  logsDir: string;
+};
+
+/** Data passed to the isolated proxy log-retention worker. */
+export type ProxyLogCleanupWorkerData = {
+  logsDir: string;
+  maxAgeDays: number;
+  maxSizeMb: number;
+};
+
+/** Lifecycle handle for non-blocking proxy log retention. */
+export type ProxyLogCleanupScheduler = {
+  trigger: () => boolean;
+  stop: () => Promise<void>;
 };
 
 /** Hono app + readiness state created by the proxy start command. */
@@ -2613,6 +3232,9 @@ export type StatusStats = {
   /** Whether this status response reconciled shared state or used local memory. */
   snapshotSource?: "reconciled" | "memory";
   accounts?: {
+    /** Provider-qualified key; null for explicitly unattributed legacy rows. */
+    key?: string | null;
+    provider?: "anthropic" | "codex" | "other" | "unknown";
     label: string;
     type: string;
     attempts?: number;
@@ -2653,7 +3275,7 @@ export type ProxyTelemetryAction =
 // =============================================================================
 
 /** Wire format a proxy request is using. */
-export type ProxyFormat = "claude" | "openai";
+export type ProxyFormat = "claude" | "openai" | "gemini";
 
 /**
  * Common adapter interface that hides the differences between
@@ -2802,6 +3424,42 @@ export type OpenAIErrorResponse = {
 };
 
 /** Parsed OpenAI request — intermediate form for NeuroLink pipeline. */
+/** One part of a Gemini `contents[].parts[]` entry. */
+export type ProxyGeminiPart = { text?: string; inlineData?: { data?: string } };
+
+/** One turn in a Gemini `contents[]` array. */
+export type ProxyGeminiContent = { role?: string; parts?: ProxyGeminiPart[] };
+
+/**
+ * A Gemini `generateContent` request, reduced to what translation needs.
+ *
+ * Google's shape differs from both others in three ways that matter here:
+ * roles are `user`/`model` rather than `user`/`assistant`, the system prompt
+ * lives in a sibling `systemInstruction` rather than in the turn list, and
+ * generation settings are nested under `generationConfig` instead of sitting
+ * at the top level.
+ */
+export type ParsedGeminiRequest = {
+  model: string;
+  maxTokens?: number;
+  temperature?: number;
+  topP?: number;
+  systemPrompt?: string;
+  stream: boolean;
+  prompt: string;
+  images: string[];
+  conversationMessages: Array<{ role: string; content: string }>;
+  tools: Record<
+    string,
+    {
+      description?: string;
+      inputSchema: unknown;
+      execute?: (...args: unknown[]) => unknown;
+    }
+  >;
+  stopSequences?: string[];
+};
+
 export type ParsedOpenAIRequest = {
   model: string;
   maxTokens?: number;
@@ -2824,4 +3482,886 @@ export type ParsedOpenAIRequest = {
   toolChoiceName?: string;
   stopSequences?: string[];
   responseFormat?: { type: string; jsonSchema?: unknown };
+};
+
+// =============================================================================
+// PEER SHARING TYPES (from proxy/shareGrants.ts, sharePolicy.ts, peerPool.ts)
+// =============================================================================
+
+/**
+ * How a borrower reaches the lender's capacity.
+ *
+ * - `live` — the borrower forwards each request to the lender's exposed proxy.
+ *   The lender's credentials never leave the lender's device and every request
+ *   passes the lender's gate, so control is immediate and cryptographic. The
+ *   borrower is dependent on the lender's device being reachable.
+ * - `complete` — the borrower holds an independently provisioned OAuth grant on
+ *   the lender's account and calls the upstream directly. Survives the lender
+ *   being offline; control is enforced by a signed lease plus usage audit,
+ *   which makes it cooperative rather than cryptographic.
+ */
+export type ProxyShareLevel = "live" | "complete";
+
+export type ProxyShareGrantState = "active" | "paused" | "revoked" | "expired";
+
+/** Whether consumption is metered against a coin balance or uncapped. */
+export type ProxyShareLedgerMode = "coins" | "unlimited";
+
+/** A ceiling expressed as a percentage of each subscription window. */
+export type ProxyShareWindowSlice = {
+  /** Percent of the 5-hour session window. */
+  session5hPct?: number;
+  /** Percent of the 7-day weekly window. */
+  weekly7dPct?: number;
+};
+
+/**
+ * Use-it-or-lose-it capacity: admit the borrower only in the run-up to a window
+ * reset, and only when little of that window was consumed. `maxSlicePct` caps
+ * how much of the remaining window the borrower may take while spilling over,
+ * so a spillover grant can still carry a hard ceiling.
+ */
+export type ProxyShareSpilloverGate = {
+  beforeResetHours: number;
+  whenUtilizationBelowPct: number;
+  maxSlicePct?: number;
+};
+
+/** Hour-of-day admission window, evaluated in the lender's local time. */
+export type ProxyShareSchedule = {
+  fromHour: number;
+  toHour: number;
+};
+
+export type ProxyShareRate = {
+  perMinute?: number;
+  concurrency?: number;
+};
+
+/**
+ * The gate set. Every configured gate must pass; the effective allowance is the
+ * minimum across all of them. Gates are deliberately orthogonal so a headroom
+ * grant can also carry a window-slice ceiling, a spillover grant can also carry
+ * a model allowlist, and so on.
+ */
+export type ProxyShareGates = {
+  /** Hard ceiling on how much of the **pool** the borrower may consume, as a
+   *  percentage of one window's worth of capacity. Pool-wide because an
+   *  operator saying "a fifth" means a fifth of what they have, not a fifth of
+   *  every credential they happen to own. */
+  maxSlice?: ProxyShareWindowSlice;
+  /** Per-account ceiling. Rare — reach for `maxSlice` unless you specifically
+   *  mean "this much of every credential, independently". */
+  maxSlicePerAccount?: ProxyShareWindowSlice;
+  /** Admit only while the lender's own utilization leaves this much headroom. */
+  reserveFloor?: ProxyShareWindowSlice;
+  spillover?: ProxyShareSpilloverGate;
+  /** Model tier allowlist, matched case-insensitively as substrings. */
+  models?: string[];
+  /** Which of the lender's accounts are lendable under this grant. */
+  accounts?: string[];
+  rate?: ProxyShareRate;
+  schedule?: ProxyShareSchedule;
+  /** Grant expiry, epoch ms. */
+  notAfter?: number;
+};
+
+export type ProxyShareRefillPeriod = "session" | "week";
+
+export type ProxyShareEntitlement = {
+  ledger: ProxyShareLedgerMode;
+  /** Remaining balance when `ledger` is "coins". */
+  coins?: number;
+  refill?: {
+    amount: number;
+    per: ProxyShareRefillPeriod;
+    lastAt?: number;
+  };
+};
+
+/** One lender-issued authorization for one borrower. */
+export type ProxyShareGrant = {
+  schemaVersion: 1;
+  id: string;
+  peerLabel: string;
+  /** sha256(salt + token). The token itself is never persisted. */
+  tokenHash: string;
+  tokenSalt: string;
+  level: ProxyShareLevel;
+  state: ProxyShareGrantState;
+  entitlement: ProxyShareEntitlement;
+  gates: ProxyShareGates;
+  createdAt: number;
+  updatedAt: number;
+  lastUsedAt?: number;
+  note?: string;
+  /** Complete-mode only: shared secret the lease signature is keyed by. */
+  leaseSecret?: string;
+  /**
+   * Shared secret receipts and netting claims are keyed by. Minted with the
+   * grant and handed to the borrower in the share link; deliberately survives
+   * `share rotate`, so receipts issued under an old token stay checkable.
+   */
+  receiptSecret?: string;
+  /** Cumulative coins forgiven by reciprocal netting on this grant. */
+  nettedCoins?: number;
+  /** Complete-mode only: which of the lender's own accounts was provisioned. */
+  provisionedAccount?: string;
+  /** Complete-mode lease shape. Absent means the defaults apply. */
+  leasePolicy?: {
+    ttlMs: number;
+    heartbeatEveryMs: number;
+    offlineGraceMs: number;
+  };
+};
+
+export type ProxyShareGrantFile = {
+  schemaVersion: 1;
+  grants: Record<string, ProxyShareGrant>;
+  /** This node's stable public address, when it has one. Recorded once so
+   *  every share link is minted against it without retyping. */
+  publicUrl?: string;
+  /** Node-level secret coin notes are signed with. Minted on first issue. */
+  noteSecret?: string;
+};
+
+/** Why a borrowed request was refused. Surfaced verbatim in a response header. */
+export type ProxyShareRefusalReason =
+  | "missing_token"
+  | "unknown_token"
+  | "malformed_token"
+  | "paused"
+  | "revoked"
+  | "expired"
+  | "out_of_window"
+  | "model_not_allowed"
+  | "exhausted"
+  | "rate_limited"
+  | "concurrency_limited"
+  | "reserve_floor"
+  /** Spillover is configured and the lender is not yet spilling. Transient. */
+  | "spillover_inactive"
+  | "slice_exhausted"
+  | "no_capacity";
+
+/**
+ * Result of evaluating an inbound borrowed request.
+ *
+ * A refusal carries its own status and reason so the borrower can distinguish
+ * "you are out of credits" from an upstream rate limit. Conflating the two makes
+ * a borrower cool the peer as if it were throttled and retry forever.
+ */
+export type ProxyShareAdmission =
+  | { admitted: true; grant: ProxyShareGrant }
+  | {
+      admitted: false;
+      status: number;
+      reason: ProxyShareRefusalReason;
+      message: string;
+      retryAfterSeconds?: number;
+      grant?: ProxyShareGrant;
+    };
+
+/** The refusing half of {@link ProxyShareAdmission}. */
+export type ProxyShareRefusedAdmission = Extract<
+  ProxyShareAdmission,
+  { admitted: false }
+>;
+
+/** Request-scoped view of the grant serving the current borrowed request. */
+export type ProxyShareRequestContext = {
+  grantId: string;
+  peerLabel: string;
+  level: ProxyShareLevel;
+  gates: ProxyShareGates;
+  ledger: ProxyShareLedgerMode;
+  /** Pre-authorization opened at admission; settlement closes it. */
+  holdId?: string;
+  /** Model the borrower asked for, carried so settlement can price it. */
+  model?: string;
+};
+
+/** What `share create` returns — the only moment the raw token exists. */
+export type ProxyShareIssuedGrant = {
+  grant: ProxyShareGrant;
+  token: string;
+};
+
+/** Everything `createShareGrant` needs to mint a grant. */
+export type ProxyShareGrantInput = {
+  peerLabel: string;
+  level: ProxyShareLevel;
+  entitlement: ProxyShareEntitlement;
+  gates: ProxyShareGates;
+  note?: string;
+};
+
+/** Partial edit applied by `share set` / `share topup` / `share level`. */
+export type ProxyShareGrantPatch = {
+  entitlement?: Partial<ProxyShareEntitlement>;
+  gates?: ProxyShareGates;
+  level?: ProxyShareLevel;
+  note?: string;
+};
+
+/** Runtime counters the rate gates need, supplied by the caller so the policy
+ *  evaluator stays pure. */
+export type ProxyShareRuntimeCounters = {
+  requestsInLastMinute: number;
+  inFlight: number;
+};
+
+/** Everything `evaluateShareAdmission` needs. Pure input — no I/O. */
+export type ProxyShareAdmissionInput = {
+  grant: ProxyShareGrant;
+  now: number;
+  /** Requested model, used against the model allowlist. */
+  model?: string;
+  counters: ProxyShareRuntimeCounters;
+  /** Remaining coins; omitted for an unlimited grant. */
+  coinBalance?: number;
+};
+
+/** One candidate account as the share gates see it. */
+export type ProxyShareAccountView = {
+  accountKey: string;
+  /** 0..1 utilization of the 5h window, or null when unobserved. */
+  sessionUsed: number | null;
+  /** 0..1 utilization of the 7d window, or null when unobserved. */
+  weeklyUsed: number | null;
+  /** Epoch ms when the 5h window resets, or null when unknown. */
+  sessionResetAt: number | null;
+  /** Epoch ms when the 7d window resets, or null when unknown. */
+  weeklyResetAt: number | null;
+  /** Fraction (0..1) of the current 5h window this grant has already taken. */
+  borrowedSessionFraction: number;
+  /** Fraction (0..1) of the current 7d window this grant has already taken. */
+  borrowedWeeklyFraction: number;
+};
+
+/**
+ * A grant's consumption of the pool, normalised to one window's worth.
+ *
+ * `Σ per-account fractions / accountCount`, so 0.2 means the borrower has taken
+ * a fifth of total pool capacity however it was spread across credentials.
+ */
+export type ProxySharePoolUsage = {
+  sessionFraction: number;
+  weeklyFraction: number;
+};
+
+/**
+ * One borrower's outstanding request for a resident credential.
+ *
+ * Holds the challenge, never a verifier and never a token — the lender is not
+ * in a position to leak what it does not have. `code` exists only between the
+ * lender authorizing and the borrower claiming, and is erased by consumption.
+ */
+export type ProxyShareProvisionRequest = {
+  schemaVersion: 1;
+  grantId: string;
+  /** Base64url SHA-256 of the borrower's verifier. */
+  codeChallenge: string;
+  challengeMethod: "S256";
+  /** Borrower-chosen state, echoed through the authorization round trip. */
+  state: string;
+  requestedAt: number;
+  expiresAt: number;
+  status: ProxyShareProvisionStatus;
+  /** Present only between authorization and the single claim that consumes it. */
+  code?: string;
+  authorizedAt?: number;
+  claimedAt?: number;
+  /** Which of the lender's accounts was authorized, for the drift audit. */
+  accountLabel?: string;
+};
+
+export type ProxyShareProvisionStatus = "pending" | "authorized" | "consumed";
+
+export type ProxyShareProvisionFile = {
+  schemaVersion: 1;
+  requests: Record<string, ProxyShareProvisionRequest>;
+};
+
+/**
+ * A lender's signed statement that one borrowed request was settled, and for
+ * how much.
+ *
+ * `usage` travels with it so the borrower can recompute the charge from the
+ * response it actually received, rather than taking the coin figure on faith.
+ * `sequence` is contiguous per grant, so a withheld receipt shows up as a gap.
+ */
+export type ProxyShareReceipt = {
+  schemaVersion: 1;
+  grantId: string;
+  /** Monotonic, contiguous, per grant. */
+  sequence: number;
+  settledAt: number;
+  model?: string;
+  usage: ProxyShareUsage;
+  coins: number;
+  /** Remaining balance after this charge; null on an unlimited grant. */
+  balanceAfter: number | null;
+  signature: string;
+};
+
+export type ProxyShareReceiptFile = {
+  schemaVersion: 1;
+  /** Per grant, oldest first, bounded. */
+  receipts: Record<string, ProxyShareReceipt[]>;
+  /** Cumulative coins each grant has had forgiven by netting. */
+  netted: Record<string, number>;
+  /**
+   * Lifetime coins receipted per grant.
+   *
+   * Kept separately because `receipts` is trimmed: summing the retained history
+   * would quietly under-count a busy grant, and netting reads this number.
+   */
+  consumedTotal?: Record<string, number>;
+  /**
+   * Highest sequence issued per grant, for the same reason.
+   *
+   * Taking it from the retained tail is right only until the tail is trimmed
+   * away, and a sequence that restarts would look like a replay to the
+   * borrower's audit.
+   */
+  highestSequence?: Record<string, number>;
+};
+
+/** What a borrower makes of the receipts it collected. */
+export type ProxyShareStatement = {
+  grantId: string;
+  receipts: number;
+  coins: number;
+  /** Receipts whose signature did not verify against the shared secret. */
+  unverified: number;
+  /** Receipts whose coin figure disagrees with its own usage block. */
+  miscounted: number;
+  /** Sequence numbers missing from an otherwise contiguous run. */
+  gaps: number[];
+  latestSequence: number;
+};
+
+/** One side's position in a reciprocal netting round. */
+export type ProxyShareNettingClaim = {
+  /** Cumulative coins the *other* node has consumed under my grant to them. */
+  consumedByYou: number;
+  /** Cumulative coins already forgiven on my side, so a replay nets nothing. */
+  alreadyNetted: number;
+  signature: string;
+};
+
+export type ProxyShareNettingResult = {
+  /** Coins forgiven in this round, on both sides. */
+  netted: number;
+  /** Cumulative total after this round. */
+  totalNetted: number;
+  detail: string;
+};
+
+/**
+ * A bearer credit one node issued, which any node holding it may redeem against
+ * the issuer.
+ *
+ * Signed by the issuer with a node-level secret, because the grant that
+ * eventually redeems it need not have existed when it was issued.
+ */
+export type ProxyShareNote = {
+  schemaVersion: 1;
+  noteId: string;
+  issuer: string;
+  coins: number;
+  issuedAt: number;
+  notAfter: number;
+  memo?: string;
+  signature: string;
+};
+
+export type ProxyShareNoteStatus =
+  | "valid"
+  | "spent"
+  | "expired"
+  | "unknown"
+  | "forged";
+
+export type ProxyShareNoteRecord = {
+  noteId: string;
+  coins: number;
+  issuedAt: number;
+  notAfter: number;
+  memo?: string;
+  redeemedAt?: number;
+  redeemedByGrant?: string;
+};
+
+export type ProxyShareNoteFile = {
+  schemaVersion: 1;
+  notes: Record<string, ProxyShareNoteRecord>;
+};
+
+/** The slice of a node HTTP server the proxy runtime actually closes. */
+export type ProxyClosableServer = {
+  close?: (callback?: (error?: Error) => void) => void;
+};
+
+/** A running gate-only share listener, as its supervisor sees it. */
+export type ProxyShareListenerHandle = {
+  port: number;
+  close: () => Promise<void>;
+};
+
+/** Result of lodging or authorizing a split-PKCE provisioning request. */
+export type ProxyShareProvisionOutcome =
+  | { ok: true; request: ProxyShareProvisionRequest }
+  | { ok: false; reason: string };
+
+/** Result of authenticating a `/peer/*` caller by its share token. */
+export type ProxyPeerAuthOutcome =
+  | { ok: true; grant: ProxyShareGrant }
+  | { ok: false; body: ProxyShareRefusalResponse["body"] };
+
+/** What a borrower gets back when its authorization code is ready to collect. */
+export type ProxyShareProvisionClaim = {
+  code: string;
+  state: string;
+  accountLabel: string;
+  leaseSecret: string;
+  lease: ProxyShareLease;
+  lenderUrl: string;
+};
+
+/** The verifier a borrower is holding while it waits to be authorized. */
+export type ProxyPeerPendingProvision = {
+  codeVerifier: string;
+  state: string;
+  requestedAt: number;
+};
+
+/**
+ * What `GET /peer/limits` tells a borrower.
+ *
+ * Scoped to the caller's own grant on purpose: it carries no account labels and
+ * no per-account figures, so it cannot be used to describe — or count — the
+ * lender's pool. `null` on a slice means no ceiling is configured for that
+ * window, which is different from a ceiling with nothing left.
+ */
+export type ProxyPeerLimitsSnapshot = {
+  grantState: ProxyShareGrantState;
+  level: ProxyShareLevel;
+  ledger: ProxyShareLedgerMode;
+  remainingCoins?: number;
+  /** Whether at least one of the lender's accounts can serve this grant now. */
+  servable: boolean;
+  withheldReason?: ProxyShareRefusalReason;
+  sliceLeftPct: {
+    session: number | null;
+    weekly: number | null;
+  };
+  retryAfterSeconds?: number;
+};
+
+/** Why one account was withheld from a grant. */
+export type ProxyShareAccountExclusion = {
+  accountKey: string;
+  reason: ProxyShareRefusalReason;
+};
+
+export type ProxyShareAccountFilterResult = {
+  allowed: string[];
+  excluded: ProxyShareAccountExclusion[];
+};
+
+/** A refusal rendered for the wire: status, headers and Anthropic-shaped body. */
+export type ProxyShareRefusalResponse = {
+  status: number;
+  headers: Record<string, string>;
+  body: {
+    type: "error";
+    error: { type: string; message: string };
+  };
+};
+
+/**
+ * What the inbound gate decided.
+ *
+ * `local` is the unauthenticated path a node's own client takes on loopback; it
+ * carries no grant and no accounting. `admitted` owns a concurrency slot that
+ * the caller must release. `refused` is ready to write to the wire as-is.
+ */
+export type ProxyShareGateOutcome =
+  | { kind: "local" }
+  | {
+      kind: "admitted";
+      context: ProxyShareRequestContext;
+      release: () => void;
+    }
+  | { kind: "refused"; response: ProxyShareRefusalResponse };
+
+/** Per-grant sliding-window request timestamps and in-flight count. */
+export type ProxyShareGrantCounters = {
+  timestamps: number[];
+  inFlight: number;
+};
+
+/** Model-weighted token usage settled against a grant. */
+export type ProxyShareUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens?: number;
+  cacheReadTokens?: number;
+};
+
+/**
+ * One grant's consumption of one account's current windows.
+ *
+ * Keyed by the window's reset timestamp so a reset starts a fresh bucket
+ * automatically — without that, a slice ceiling would latch permanently after
+ * the first busy window.
+ */
+export type ProxyShareLedgerBucket = {
+  grantId: string;
+  accountKey: string;
+  sessionResetAt: number | null;
+  weeklyResetAt: number | null;
+  /** Accumulated 5h-window utilization attributable to this grant (0..1). */
+  sessionFraction: number;
+  /** Accumulated 7d-window utilization attributable to this grant (0..1). */
+  weeklyFraction: number;
+  coinsSpent: number;
+  requests: number;
+  updatedAt: number;
+};
+
+export type ProxyShareLedgerFile = {
+  schemaVersion: 1;
+  buckets: Record<string, ProxyShareLedgerBucket>;
+};
+
+/** An open pre-authorization against a grant's balance. */
+export type ProxyShareHold = {
+  id: string;
+  grantId: string;
+  coins: number;
+  openedAt: number;
+};
+
+/** Coin settlement for a finished borrowed request. */
+export type ProxyShareSettlement = {
+  grantId: string;
+  accountKey: string;
+  model?: string;
+  usage: ProxyShareUsage;
+  holdId?: string;
+};
+
+/**
+ * A before/after utilization observation for one borrowed request.
+ *
+ * Recorded where the response's quota headers are parsed, because that is the
+ * only point at which both the previous snapshot and the new one are in hand.
+ * Token usage settles separately: on a stream it is not known until
+ * `message_delta`, long after the headers arrived.
+ */
+export type ProxyShareWindowObservation = {
+  grantId: string;
+  accountKey: string;
+  sessionBefore?: number | null;
+  sessionAfter?: number | null;
+  sessionResetAt?: number | null;
+  weeklyBefore?: number | null;
+  weeklyAfter?: number | null;
+  weeklyResetAt?: number | null;
+};
+
+/** Per-grant rollup for `share status`. */
+export type ProxyShareGrantUsageSummary = {
+  grantId: string;
+  coinsSpent: number;
+  requests: number;
+  accounts: number;
+  lastUsedAt: number | null;
+};
+
+// =============================================================================
+// PEER BORROWING TYPES (from proxy/peerStore.ts, peerTransport.ts)
+// =============================================================================
+
+/** Why a peer is temporarily not worth trying. */
+export type ProxyPeerCooldownReason =
+  | "exhausted"
+  | "paused"
+  | "revoked"
+  | "expired"
+  | "withheld"
+  | "unreachable"
+  | "upstream_error";
+
+/** Last thing a peer told us, kept so `peer status` can answer offline. */
+export type ProxyPeerObservation = {
+  grantStatus?: string;
+  grantReason?: string;
+  remainingCoins?: number;
+  observedAt: number;
+};
+
+/** A lender this node may borrow from. */
+export type ProxyPeer = {
+  schemaVersion: 1;
+  name: string;
+  url: string;
+  token: string;
+  /** Lower is tried first. Peers of equal priority keep insertion order. */
+  priority: number;
+  enabled: boolean;
+  createdAt: number;
+  updatedAt: number;
+  note?: string;
+  lastUsedAt?: number;
+  cooldownUntil?: number;
+  cooldownReason?: ProxyPeerCooldownReason;
+  lastObservation?: ProxyPeerObservation;
+  /** Set while a split-PKCE provisioning request is outstanding. */
+  pendingProvision?: ProxyPeerPendingProvision;
+  /** Shared secret this lender's receipts are signed with, when known. */
+  receiptSecret?: string;
+  /** Label of the grant this node issued to the same person, for netting. */
+  reciprocalPeer?: string;
+  /** Highest receipt sequence collected from this lender. */
+  lastReceiptSequence?: number;
+};
+
+export type ProxyPeerFile = {
+  schemaVersion: 1;
+  peers: Record<string, ProxyPeer>;
+};
+
+/** Outcome of forwarding one request to one peer. */
+export type ProxyPeerAttempt =
+  | { ok: true; response: Response; peer: ProxyPeer }
+  | {
+      ok: false;
+      peer: ProxyPeer;
+      status?: number;
+      reason: ProxyPeerCooldownReason;
+      message: string;
+      retryAfterSeconds?: number;
+    };
+
+/** What `peer add` accepts. */
+export type ProxyPeerInput = {
+  name: string;
+  url: string;
+  token: string;
+  /** Shared secret this lender signs receipts with, when the link carried one. */
+  receiptSecret?: string;
+  priority?: number;
+  note?: string;
+};
+
+export type ProxyPeerArgs = {
+  action?:
+    | "add"
+    | "request"
+    | "list"
+    | "status"
+    | "sync"
+    | "receipts"
+    | "net"
+    | "redeem"
+    | "test"
+    | "remove"
+    | "pause"
+    | "resume"
+    | "set";
+  /** `peer request --claim`: collect a code the lender has authorized. */
+  claim?: boolean;
+  /** Shared secret for verifying this lender's receipts, when added by hand. */
+  receiptSecret?: string;
+  /** `peer net`: label of the grant this node issued to the same person. */
+  reciprocal?: string;
+  /** `peer redeem`: the coin note to present. */
+  noteValue?: string;
+  /** `peer redeem --check`: ask the issuer about a note without spending it. */
+  check?: boolean;
+  /** Local account label for a provisioned credential. */
+  label?: string;
+  name?: string;
+  url?: string;
+  token?: string;
+  link?: string;
+  priority?: number;
+  note?: string;
+  json?: boolean;
+  dev?: boolean;
+};
+
+// =============================================================================
+// COMPLETE-MODE LEASE TYPES (from proxy/shareLease.ts)
+// =============================================================================
+
+/**
+ * The offline-survivable projection of a grant.
+ *
+ * A complete-mode borrower holds a credential on the lender's account and calls
+ * the upstream directly, so the lender's gate is not in the request path. The
+ * lease is what control looks like without that gate: the borrower enforces it
+ * locally, refreshes it by heartbeat, and stops when it can no longer prove the
+ * lender still consents.
+ */
+export type ProxyShareLease = {
+  schemaVersion: 1;
+  grantId: string;
+  peerLabel: string;
+  issuedAt: number;
+  /** Hard stop, honored even by a borrower that never calls home again. */
+  notAfter: number;
+  /** How often the borrower should check in. */
+  heartbeatEveryMs: number;
+  /** How long the borrower may keep serving while the lender is unreachable. */
+  offlineGraceMs: number;
+  /** The gate set, snapshotted at issue time. */
+  gates: ProxyShareGates;
+  /** Coin balance at issue time; "unlimited" for an uncapped grant. */
+  entitlementSnapshot: number | "unlimited";
+  /** HMAC over the payload, keyed by the grant's lease secret. */
+  signature: string;
+};
+
+/** Why a lease is not currently usable. */
+export type ProxyShareLeaseVerdict =
+  | { usable: true; nextHeartbeatDueAt: number }
+  | {
+      usable: false;
+      reason: "unsigned" | "expired" | "grace_elapsed" | "stopped";
+      detail: string;
+    };
+
+/** The refusing half of {@link ProxyShareLeaseVerdict}. */
+export type ProxyShareLeaseRefusal = Extract<
+  ProxyShareLeaseVerdict,
+  { usable: false }
+>;
+
+/** What a borrower sends when checking in. */
+export type ProxyShareHeartbeatRequest = {
+  grantId: string;
+  /** Coins the borrower believes it has spent since the last heartbeat. */
+  coinsSpent?: number;
+  requests?: number;
+  /** Borrower's clock, for drift diagnostics only. */
+  reportedAt: number;
+};
+
+/** What the lender answers with. */
+export type ProxyShareHeartbeatResponse =
+  | { ok: true; lease: ProxyShareLease }
+  | { ok: false; stop: true; reason: string };
+
+/** The stopping half of {@link ProxyShareHeartbeatResponse}. */
+export type ProxyShareHeartbeatStop = Extract<
+  ProxyShareHeartbeatResponse,
+  { ok: false }
+>;
+
+/** The renewing half of {@link ProxyShareHeartbeatResponse}. */
+export type ProxyShareHeartbeatRenewal = Extract<
+  ProxyShareHeartbeatResponse,
+  { ok: true }
+>;
+
+/** A credential provisioned onto a borrower's device under a complete grant. */
+export type ProxyResidentGrant = {
+  schemaVersion: 1;
+  /** Local tokenStore label, unique on the borrower's device. */
+  accountLabel: string;
+  grantId: string;
+  lenderName: string;
+  lenderUrl: string;
+  /** Shared secret used to verify leases from this lender. */
+  leaseSecret: string;
+  lease: ProxyShareLease;
+  lastHeartbeatAt?: number;
+  /** Coins spent since the last successful heartbeat, awaiting report. */
+  unreportedCoins?: number;
+  unreportedRequests?: number;
+};
+
+export type ProxyResidentGrantFile = {
+  schemaVersion: 1;
+  grants: Record<string, ProxyResidentGrant>;
+};
+
+// =============================================================================
+// COMPLETE-MODE DRIFT AUDIT (from proxy/shareAudit.ts)
+// =============================================================================
+
+/**
+ * One heartbeat's worth of evidence about a complete-mode grant.
+ *
+ * The lender cannot see a resident credential's requests — they never touch this
+ * node. What it *can* see is the account's own utilization, which the provider
+ * reports and the borrower cannot influence. Pairing that with what the borrower
+ * claimed to spend is the whole audit.
+ */
+export type ProxyShareAuditObservation = {
+  at: number;
+  /** 0..1 utilization of the account's 5h window at this heartbeat. */
+  sessionUsed: number | null;
+  /** 0..1 utilization of the account's 7d window at this heartbeat. */
+  weeklyUsed: number | null;
+  /** Coins the borrower reported since the previous heartbeat. */
+  reportedCoins: number;
+  /** Requests this node itself served on the account **since the previous
+   *  observation**. A per-interval delta, not a running total: the drift check
+   *  asks whether the lender used the account during this interval. */
+  lenderRequests: number;
+};
+
+/** Rolling audit state for one complete-mode grant. */
+export type ProxyShareAuditRecord = {
+  grantId: string;
+  /** The lender's own account the credential was provisioned from. */
+  accountLabel: string;
+  lastObservation?: ProxyShareAuditObservation;
+  /** Running lifetime total of lender-served requests on the account, kept so
+   *  the next observation's delta can be computed. */
+  lenderRequestsTotal?: number;
+  /** Consecutive heartbeats where the account moved but nothing was reported. */
+  driftStreak: number;
+  lastDriftAt?: number;
+  lastDriftDetail?: string;
+  /** Set once the streak crossed the tolerance and the grant was paused. */
+  autoPausedAt?: number;
+};
+
+export type ProxyShareAuditFile = {
+  schemaVersion: 1;
+  records: Record<string, ProxyShareAuditRecord>;
+};
+
+/** The verdict of comparing one heartbeat against the account's real movement. */
+export type ProxyShareDriftVerdict =
+  | { drifted: false; reason: "no_baseline" | "attributable" | "quiet" }
+  | {
+      drifted: true;
+      /** How much of a window moved without being accounted for. */
+      unexplainedSessionPct: number;
+      unexplainedWeeklyPct: number;
+      detail: string;
+    };
+
+/** The handover artifact a lender gives a complete-share borrower. */
+export type ProxyShareProvisioningBundle = {
+  schemaVersion: 1;
+  grantId: string;
+  lenderName: string;
+  lenderUrl: string;
+  accountLabel: string;
+  leaseSecret: string;
+  lease: ProxyShareLease;
+  tokens: {
+    accessToken: string;
+    refreshToken?: string;
+    expiresAt?: number;
+  };
 };

@@ -35,8 +35,8 @@ import type {
   GenerateOptions,
   StreamOptions,
 } from "../dist/index.js";
-import { ProviderFactory } from "../dist/lib/factories/providerFactory.js";
-import { ProviderRegistry } from "../dist/lib/factories/providerRegistry.js";
+import { ProviderFactory } from "../dist/factories/providerFactory.js";
+import { ProviderRegistry } from "../dist/factories/providerRegistry.js";
 
 import { assertDistFresh } from "./helpers/distFreshness.js";
 
@@ -389,7 +389,10 @@ async function testInstanceAndCallBehavior(): Promise<void> {
     // for log levels below DEBUG. We capture stdout for a brief window.
     const logged: string[] = [];
     const originalWrite = process.stdout.write.bind(process.stdout);
-    (process.stdout as any).write = (chunk: unknown, ...args: any[]) => {
+    (process.stdout as any).write = (
+      chunk: string | Uint8Array<ArrayBufferLike>,
+      ...args: any[]
+    ) => {
       if (typeof chunk === "string") {
         logged.push(chunk);
       }

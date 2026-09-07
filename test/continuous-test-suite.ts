@@ -22,6 +22,46 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
+/**
+ * Build the failure detail for a test that runs its body in a spawned script.
+ *
+ * These tests only ever inspected the child's stdout. When the child dies
+ * before printing anything -- a crash at import, a SIGTERM from the harness
+ * timeout, an unhandled rejection -- stdout is empty, so the detail collapsed
+ * to an empty string and the suite reported a bare "failed" with nothing to go
+ * on. That is exactly the state "JSON Format with 3+ Images (SDK)" fails in:
+ * reproducible in a full run, passing every time when driven directly, and
+ * undiagnosable from the log because the child's stderr was thrown away.
+ *
+ * Prefer the child's own FAIL line when it managed to print one; otherwise say
+ * what actually happened, including the exit code and the tail of stderr.
+ */
+function subprocessFailureDetail(result: {
+  stdout: string;
+  stderr: string;
+  exitCode?: number;
+  code?: number | null;
+}): string {
+  const own = result.stdout.split("\n").find((l) => l.includes("FAIL"));
+  if (own) {
+    return own;
+  }
+  const exit = result.exitCode ?? result.code ?? "unknown";
+  const out = (result.stdout || "").trim();
+  const err = (result.stderr || "").trim();
+  if (!out && !err) {
+    return `child produced no output at all (exit ${exit}) -- it died before printing, so there is no assertion result to report`;
+  }
+  const parts = [`child printed no FAIL line (exit ${exit})`];
+  if (out) {
+    parts.push(`stdout: ${out.slice(0, 200)}`);
+  }
+  if (err) {
+    parts.push(`stderr: ${err.slice(-400)}`);
+  }
+  return parts.join(" | ");
+}
+
 // Read package.json dynamically for version and main script
 const packageJsonPath = "package.json";
 let packageData: { version?: string; main?: string };
@@ -167,7 +207,65 @@ import {
   defineSuite,
   log,
   logSection as harnessLogSection,
+  isCaseTimeout,
+  withCaseTimeout,
 } from "./helpers/harness.js";
+
+/**
+ * 600s rather than the shared 240s default.
+ *
+ * This file is the orchestrator: its cases are end-to-end journeys against live
+ * providers — several models, tool round-trips and file processing inside a
+ * single case — where the shared default is a plausible honest duration rather
+ * than a hang. Firing there would be a false positive, and a false positive
+ * here is unusually expensive: the bound is fail-closed, so one wrong timeout
+ * turns every later case into "not run" and the run reports nothing usable.
+ *
+ * A case that needs longer than ten minutes is a hang worth failing on, which
+ * is the line this number is meant to draw.
+ *
+ * This number is measured, not guessed. Three runs of the same commit:
+ *
+ *   240s  ->  21 passed / 14 failed
+ *   600s  ->  35 passed /  0 failed / 2 skipped, no timeout trace at all
+ *   240s  ->  23 passed / 12 failed, and the reason, in the log:
+ *
+ *     Model Alias Redirect exceeded 240000ms and was aborted
+ *     not run — "Model Alias Redirect" was abandoned by its timeout ...   (x18)
+ *
+ * So in-suite that case takes between 240s and 600s, and at 240s it does not
+ * merely fail itself — it fail-closes the 18 cases behind it. That is the bound
+ * working as designed (never publish results from a process with dirty state),
+ * and it is why the orchestrator's number cannot be the shared one: here a
+ * single false positive costs half the suite.
+ *
+ * Do NOT read that as "the case is slow" — it is INTERMITTENT, which is the
+ * whole reason this bound has to be generous. Measured four ways:
+ *
+ *   standalone, three runs          6.2s / 6.3s / 6.9s
+ *   in-suite, profiled run          5.1s
+ *   in-suite, two other runs        >240s (aborted by the bound)
+ *
+ * So the same call is normally ~5-7s in this very suite and occasionally hangs
+ * past four minutes. Ruled out as causes: provider throttling (no 429s; the 36
+ * "rate limit" strings in the log are this suite's own "waiting 10s" notice),
+ * undisposed per-case NeuroLink instances (six retained instances changed it by
+ * 1.01x), and handle leakage (active handles plateau at 14-16 and do not grow).
+ * The remaining candidate is a provider-side stall on an individual request,
+ * which no bound can prevent and only a generous one can survive.
+ *
+ * And it is NOT specific to this case, so do not go optimising it by name.
+ * Across four runs the stall landed on a different case each time — Model Alias
+ * Redirect twice, and once on "SDK Mimetype Hint — extension-less Buffer",
+ * which sat 180s inside its own spawned subprocess and passed cleanly in the
+ * run before. Roughly one stall per run over ~37 live calls, with the same call
+ * completing in 2-6s when re-run alone. Treat a single slow case here as a
+ * sample of that, not as a property of the case.
+ *
+ * That is what this number buys: a rare stall fails one case instead of
+ * aborting the run. It is not a claim that ten minutes is reasonable work.
+ */
+const ORCHESTRATOR_CASE_TIMEOUT_MS = 600_000;
 const { recordTest, runSuite } = defineSuite("Continuous Test Suite (root)");
 
 // `ColorName` is imported elsewhere in this file from `./types/mcp.js`;
@@ -1584,7 +1682,7 @@ function registerHITLBusinessTools(neurolink: NeuroLink): void {
 
 /*
  * ========================================================================================
- * TODO: FIX HITL TESTS - CURRENT APPROACH IS NON-DETERMINISTIC
+ * TODO(#1318): FIX HITL TESTS - CURRENT APPROACH IS NON-DETERMINISTIC
  * ========================================================================================
  *
  * PROBLEM:
@@ -3150,7 +3248,7 @@ async function testSDKMimetypeHintExtensionlessBuffer(): Promise<
   // tiers in one test invocation.
   try {
     const { FileDetector } = await import(
-      `${process.cwd()}/dist/lib/utils/fileDetector.js`
+      `${process.cwd()}/dist/utils/fileDetector.js`
     );
     const tinyJson = Buffer.from('{"ok":true}', "utf-8");
     const det = await FileDetector.detectAndProcess(tinyJson, {
@@ -3428,6 +3526,13 @@ const REAL_HTTP_MCP_SERVERS = {
 //
 // Each test SKIPs on credential errors and FAILs on the bug signature.
 
+// A model that is not enabled for the caller's GCP project returns 404
+// NOT_FOUND, which is environmental rather than a defect in this package. The
+// suite must not report that as a failure. Kept as one pattern so the CLI and
+// the generated SDK scripts cannot drift apart.
+const MODEL_UNAVAILABLE_PATTERN =
+  /NOT_FOUND|not available in region|was not found or your project does not have access/i;
+
 async function testTextRequestOnDualModeImageModelCLI(): Promise<
   boolean | null
 > {
@@ -3469,6 +3574,22 @@ async function testTextRequestOnDualModeImageModelCLI(): Promise<
         "Text Request on Dual-Mode Image Model (CLI)",
         "SKIP",
         "Vertex credentials not configured",
+      );
+      return null;
+    }
+
+    // SKIP when the model simply is not provisioned for this project/region.
+    // Credentials can be perfectly valid and still get a 404 here: the test
+    // pins a specific preview model, and whether that model is enabled varies
+    // by GCP project. Without this the suite reports a hard FAIL for a purely
+    // environmental reason, which is a standing false alarm. Still placed
+    // AFTER the bug-signature check above, so a genuine mis-route to the
+    // image pipeline is never masked by it.
+    if (MODEL_UNAVAILABLE_PATTERN.test(combined)) {
+      logTest(
+        "Text Request on Dual-Mode Image Model (CLI)",
+        "SKIP",
+        "model not provisioned for this project/region",
       );
       return null;
     }
@@ -3547,6 +3668,12 @@ async function run() {
       console.log('SDK Text on Image Model: SKIP - credentials not configured');
       process.exit(0);
     }
+    // Same environmental-404 guard as the CLI path: a valid credential
+    // can still hit a model that is not enabled for this project.
+    if (/NOT_FOUND|not available in region|was not found or your project does not have access/i.test(msg)) {
+      console.log('SDK Text on Image Model: SKIP - model not provisioned for this project/region');
+      process.exit(0);
+    }
     console.log('SDK Text on Image Model: FAIL - ' + (msg || String(error)).slice(0, 300));
     process.exit(1);
   }
@@ -3573,9 +3700,7 @@ run();
       );
       return true;
     }
-    const failLine =
-      result.stdout.split("\n").find((l) => l.includes("FAIL")) ||
-      result.stdout.slice(0, 300);
+    const failLine = subprocessFailureDetail(result);
     logTest("Text Request on Dual-Mode Image Model (SDK)", "FAIL", failLine);
     return false;
   } catch (error) {
@@ -3694,6 +3819,12 @@ async function run() {
       console.log('Schema 3+ Images: SKIP - credentials not configured');
       process.exit(0);
     }
+    // Same environmental-404 guard as the CLI path: a valid credential
+    // can still hit a model that is not enabled for this project.
+    if (/NOT_FOUND|not available in region|was not found or your project does not have access/i.test(msg)) {
+      console.log('Schema 3+ Images: SKIP - model not provisioned for this project/region');
+      process.exit(0);
+    }
     console.log('Schema 3+ Images: FAIL - ' + (msg || String(error)).slice(0, 300));
     process.exit(1);
   }
@@ -3722,26 +3853,40 @@ run();
       );
       return true;
     }
-    // Inner process timed out or crashed without printing anything useful —
-    // treat as SKIP because we cannot distinguish a real schema regression
-    // from a transient resource starvation under heavy concurrent test load.
-    if (result.exitCode === -1 || result.stdout.trim() === "") {
+    // Only a child that left nothing to judge may be skipped.
+    //
+    // `runCommand` reports `code === -1` when the close event carried a signal
+    // instead of an exit code — an outside kill, e.g. the OOM killer under
+    // heavy concurrent load. That carries no verdict, and neither does a child
+    // that died before writing to either stream. Both stay SKIP.
+    //
+    // The old guard also skipped on `stdout === ""` alone. That is how a Node
+    // process normally fails: exit non-zero, stack trace on stderr, nothing on
+    // stdout. Every such crash — including a genuine schema regression — was
+    // reported green. A child that explained itself on stderr is diagnosable,
+    // so it is a failure.
+    //
+    // A timeout never reaches here: `runCommand` rejects on timeout, so it
+    // lands in the catch below and is reported as a FAIL with its own message.
+    const killedBySignal = result.code === -1;
+    const silent = result.stdout.trim() === "" && result.stderr.trim() === "";
+    if (killedBySignal || silent) {
       logTest(
         "Schema Output with 3+ Images (SDK)",
         "SKIP",
-        `inner process produced no output (exit=${result.exitCode}); stderr=${(result.stderr || "").slice(0, 200)}`,
+        killedBySignal
+          ? "inner process was killed by a signal, so it produced no verdict"
+          : `inner process wrote nothing to either stream (exit=${result.code})`,
       );
       return null;
     }
-    const failLine =
-      result.stdout.split("\n").find((l) => l.includes("FAIL")) ||
-      result.stdout.slice(0, 300);
-    const detail =
-      `${failLine} | stderr=${(result.stderr || "").slice(0, 200)}`.slice(
-        0,
-        500,
-      );
-    logTest("Schema Output with 3+ Images (SDK)", "FAIL", detail);
+    // subprocessFailureDetail() already appends the tail of stderr when the
+    // child printed no FAIL line, so do not append it a second time here.
+    logTest(
+      "Schema Output with 3+ Images (SDK)",
+      "FAIL",
+      subprocessFailureDetail(result).slice(0, 500),
+    );
     return false;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -3758,6 +3903,23 @@ run();
 
 async function testJsonFormatWithMultipleImagesSDK(): Promise<boolean | null> {
   logSection("Testing output.format=json with 3+ Images (SDK)");
+
+  // Fail loudly rather than silently testing a stale build.
+  //
+  // This used to live inside the generated child script as
+  // `import { assertDistFresh } from "./helpers/distFreshness.js"`. That could
+  // never work: the child is written into a mkdtemp directory under test/.tmp
+  // and run with plain `node`, so the relative specifier resolved to
+  // test/.tmp/<random>/helpers/distFreshness.js, and no compiled .js of that
+  // helper exists anywhere in the tree either. Every run died with
+  // ERR_MODULE_NOT_FOUND before printing a single line — which is why this test
+  // failed in every full-suite run while passing whenever the same call was
+  // driven directly, and why the failure carried no message.
+  //
+  // The parent runs under tsx and can load the helper normally, and the build
+  // is equally stale or fresh for both, so check it once here.
+  const { assertDistFresh } = await import("./helpers/distFreshness.js");
+  assertDistFresh();
 
   const screenshotPath = "test/fixtures/sample-screenshot.png";
   if (!fs.existsSync(screenshotPath)) {
@@ -3784,11 +3946,6 @@ async function testJsonFormatWithMultipleImagesSDK(): Promise<boolean | null> {
     const testScript = `
 import { NeuroLink } from '${process.cwd()}/dist/index.js';
 import { readFileSync } from 'fs';
-
-import { assertDistFresh } from "./helpers/distFreshness.js";
-
-// Fail loudly rather than silently testing a stale build (see distFreshness.ts).
-assertDistFresh();
 
 async function run() {
   const sdk = new NeuroLink();
@@ -3859,6 +4016,12 @@ async function run() {
       console.log('JSON 3+ Images: SKIP - credentials not configured');
       process.exit(0);
     }
+    // Same environmental-404 guard as the CLI path: a valid credential
+    // can still hit a model that is not enabled for this project.
+    if (/NOT_FOUND|not available in region|was not found or your project does not have access/i.test(msg)) {
+      console.log('JSON 3+ Images: SKIP - model not provisioned for this project/region');
+      process.exit(0);
+    }
     console.log('JSON 3+ Images: FAIL - ' + (msg || String(error)).slice(0, 300));
     process.exit(1);
   }
@@ -3885,9 +4048,7 @@ run();
       );
       return true;
     }
-    const failLine =
-      result.stdout.split("\n").find((l) => l.includes("FAIL")) ||
-      result.stdout.slice(0, 300);
+    const failLine = subprocessFailureDetail(result);
     logTest("JSON Format with 3+ Images (SDK)", "FAIL", failLine);
     return false;
   } catch (error) {
@@ -4152,7 +4313,7 @@ async function testModelAliasWarn(): Promise<boolean | null> {
 async function testAccountPoolRuntime(): Promise<boolean | null> {
   logSection("Testing AccountPool Runtime");
   try {
-    const { AccountPool } = await import("../dist/lib/auth/accountPool.js");
+    const { AccountPool } = await import("../dist/auth/accountPool.js");
 
     const pool = new AccountPool({ strategy: "round-robin" });
     pool.addAccount({
@@ -4231,7 +4392,7 @@ async function testAccountPoolRuntime(): Promise<boolean | null> {
 async function testModelRouterRuntime(): Promise<boolean | null> {
   logSection("Testing ModelRouter Runtime");
   try {
-    const { ModelRouter } = await import("../dist/lib/proxy/modelRouter.js");
+    const { ModelRouter } = await import("../dist/proxy/modelRouter.js");
     const router = new ModelRouter({
       strategy: "round-robin",
       modelMappings: [
@@ -4294,7 +4455,47 @@ async function testClaudeFormatRuntime(): Promise<boolean | null> {
   logSection("Testing ClaudeFormat Runtime");
   try {
     const { parseClaudeRequest, serializeClaudeResponse, buildClaudeError } =
-      await import("../dist/lib/proxy/claudeFormat.js");
+      await import("../dist/proxy/claudeFormat.js");
+    const { parseOpenAIRequest } =
+      await import("../dist/proxy/openaiFormat.js");
+
+    // The same regression on the OTHER side of the boundary. claudeFormat's fold
+    // exists to mirror parseOpenAIRequest's handling of inline system messages, so
+    // a guard on only one of them leaves the mirrored path free to drift: an
+    // inline system message must reach systemPrompt and must NOT stay in the
+    // conversation, wherever in the list it appears.
+    const openaiInline = parseOpenAIRequest({
+      model: "gpt-4",
+      messages: [
+        { role: "user", content: "Hello" },
+        { role: "system", content: "Inline system reminder" },
+        { role: "assistant", content: "Hi there" },
+        { role: "user", content: "What is 2+2?" },
+      ],
+    } as unknown as Parameters<typeof parseOpenAIRequest>[0]);
+    if (
+      typeof openaiInline.systemPrompt !== "string" ||
+      !openaiInline.systemPrompt.includes("Inline system reminder")
+    ) {
+      logTest(
+        "ClaudeFormat Runtime",
+        "FAIL",
+        "parseOpenAIRequest did not fold an inline system message into systemPrompt",
+      );
+      return false;
+    }
+    if (
+      openaiInline.conversationMessages.some(
+        (m: { role: string }) => m.role === "system",
+      )
+    ) {
+      logTest(
+        "ClaudeFormat Runtime",
+        "FAIL",
+        "parseOpenAIRequest left an inline system message in conversationMessages",
+      );
+      return false;
+    }
 
     // Parse request
     const parsed = parseClaudeRequest({
@@ -4312,6 +4513,77 @@ async function testClaudeFormatRuntime(): Promise<boolean | null> {
         "ClaudeFormat Runtime",
         "FAIL",
         `Parse wrong prompt: ${parsed.prompt}`,
+      );
+      return false;
+    }
+
+    // Regression: an inline "system"-role message (invalid per the Messages
+    // API spec, but not rejected by the proxy's runtime parsing) must fold
+    // into systemPrompt instead of leaking into conversationMessages — a
+    // stray system message anywhere but index 0 is rejected by
+    // OpenAI-compatible fallback backends (LiteLLM/vLLM chat templates).
+    const parsedWithInlineSystem = parseClaudeRequest({
+      model: "claude-sonnet-4",
+      max_tokens: 1024,
+      messages: [
+        { role: "user", content: "Hello" },
+        { role: "system", content: "Inline system reminder" },
+        { role: "assistant", content: "Hi there" },
+        { role: "user", content: "What is 2+2?" },
+      ],
+      system: "You are helpful",
+    } as unknown as Parameters<typeof parseClaudeRequest>[0]);
+    // systemPrompt is typed string | Array<text-block>; the parser only ever
+    // emits a string, so a non-string here is itself a failure.
+    const inlineSystemPrompt = parsedWithInlineSystem.systemPrompt;
+    if (typeof inlineSystemPrompt !== "string") {
+      logTest(
+        "ClaudeFormat Runtime",
+        "FAIL",
+        "Inline system fold produced a non-string systemPrompt",
+      );
+      return false;
+    }
+    // Three separate properties, and the suite needs all three. Asserting only
+    // that the inline text arrived is satisfied by an implementation that
+    // OVERWRITES systemPrompt rather than appending to it — the pre-existing
+    // prompt would be silently dropped and this would still pass. Asserting
+    // the order too is what pins the append rather than a prepend.
+    const inlineIdx = inlineSystemPrompt.indexOf("Inline system reminder");
+    const originalIdx = inlineSystemPrompt.indexOf("You are helpful");
+    if (inlineIdx === -1) {
+      logTest(
+        "ClaudeFormat Runtime",
+        "FAIL",
+        "Inline system message was not folded into systemPrompt",
+      );
+      return false;
+    }
+    if (originalIdx === -1) {
+      logTest(
+        "ClaudeFormat Runtime",
+        "FAIL",
+        "Folding the inline system message discarded the request's own system prompt",
+      );
+      return false;
+    }
+    if (originalIdx > inlineIdx) {
+      logTest(
+        "ClaudeFormat Runtime",
+        "FAIL",
+        "Inline system text was placed ahead of the request's own system prompt",
+      );
+      return false;
+    }
+    if (
+      parsedWithInlineSystem.conversationMessages.some(
+        (m: { role: string }) => m.role === "system",
+      )
+    ) {
+      logTest(
+        "ClaudeFormat Runtime",
+        "FAIL",
+        "Inline system message leaked into conversationMessages",
       );
       return false;
     }
@@ -4366,7 +4638,7 @@ async function testSSESerializerRuntime(): Promise<boolean | null> {
   logSection("Testing SSE Serializer Runtime");
   try {
     const { ClaudeStreamSerializer } =
-      await import("../dist/lib/proxy/claudeFormat.js");
+      await import("../dist/proxy/claudeFormat.js");
     const sse = new ClaudeStreamSerializer("claude-sonnet-4", 100);
 
     const events: string[] = [];
@@ -4450,15 +4722,15 @@ async function testCloakingRuntime(): Promise<boolean | null> {
   logSection("Testing Cloaking Pipeline Runtime");
   try {
     const { CloakingPipeline } =
-      await import("../dist/lib/proxy/cloaking/index.js");
+      await import("../dist/proxy/cloaking/index.js");
     const { parseClaudeCodeUserId } =
-      await import("../dist/lib/auth/anthropicOAuth.js");
+      await import("../dist/auth/anthropicOAuth.js");
     const { createHeaderScrubber } =
-      await import("../dist/lib/proxy/cloaking/plugins/headerScrubber.js");
+      await import("../dist/proxy/cloaking/plugins/headerScrubber.js");
     const { createSessionIdentity } =
-      await import("../dist/lib/proxy/cloaking/plugins/sessionIdentity.js");
+      await import("../dist/proxy/cloaking/plugins/sessionIdentity.js");
     const { createWordObfuscator } =
-      await import("../dist/lib/proxy/cloaking/plugins/wordObfuscator.js");
+      await import("../dist/proxy/cloaking/plugins/wordObfuscator.js");
 
     const pipeline = new CloakingPipeline();
     pipeline.use(createHeaderScrubber());
@@ -4512,9 +4784,11 @@ async function testCloakingRuntime(): Promise<boolean | null> {
       );
       return false;
     }
-    // Verify word obfuscation (zero-width space in "proxy")
+    // Verify word obfuscation (zero-width space in "proxy"). `content` is
+    // `string | Array<Record<string, unknown>>` per CloakingRequest \u2014 the
+    // fixture above sends a plain string, so narrow to it explicitly.
     const content = result.request.body.messages[0].content;
-    if (!content.includes("\u200B")) {
+    if (typeof content !== "string" || !content.includes("\u200B")) {
       logTest("Cloaking Runtime", "FAIL", "Zero-width space not inserted");
       return false;
     }
@@ -4574,7 +4848,7 @@ async function testProxyConfigRuntime(): Promise<boolean | null> {
   logSection("Testing ProxyConfig Runtime");
   try {
     const { parseProxyConfigString } =
-      await import("../dist/lib/proxy/proxyConfig.js");
+      await import("../dist/proxy/proxyConfig.js");
 
     const config = await parseProxyConfigString(
       JSON.stringify({
@@ -4758,7 +5032,7 @@ async function runAllTests(): Promise<void> {
     { name: "SDK Stream", fn: () => testSDKStream(sharedSdk) },
     { name: "SDK Business Tools", fn: testSDKBusinessTools },
     { name: "SDK Business Tools (CLI Simulation)", fn: testCLIBusinessTools },
-    // TODO: Fix HITL tests later - commented out for now (see HITL TODO block above)
+    // TODO(#1318): Fix HITL tests later - commented out for now (see HITL TODO block above)
     // HITL logic fixed: PASS if AI calls tool + HITL fires, SKIP (null) if AI doesn't call tool
     // { name: "SDK HITL Generate", fn: testSDKHITLGenerate },
     // { name: "SDK HITL Stream", fn: testSDKHITLStream },
@@ -4829,6 +5103,8 @@ async function runAllTests(): Promise<void> {
     },
   ];
 
+  let suiteAborted = false;
+
   for (const test of tests) {
     try {
       // Check if this test should be skipped (e.g., streaming tests for gpt-5/o3)
@@ -4853,7 +5129,11 @@ async function runAllTests(): Promise<void> {
         log("✅ Cleanup complete, starting SDK Stream test\n", "cyan");
       }
 
-      const result = await test.fn();
+      const result = await withCaseTimeout(
+        test.name,
+        test.fn,
+        ORCHESTRATOR_CASE_TIMEOUT_MS,
+      );
       recordTest(
         test.name,
         result === true,
@@ -4864,6 +5144,23 @@ async function runAllTests(): Promise<void> {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
       recordTest(test.name, false, false, errorMessage);
+
+      // A case bound is not an ordinary failure: the abandoned case is STILL
+      // RUNNING, because Promise.race cannot cancel it. Carrying on would run
+      // globalCleanup() and dispose shared resources underneath live work, and
+      // would burn the inter-test delay once per remaining case to report each
+      // as "not run" — 18 of those, and three minutes of waiting, in the run
+      // that motivated this. Stop at the first one instead.
+      if (isCaseTimeout(error)) {
+        suiteAborted = true;
+        log(
+          `\n🛑 ABORTING: "${test.name}" was abandoned by its ${ORCHESTRATOR_CASE_TIMEOUT_MS / 1000}s bound and is still executing.` +
+            `\n   Remaining cases are NOT run and shared resources are NOT disposed —` +
+            `\n   this process no longer has clean state, so any further result would be a guess.`,
+          "red",
+        );
+        break;
+      }
     }
 
     // Global cleanup after each test to prevent resource contamination
@@ -4889,7 +5186,19 @@ async function runAllTests(): Promise<void> {
     }
   }
 
-  // Cleanup shared SDK instance
+  // Cleanup shared SDK instance.
+  //
+  // Skipped after an abort: the abandoned case may still be mid-generate on
+  // this very instance, and disposing it underneath would turn one clear
+  // timeout into a second, unrelated-looking failure. The process is exiting
+  // regardless, so leaking it here is the cheaper of the two.
+  if (suiteAborted) {
+    log(
+      "\n[CLEANUP] Shared SDK NOT disposed — a case is still running on it",
+      "yellow",
+    );
+    return;
+  }
   try {
     await sharedSdk.dispose();
     log("\n[CLEANUP] Shared SDK instance disposed", "cyan");

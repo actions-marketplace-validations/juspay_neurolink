@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v9.62.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,7 +8,7 @@
 
 > **AudioChunk** = `object`
 
-Defined in: [types/stream.ts:146](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L146)
+Defined in: [types/stream.ts:158](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L158)
 
 ## Properties
 
@@ -16,7 +16,7 @@ Defined in: [types/stream.ts:146](https://github.com/juspay/neurolink/blob/ff50c
 
 > **data**: `Buffer`
 
-Defined in: [types/stream.ts:147](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L147)
+Defined in: [types/stream.ts:159](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L159)
 
 ---
 
@@ -24,7 +24,7 @@ Defined in: [types/stream.ts:147](https://github.com/juspay/neurolink/blob/ff50c
 
 > **sampleRateHz**: `number`
 
-Defined in: [types/stream.ts:148](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L148)
+Defined in: [types/stream.ts:160](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L160)
 
 ---
 
@@ -32,7 +32,7 @@ Defined in: [types/stream.ts:148](https://github.com/juspay/neurolink/blob/ff50c
 
 > **channels**: `number`
 
-Defined in: [types/stream.ts:149](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L149)
+Defined in: [types/stream.ts:161](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L161)
 
 ---
 
@@ -40,4 +40,4 @@ Defined in: [types/stream.ts:149](https://github.com/juspay/neurolink/blob/ff50c
 
 > **encoding**: [`PCMEncoding`](PCMEncoding.md)
 
-Defined in: [types/stream.ts:150](https://github.com/juspay/neurolink/blob/ff50c1e5a18abd666c68e6a6290bfe2015cb65b1/src/lib/types/stream.ts#L150)
+Defined in: [types/stream.ts:162](https://github.com/juspay/neurolink/blob/release/src/lib/types/stream.ts#L162)
