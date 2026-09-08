@@ -5901,7 +5901,7 @@ Current user's request: ${currentInput}`;
       music: textResult.music,
       ppt: textResult.ppt,
       // Forward reasoning/reasoningTokens from the provider layer.
-      // BaseProvider's GenerationHandler extracts these from AI-SDK reasoning
+      // The native generate loop extracts these from vendor reasoning
       // parts (DeepSeek's `reasoning_content`, Anthropic thinking blocks,
       // Gemini thought parts, OpenAI o1) and they're declared on
       // `GenerateResult`, but the builder previously dropped them on the

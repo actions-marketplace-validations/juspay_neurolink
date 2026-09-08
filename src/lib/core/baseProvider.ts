@@ -1632,7 +1632,7 @@ export abstract class BaseProvider implements AIProvider {
           },
         },
       );
-      // Set this span as the active context so child spans (GenerationHandler, etc.) become descendants
+      // Set this span as the active context so child spans (provider calls, tool executions) become descendants
       const activeCtx = trace.setSpan(context.active(), otelSpan);
       const otelSpanState = { ended: false };
 
@@ -2205,9 +2205,9 @@ export abstract class BaseProvider implements AIProvider {
       analytics: result.analytics,
       evaluation: result.evaluation,
       audio: result.audio,
-      // Forward reasoning fields populated by GenerationHandler from AI-SDK
-      // reasoning parts (DeepSeek `reasoning_content`, Anthropic thinking,
-      // Gemini thought parts, OpenAI o1).
+      // Forward reasoning fields populated by the native generate loop from
+      // vendor reasoning parts (DeepSeek `reasoning_content`, Anthropic
+      // thinking, Gemini thought parts, OpenAI o1).
       reasoning: result.reasoning,
       reasoningTokens: result.reasoningTokens,
     };

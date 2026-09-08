@@ -44,7 +44,7 @@ These are non-negotiable. Violating them breaks the build or introduces bugs.
 11. **No local `types/` directories** — There must be no `types/` directory anywhere except `src/lib/types/`. No `src/lib/observability/types/`, no `src/lib/workflow/core/types/`, etc. Move those types into the canonical `src/lib/types/` folder.
 12. **No type re-exports from non-type files** — Files outside `src/lib/types/` must not re-export types (`export type { X } from`). Consumers should import types from `src/lib/types/` directly. Module `index.ts` files should only re-export runtime values (classes, functions, constants), never types.
 
-13. **Barrel-only imports for internal types** — Code outside `src/lib/types/` must import internal types from the barrel (`../types/index.js` or `../types`), never from specific type files (`../types/rag.js`, `../types/mcp.js`). External library types (`zod`, `@ai-sdk/provider`, etc.) can be imported normally. Files inside `src/lib/types/` are exempt (they import from each other).
+13. **Barrel-only imports for internal types** — Code outside `src/lib/types/` must import internal types from the barrel (`../types/index.js` or `../types`), never from specific type files (`../types/rag.js`, `../types/mcp.js`). External library types (`zod`, `@anthropic-ai/sdk`, etc.) can be imported normally. Files inside `src/lib/types/` are exempt (they import from each other).
 
 14. **No double type assertions** — Never cast through `unknown`/`any` (`x as unknown as T`, `x as any as T`). A double assertion defeats the compiler's structural-overlap check entirely — the value is trusted as `T` with zero validation. Fix the type at the source, narrow with a runtime-validating type guard, or use a single `as T` (still overlap-checked). Applies to `src/`; test files are exempt. The rare genuine type-system boundary requires `// eslint-disable-next-line no-restricted-syntax -- <reason>`.
 
@@ -495,6 +495,37 @@ Bedrock request, on a run where the request never left the machine —
 probe designs agreed with each other and were all wrong for the same reason,
 because they shared an unstated assumption about the transport. Assert the
 precondition first, in the probe, and make it fail loudly when it does not hold.
+
+### ⚠️ A "regenerate and diff" check needs a reproducible generator first
+
+`docs/api` currency works because typedoc is a pure function of the source.
+`docs-site/static/{llms.txt,llms-full.txt,search-index.json}` were not, and a
+naive currency check over them would have been **permanently red** — the same
+shape of always-failing required check the ffmpeg incident below produced.
+
+Two separate causes, and the second is the one that hides:
+
+1. `build-llms-txt.ts` stamped `new Date().toISOString()` into both llms files.
+   Obvious once you look, and trivially fatal to any diff.
+2. `docFiles.sort((a, b) => a.order - b.order)` is **not a total order** — many
+   files share one `order`. `Array.prototype.sort` is stable, so ties fell back
+   to the input order, which came from `glob()`, which is filesystem order. Two
+   consecutive builds of an unchanged tree differed by **215,862 lines**.
+   `sortSections` had the same defect: every section outside `SECTION_ORDER`
+   scores 999, so their ties came from Map insertion order.
+
+Both are fixed, and the artifacts are now byte-identical across runs. When
+adding any generator whose output is committed: prove it by building twice and
+`cmp`-ing, before writing a check that assumes it. Tiebreak with a codepoint
+comparison, not `localeCompare` — collation depends on the Node ICU build, so
+it can order CI and a laptop differently.
+
+Note also why the artifacts drifted in the first place, and why the check lives
+on the pull request rather than in `docs-deploy.yml`: that workflow runs
+post-merge with `contents: read`, and giving it write access would not help,
+because a push to `release` from outside a pull request carries no check runs
+and is declined by branch protection. See the required-status-checks section
+above.
 
 ### ⚠️ ffmpeg is deliberately not installed in CI
 

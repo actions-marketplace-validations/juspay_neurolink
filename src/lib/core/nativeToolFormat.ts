@@ -71,8 +71,8 @@ export function toNativeToolDeclarations(
         ? convertZodToJsonSchema(rawSchema as never)
         : { type: "object", properties: {} }
     ) as Record<string, unknown>;
-    // GenerationHandler marks the last tool definition with a cache
-    // breakpoint when prompt caching is active — keep honoring it.
+    // Honor a cache breakpoint the caller set on this tool. The direct
+    // Anthropic path marks the last tool itself, on the assembled request.
     const cc = cacheControlOf(tool);
     const declaration: NativeAnthropicToolDeclaration = {
       name,

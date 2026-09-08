@@ -1350,8 +1350,8 @@ export class AnthropicProvider extends BaseProvider {
         let tools: Anthropic.Messages.Tool[] | undefined = (options.tools ?? [])
           .filter((t) => t.type === "function")
           .map((t) => {
-            // GenerationHandler marks the last tool definition with a cache
-            // breakpoint when prompt caching is active — keep honoring it.
+            // Honor a cache breakpoint the caller set on this tool. When no
+            // tool carries one, the last tool is marked further below.
             const cc = cacheControlOf(t);
             return {
               name: t.name,
@@ -1397,10 +1397,10 @@ export class AnthropicProvider extends BaseProvider {
 
         // Additive structured output: when the caller wants a schema AND real
         // tools, the forced-json path above cannot be used (it replaces the
-        // tools array), and the AI-SDK experimental_output path is excluded
-        // for this surface by structuredOutputPolicy. GenerationHandler hands
-        // the JSON Schema down here instead, and we APPEND a `final_result`
-        // tool — tool_choice stays auto, so every real tool keeps working and
+        // tools array), and structured output is excluded for this surface
+        // by structuredOutputPolicy. The schema arrives instead on
+        // `providerOptions.anthropic.finalResultSchema` and we APPEND a
+        // `final_result` tool — tool_choice stays auto, so every real tool keeps working and
         // the model self-selects final_result when it is ready to answer.
         const finalResultSchema = options.providerOptions?.anthropic
           ?.finalResultSchema as Record<string, unknown> | undefined;
@@ -1419,9 +1419,27 @@ export class AnthropicProvider extends BaseProvider {
           | { type: "enabled"; budget_tokens: number }
           | undefined;
 
+        // Close the stable prefix with a breakpoint on the LAST tool. Tool
+        // definitions sit between the system prompt and the conversation and
+        // rarely change, so without this the whole tools block is re-billed
+        // every turn. Applied after every tool mutation above (including the
+        // appended final_result tool) so the marker really is last, and before
+        // the count below so the history budget accounts for it. A caller that
+        // marked a tool itself wins.
+        if (tools && tools.length > 0) {
+          const alreadyMarked = tools.some((t) => cacheControlOf(t));
+          if (!alreadyMarked) {
+            const last = tools[tools.length - 1];
+            tools = [
+              ...tools.slice(0, -1),
+              { ...last, cache_control: { type: "ephemeral" } },
+            ];
+          }
+        }
+
         // Prompt-cache parity with the native Vertex+Claude path: upstream
-        // layers mark only the stable prefix (system via MessageBuilder,
-        // last tool via GenerationHandler) — the growing conversation
+        // layers mark the stable prefix (system via MessageBuilder, and the
+        // last tool just above) — the growing conversation
         // history has no breakpoint, so on every turn it falls after the
         // last marker and is re-billed as fresh input. Add rolling history
         // breakpoints in whatever budget remains under Anthropic's
@@ -1884,6 +1902,7 @@ export class AnthropicProvider extends BaseProvider {
       ...(loop.rawFinishReason
         ? { rawFinishReason: loop.rawFinishReason }
         : {}),
+      ...(loop.reasoning ? { reasoning: loop.reasoning } : {}),
       usage: {
         input: loop.inputTokens,
         output: loop.outputTokens,
