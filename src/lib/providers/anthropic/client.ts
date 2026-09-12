@@ -457,6 +457,12 @@ const messagesToAnthropic = (
       }
       case "assistant": {
         const blocks: Anthropic.Messages.ContentBlockParam[] = [];
+        // Extended thinking must come back byte-identical — signature
+        // included — or Anthropic rejects the turn, and the loop replays this
+        // message on every tool step. Blocks are emitted in content order
+        // rather than hoisted: `interleaved-thinking-2025-05-14` (requested in
+        // the beta header) lets thinking appear between tool calls, so
+        // reordering would corrupt the chain it validates.
         for (const part of partsOf(msg.content)) {
           if (typeof part === "string") {
             if (part.length > 0) {
@@ -470,7 +476,33 @@ const messagesToAnthropic = (
             toolCallId?: string;
             toolName?: string;
             input?: unknown;
+            providerOptions?: Record<string, Record<string, unknown>>;
           };
+          if (p?.type === "reasoning") {
+            const meta = p.providerOptions?.anthropic;
+            const redacted = meta?.redactedData;
+            if (typeof redacted === "string" && redacted.length > 0) {
+              blocks.push({ type: "redacted_thinking", data: redacted });
+              continue;
+            }
+            const signature = meta?.signature;
+            // Both halves required, matching loopAdapter's check on the
+            // streaming path: Anthropic rejects a thinking block that is
+            // unsigned, and equally one whose text is empty. Reasoning from a
+            // provider that never produced a signature (a reasoner model's
+            // plain text) is not an Anthropic thinking block at all, and an
+            // empty one carries nothing worth replaying — either way, dropping
+            // it beats sending a block that will be refused.
+            if (
+              typeof signature === "string" &&
+              signature.length > 0 &&
+              typeof p.text === "string" &&
+              p.text.length > 0
+            ) {
+              blocks.push({ type: "thinking", thinking: p.text, signature });
+            }
+            continue;
+          }
           if (p?.type === "text" && typeof p.text === "string") {
             if (p.text.length > 0) {
               const cc = cacheControlOf(p);
@@ -1463,15 +1495,32 @@ export class AnthropicProvider extends BaseProvider {
           },
           "anthropic.doGenerate",
         );
+        // Dropping a caller's explicit sampling parameters is exactly the
+        // kind of silent discard this change fixes elsewhere, so say so.
+        if (
+          thinking &&
+          (samplingParams.temperature !== undefined ||
+            samplingParams.topP !== undefined)
+        ) {
+          logger.debug(
+            "[anthropic] extended thinking is enabled, so temperature/top_p are omitted — Anthropic rejects any temperature but 1 while thinking is set",
+          );
+        }
         const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
           model: modelId,
           messages: cachedMessages,
           max_tokens: resolveClaudeMaxTokens(modelId, options.maxOutputTokens),
           ...(system ? { system } : {}),
-          ...(samplingParams.temperature !== undefined
+          // Extended thinking fixes sampling: Anthropic rejects any
+          // temperature but 1 while `thinking` is set, and does not honour
+          // top_p there. The CLI always sends a default temperature, so
+          // forwarding it alongside thinking turns a call that used to work
+          // into a 400. Drop the sampling knobs for exactly those turns and
+          // let Anthropic's thinking defaults stand.
+          ...(!thinking && samplingParams.temperature !== undefined
             ? { temperature: samplingParams.temperature }
             : {}),
-          ...(samplingParams.topP !== undefined
+          ...(!thinking && samplingParams.topP !== undefined
             ? { top_p: samplingParams.topP }
             : {}),
           ...(options.stopSequences && options.stopSequences.length > 0
@@ -1541,7 +1590,28 @@ export class AnthropicProvider extends BaseProvider {
         let jsonToolAnswered = false;
         for (const block of response.content) {
           if (block.type === "thinking") {
-            content.push({ type: "reasoning", text: block.thinking });
+            // The signature rides along in providerOptions because Anthropic
+            // rejects a replayed thinking block without it, and the tool loop
+            // pushes this part straight back into the conversation.
+            content.push({
+              type: "reasoning",
+              text: block.thinking,
+              providerOptions: {
+                anthropic: { signature: block.signature },
+              },
+            });
+          } else if (block.type === "redacted_thinking") {
+            // Encrypted reasoning: no readable text, but it must still be
+            // replayed verbatim or the turn is rejected.
+            content.push({
+              type: "reasoning",
+              text: "",
+              providerOptions: {
+                anthropic: {
+                  redactedData: (block as { data?: string }).data,
+                },
+              },
+            });
           } else if (block.type === "text") {
             // In forced-json mode the payload arrives via the tool input, not
             // text — pass text through only in normal mode.
@@ -2353,6 +2423,11 @@ export class AnthropicProvider extends BaseProvider {
             : {},
           "anthropic.executeStream",
         );
+        if (thinking && streamSamplingParams.temperature !== undefined) {
+          logger.debug(
+            "[anthropic] extended thinking is enabled, so temperature is omitted on the stream path — Anthropic rejects any temperature but 1 while thinking is set",
+          );
+        }
         return {
           model: modelId,
           messages: cachedConversation,
@@ -2362,7 +2437,9 @@ export class AnthropicProvider extends BaseProvider {
           // the adapter immediately overwrites — and forced this whole params
           // object into the streaming variant for a field it does not own.
           ...(payload.system ? { system: payload.system } : {}),
-          ...(streamSamplingParams.temperature !== undefined
+          // Same constraint on the streaming path: a temperature alongside
+          // `thinking` is rejected outright.
+          ...(!thinking && streamSamplingParams.temperature !== undefined
             ? { temperature: streamSamplingParams.temperature }
             : {}),
           ...(cachedTools && cachedTools.length > 0
