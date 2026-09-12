@@ -1,3 +1,11 @@
+import {
+  initializeProxyOtelLogs,
+  routeProxyConsoleToOtel,
+  flushProxyOtelLogs,
+  shutdownProxyOtelLogs,
+  isProxyOtelOnly,
+  withProxyOtelLogShutdown,
+} from "../../lib/proxy/otelLogSink.js";
 /**
  * Proxy CLI Commands for NeuroLink
  *
@@ -11,9 +19,10 @@
  */
 
 import type { CommandModule, Argv } from "yargs";
+import { writeFileAtomic } from "../proxy-clients/snapshot.js";
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import chalk from "chalk";
 import ora from "ora";
@@ -31,6 +40,7 @@ import {
   applyAllClients,
   restoreAllClients,
 } from "../proxy-clients/registry.js";
+import { resolveProxyConfigPath } from "../../lib/proxy/proxyConfig.js";
 import {
   redactUrlsInText,
   sanitizeForLog,
@@ -3096,6 +3106,8 @@ function registerProxyShutdownHandlers(params: {
     try {
       const { flushOpenTelemetry, shutdownOpenTelemetry } =
         await import("../../lib/services/server/ai/observability/instrumentation.js");
+      await flushProxyOtelLogs();
+      await shutdownProxyOtelLogs();
       await flushOpenTelemetry();
       await shutdownOpenTelemetry();
     } catch {
@@ -3158,6 +3170,7 @@ async function startProxyRuntime(params: {
   passthrough: boolean;
   logsDir: ProxyNeurolinkRuntime["logsDir"];
   runtimeConfigStore?: ProxyRuntimeConfigStore;
+  configPath: string;
 }): Promise<void> {
   const socketWorker = isProxySocketWorkerProcess();
   const { createAdaptorServer, serve } = await import("@hono/node-server");
@@ -3458,7 +3471,9 @@ async function startProxyRuntime(params: {
   }
 
   if (!isDev) {
-    for (const result of await applyAllClients(url)) {
+    for (const result of await applyAllClients(url, {
+      configPath: params.configPath,
+    })) {
       if (result.error) {
         // Visible, not debug-level. A client whose config could not be written
         // will keep talking to its own upstream, which looks like the proxy
@@ -3535,6 +3550,9 @@ async function runLaunchdProxySupervisor(
   argv: ProxyStartArgs,
   spinner: ProxySpinner,
 ): Promise<void> {
+  await loadProxyStartEnv(argv, spinner);
+  initializeProxyOtelLogs("supervisor");
+  routeProxyConsoleToOtel();
   await ensureProxyStartAllowed(spinner);
   const entryScript = process.argv[1];
   if (!entryScript) {
@@ -3675,6 +3693,8 @@ async function runLaunchdProxySupervisor(
     await flushProxyLifecycleEvents().catch((error) =>
       logger.warn(String(error)),
     );
+    await flushProxyOtelLogs().catch(() => undefined);
+    await shutdownProxyOtelLogs().catch(() => undefined);
     const supervisorState = loadProxySupervisorState();
     if (supervisorState?.pid === process.pid) {
       clearProxySupervisorState();
@@ -3787,6 +3807,8 @@ async function startProxyCommandHandler(argv: ProxyStartArgs): Promise<void> {
       env: baseEnv,
     });
     const loadedEnvFile = await loadProxyStartEnv(argv, spinner);
+    initializeProxyOtelLogs("worker");
+    routeProxyConsoleToOtel();
 
     // Reuse upstream TCP connections (longer keep-alive + bounded pool) instead
     // of opening a new flow per request — cuts outbound flow churn through host
@@ -3796,9 +3818,7 @@ async function startProxyCommandHandler(argv: ProxyStartArgs): Promise<void> {
     const { neurolink, logsDir } = await createProxyNeurolinkRuntime(
       devPaths?.logsDir,
     );
-    const configPath = argv.config
-      ? resolve(argv.config)
-      : join(homedir(), ".neurolink", "proxy-config.yaml");
+    const configPath = resolveProxyConfigPath(argv.config);
     const runtimeConfigStore = await ProxyRuntimeConfigStore.create({
       configPath,
       configRequired: Boolean(argv.config),
@@ -3868,6 +3888,7 @@ async function startProxyCommandHandler(argv: ProxyStartArgs): Promise<void> {
       passthrough,
       logsDir,
       runtimeConfigStore,
+      configPath,
     });
   } catch (error) {
     if (spinner) {
@@ -4626,7 +4647,9 @@ export const proxyGuardCommand: CommandModule<object, ProxyGuardArgs> = {
         default: true,
       }) as Argv<ProxyGuardArgs>;
   },
-  handler: async (argv) => {
+  handler: withProxyOtelLogShutdown(async (argv: ProxyGuardArgs) => {
+    initializeProxyOtelLogs("updater");
+    routeProxyConsoleToOtel();
     const host = argv.host ?? "127.0.0.1";
     const port = argv.port ?? 55669;
     const parentPid = Number(argv.parentPid);
@@ -5086,6 +5109,8 @@ export const proxyGuardCommand: CommandModule<object, ProxyGuardArgs> = {
             recordSuccessfulUpdate(result.latestVersion),
           );
           // The replacement proxy starts a worker running the new version.
+          await flushProxyOtelLogs().catch(() => undefined);
+          await shutdownProxyOtelLogs().catch(() => undefined);
           process.exit(0);
         } else {
           logger.always(
@@ -5324,7 +5349,7 @@ export const proxyGuardCommand: CommandModule<object, ProxyGuardArgs> = {
         `[proxy] fail-open guard removed stale ${expectedBaseUrl} from Claude settings`,
       );
     }
-  },
+  }),
 };
 
 // =============================================================================
@@ -5443,7 +5468,11 @@ export const proxySetupCommand: CommandModule = {
         chalk.blue(`\nStep ${nextStep}:`) + " Configuring Claude Code...",
       );
       const url = `http://127.0.0.1:${port}`;
-      for (const result of await applyAllClients(url)) {
+      for (const result of await applyAllClients(url, {
+        configPath: resolveProxyConfigPath(
+          (argv as { config?: string }).config,
+        ),
+      })) {
         if (result.error) {
           console.info(
             chalk.yellow(
@@ -5543,7 +5572,7 @@ function buildLaunchdPath(): string {
   return [...segments].join(":");
 }
 
-function buildPlist(
+export function buildProxyLaunchdPlist(
   port: number,
   host: string,
   envFile?: string,
@@ -5563,6 +5592,24 @@ function buildPlist(
     ? `
     <string>--config</string>
     <string>${escapeXml(configFile)}</string>`
+    : "";
+
+  const otelEnvironment = isProxyOtelOnly()
+    ? [
+        "NEUROLINK_PROXY_LOG_SINK",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+        "OTEL_SERVICE_NAME",
+        "NEUROLINK_PROXY_SESSION_SECRET",
+      ]
+        .filter((name) => process.env[name] !== undefined)
+        .map(
+          (name) =>
+            `    <key>${name}</key>\n    <string>${escapeXml(process.env[name]!)}</string>`,
+        )
+        .join("\n")
     : "";
 
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -5603,10 +5650,10 @@ ${configArgs}
   <integer>45</integer>
 
   <key>StandardOutPath</key>
-  <string>${join(homedir(), ".neurolink", "logs", "proxy-launchd-stdout.log")}</string>
+  <string>${isProxyOtelOnly() ? "/dev/null" : join(homedir(), ".neurolink", "logs", "proxy-launchd-stdout.log")}</string>
 
   <key>StandardErrorPath</key>
-  <string>${join(homedir(), ".neurolink", "logs", "proxy-launchd-stderr.log")}</string>
+  <string>${isProxyOtelOnly() ? "/dev/null" : join(homedir(), ".neurolink", "logs", "proxy-launchd-stderr.log")}</string>
 
   <key>EnvironmentVariables</key>
   <dict>
@@ -5614,6 +5661,7 @@ ${configArgs}
     <string>${buildLaunchdPath()}</string>
     <key>HOME</key>
     <string>${homedir()}</string>
+${otelEnvironment}
   </dict>
 </dict>
 </plist>`;
@@ -5667,15 +5715,13 @@ export const proxyInstallCommand: CommandModule = {
       process.exit(1);
     }
 
-    const { writeFileSync, mkdirSync, existsSync } = await import("fs");
+    const { mkdirSync, existsSync, chmodSync } = await import("fs");
     const envResolution = resolveProxyEnvFile({
       explicitEnvFile: (argv as { envFile?: string }).envFile,
     });
     const envFile = envResolution.path;
     const explicitConfig = (argv as { config?: string }).config;
-    const configPath = explicitConfig
-      ? resolve(explicitConfig)
-      : join(homedir(), ".neurolink", "proxy-config.yaml");
+    const configPath = resolveProxyConfigPath(explicitConfig);
     if (explicitConfig && !existsSync(configPath)) {
       console.info(chalk.red(`Proxy config file not found: ${configPath}`));
       process.exit(1);
@@ -5687,8 +5733,9 @@ export const proxyInstallCommand: CommandModule = {
       process.exit(1);
     }
 
+    await loadProxyEnvFile({ explicitEnvFile: envFile });
     const logsDir = join(homedir(), ".neurolink", "logs");
-    if (!existsSync(logsDir)) {
+    if (!isProxyOtelOnly() && !existsSync(logsDir)) {
       mkdirSync(logsDir, { recursive: true });
     }
 
@@ -5740,8 +5787,9 @@ export const proxyInstallCommand: CommandModule = {
       ),
     );
 
-    const plist = buildPlist(port, host, envFile, configFile);
-    writeFileSync(PLIST_PATH, plist, "utf-8");
+    const plist = buildProxyLaunchdPlist(port, host, envFile, configFile);
+    await writeFileAtomic(PLIST_PATH, plist, 0o600);
+    chmodSync(PLIST_PATH, 0o600);
     console.info(chalk.green(`✓ Plist written to ${PLIST_PATH}`));
     if (envFile) {
       console.info(chalk.green(`✓ Proxy env file: ${envFile}`));
