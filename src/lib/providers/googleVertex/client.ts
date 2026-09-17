@@ -1882,9 +1882,12 @@ export class GoogleVertexProvider extends BaseProvider {
       config.systemInstruction = effectiveSystemPrompt;
     }
 
-    // Add thinking config for Gemini 3
+    // Add thinking config. Gemini 3 takes `thinkingLevel` directly; Gemini
+    // 2.5 rejects that field and needs a translated `thinkingBudget` instead
+    // — createNativeThinkingConfig picks the wire shape from modelName.
     const nativeThinkingConfig = createNativeThinkingConfig(
       options.thinkingConfig,
+      modelName,
     );
     if (nativeThinkingConfig) {
       config.thinkingConfig = nativeThinkingConfig;
@@ -2921,9 +2924,12 @@ export class GoogleVertexProvider extends BaseProvider {
       config.systemInstruction = effectiveSystemPrompt;
     }
 
-    // Add thinking config for Gemini 3
+    // Add thinking config. Gemini 3 takes `thinkingLevel` directly; Gemini
+    // 2.5 rejects that field and needs a translated `thinkingBudget` instead
+    // — createNativeThinkingConfig picks the wire shape from modelName.
     const nativeThinkingConfig2 = createNativeThinkingConfig(
       options.thinkingConfig,
+      modelName,
     );
     if (nativeThinkingConfig2) {
       config.thinkingConfig = nativeThinkingConfig2;
@@ -3784,6 +3790,79 @@ export class GoogleVertexProvider extends BaseProvider {
    * Execute stream using native @anthropic-ai/vertex-sdk for Claude models on Vertex AI
    * This bypasses @ai-sdk/google-vertex completely and uses Anthropic's native SDK
    */
+
+  /**
+   * Extended thinking for Claude-on-Vertex.
+   *
+   * The direct Anthropic provider has always translated `thinkingConfig` into
+   * the Messages API's `thinking` field (anthropic/client.ts). This path never
+   * did — it built the request without one — so `thinkingConfig` was accepted
+   * and silently ignored here: no error, `usage.reasoning` 0, no reasoning
+   * content. Measured against the raw @anthropic-ai/vertex-sdk with the same
+   * project, region, credentials and model, `thinking` is supported and
+   * returns a real thinking block, so the capability was ours to send.
+   *
+   * `thinkingLevel` is deliberately not mapped to a budget: the option's
+   * contract reserves `budgetTokens` for Anthropic models and `thinkingLevel`
+   * for Gemini 3, and inventing a conversion here would be guessing at the
+   * caller's intent.
+   *
+   * The budget must leave room inside `max_tokens` for an answer, so it is
+   * clamped below the ceiling rather than passed through — an over-large
+   * budget is a 400 from the API.
+   *
+   * `useFinalResultTool` (schema / structured-output mode) always pairs with
+   * a forced `tool_choice:{type:"any"}` in the request built right after this
+   * call — Anthropic hard-rejects `thinking` combined with a `tool_choice`
+   * that forces tool use: a live 400, "Thinking may not be enabled when
+   * tool_choice forces tool use." So `thinking` is omitted entirely in that
+   * mode, preserving the prior (pre-thinking-fix) behaviour of silently
+   * ignoring `thinkingConfig` for schema calls instead of hard-failing them —
+   * mirrors the same guard already applied to the OAuth proxy path in
+   * `src/lib/proxy/oauthFetch.ts` (`delete parsed.thinking` when
+   * `tool_choice.type` is `"any"` or `"tool"`). The step/context-cap
+   * finalization backstop reuses this same omission for free since it spreads
+   * `...requestParams`. `tool_choice:{type:"none"}` (the separate
+   * tools-disabled backstop, used only outside schema mode) does not force
+   * tool use — it forces the opposite — so it is not gated here, consistent
+   * with oauthFetch.ts leaving `"none"` alone too.
+   */
+  private buildClaudeThinkingParam(
+    // Structural, not TextGenerationOptions: the streaming caller passes
+    // StreamOptions, and only these two fields are read.
+    options: { thinkingConfig?: { enabled?: boolean; budgetTokens?: number } },
+    maxTokens: number,
+    useFinalResultTool: boolean,
+  ): { type: "enabled"; budget_tokens: number } | undefined {
+    if (useFinalResultTool) {
+      if (options.thinkingConfig?.enabled) {
+        logger.debug(
+          "[GoogleVertex] Omitting thinking: schema mode forces tool_choice:any, which Anthropic rejects alongside thinking",
+        );
+      }
+      return undefined;
+    }
+    const budget = options.thinkingConfig?.budgetTokens;
+    if (!options.thinkingConfig?.enabled || !budget) {
+      return undefined;
+    }
+    // Two independent floors, checked explicitly rather than folded into one
+    // Math.max/min expression: Anthropic's own 1024 minimum on budget_tokens,
+    // and this function's 1024-token reservation for the answer that follows
+    // thinking. When maxTokens leaves no room for both — 1025..2047 is the
+    // narrow band where that happens — there is no valid budget, so thinking
+    // is omitted rather than silently coerced to exactly 1024 regardless of
+    // what the caller asked for.
+    if (maxTokens <= 1024) {
+      return undefined;
+    }
+    const clamped = Math.min(budget, maxTokens - 1024);
+    if (clamped < 1024) {
+      return undefined;
+    }
+    return { type: "enabled" as const, budget_tokens: clamped };
+  }
+
   private async executeNativeAnthropicStream(
     options: StreamOptions,
   ): Promise<StreamResult> {
@@ -4078,13 +4157,24 @@ export class GoogleVertexProvider extends BaseProvider {
       "vertex.anthropic.stream",
     );
 
+    const streamMaxTokens = resolveClaudeMaxTokens(
+      modelName,
+      options.maxTokens,
+    );
+    const streamThinking = this.buildClaudeThinkingParam(
+      options,
+      streamMaxTokens,
+      useFinalResultTool,
+    );
+
     const requestParams: Parameters<typeof client.messages.stream>[0] = {
       model: modelName,
       // Default to the model's real output ceiling (e.g. 64K for Sonnet 4.x)
       // instead of the legacy 4096, which silently truncated large structured
       // responses mid-JSON. resolveClaudeMaxTokens also clamps over-large
       // caller values so the native Vertex path never 400s.
-      max_tokens: resolveClaudeMaxTokens(modelName, options.maxTokens),
+      max_tokens: streamMaxTokens,
+      ...(streamThinking && { thinking: streamThinking }),
       messages: messages as Parameters<
         typeof client.messages.stream
       >[0]["messages"],
@@ -4135,7 +4225,10 @@ export class GoogleVertexProvider extends BaseProvider {
       output: unknown;
     }> = [];
 
-    const channel = createStreamChannel<{ content: string }>();
+    const channel = createStreamChannel<{
+      content: string;
+      reasoning?: string;
+    }>();
 
     // Mutable holders the StreamResult references. Background loop updates
     // these as state progresses; consumer reads them after iterating the
@@ -4146,6 +4239,10 @@ export class GoogleVertexProvider extends BaseProvider {
       total: number;
       cacheReadTokens?: number;
       cacheCreationTokens?: number;
+      // A SUBSET already included in `output` (Anthropic bills thinking
+      // tokens as part of output_tokens), so this is additive reporting
+      // only — never folded into output/total.
+      reasoning?: number;
     } = { input: 0, output: 0, total: 0 };
     const metadata: {
       streamId: string;
@@ -4730,6 +4827,9 @@ export class GoogleVertexProvider extends BaseProvider {
 
         const pump = (async () => {
           for await (const chunk of engineStream) {
+            if (chunk.reasoning) {
+              channel.push({ content: "", reasoning: chunk.reasoning });
+            }
             if (chunk.content) {
               channel.push({ content: chunk.content });
               liveTextPushedLength += chunk.content.length;
@@ -4760,6 +4860,12 @@ export class GoogleVertexProvider extends BaseProvider {
         if (engineResult) {
           usage.input += engineResult.usage.inputTokens;
           usage.output += engineResult.usage.outputTokens;
+          // A SUBSET already included in outputTokens above — added here
+          // only for observability, never folded into input/output/total.
+          if (engineResult.usage.reasoningTokens) {
+            usage.reasoning =
+              (usage.reasoning ?? 0) + engineResult.usage.reasoningTokens;
+          }
           finishReasonRef.value =
             engineResult.rawStopReason ?? finishReasonRef.value;
           // NOT `toolCalls.length === 0`: that array accumulates across the
@@ -5005,9 +5111,26 @@ export class GoogleVertexProvider extends BaseProvider {
                   tools,
                   messages: currentMessages,
                 });
+                // budget_tokens must stay below max_tokens or Anthropic 400s
+                // the call; terminalMaxTokens can land far below the ceiling
+                // streamThinking was sized against (the context guard can
+                // shrink it well under the original request), so the budget
+                // is rebuilt for the shrunk limit rather than inherited
+                // through the spread below.
+                const backstopThinking = this.buildClaudeThinkingParam(
+                  options,
+                  terminalMaxTokens,
+                  false,
+                );
                 const backstopStream = await client.messages.stream({
                   ...requestParams,
                   max_tokens: terminalMaxTokens,
+                  // Assigned outright, never a conditional spread: spreading
+                  // requestParams above may already carry a `thinking` sized
+                  // for the original max_tokens, and only adding a key when
+                  // backstopThinking is truthy would leave that stale value
+                  // in place instead of clearing it.
+                  thinking: backstopThinking,
                   tool_choice: { type: "none" as const },
                   system: cachedBackstop.system as Parameters<
                     typeof client.messages.stream
@@ -5044,7 +5167,35 @@ export class GoogleVertexProvider extends BaseProvider {
                   usage.output +
                   turnCacheUsage.read +
                   turnCacheUsage.creation;
+                // A SUBSET already included in usage.output above (Anthropic
+                // bills thinking as part of output_tokens) — additive only,
+                // matching the main loop's own usage.reasoning accumulation.
+                if (response.usage?.output_tokens_details?.thinking_tokens) {
+                  usage.reasoning =
+                    (usage.reasoning ?? 0) +
+                    response.usage.output_tokens_details.thinking_tokens;
+                }
                 lastStopReason = response.stop_reason;
+                // Extract<> rather than a hand-written object shape: the
+                // real SDK's ThinkingBlock also requires `signature`, which
+                // a literal `{ type: "thinking"; thinking: string }` predicate
+                // omits — TS then rejects the predicate as not assignable to
+                // ContentBlock. Extracting the union member sidesteps that
+                // without hard-coding its full shape here.
+                const backstopReasoning = response.content
+                  .filter(
+                    (
+                      block,
+                    ): block is Extract<
+                      (typeof response.content)[number],
+                      { type: "thinking" }
+                    > => block.type === "thinking",
+                  )
+                  .map((block) => block.thinking)
+                  .join("");
+                if (backstopReasoning) {
+                  channel.push({ content: "", reasoning: backstopReasoning });
+                }
                 const backstopText = (
                   response.content as VertexAnthropicContentBlock[]
                 )
@@ -5610,10 +5761,21 @@ export class GoogleVertexProvider extends BaseProvider {
       "vertex.anthropic.generate",
     );
 
+    const generateMaxTokens = resolveClaudeMaxTokens(
+      modelName,
+      options.maxTokens,
+    );
+    const generateThinking = this.buildClaudeThinkingParam(
+      options,
+      generateMaxTokens,
+      useFinalResultTool,
+    );
+
     const requestParams = {
       model: modelName,
       // Default to the model's real output ceiling (see stream path note).
-      max_tokens: resolveClaudeMaxTokens(modelName, options.maxTokens),
+      max_tokens: generateMaxTokens,
+      ...(generateThinking && { thinking: generateThinking }),
       messages,
       ...(tools && tools.length > 0 && { tools }),
       ...(useFinalResultTool && { tool_choice: { type: "any" as const } }),
@@ -5660,6 +5822,16 @@ export class GoogleVertexProvider extends BaseProvider {
     // ~1.25x cache-write tiers instead of billing everything at full input rate.
     let totalCacheReadTokens = 0;
     let totalCacheCreationTokens = 0;
+    // A SUBSET already included in totalOutputTokens above (Anthropic bills
+    // thinking tokens as part of output_tokens) — reported separately for
+    // observability, never folded into the input/output/total rollup.
+    let totalReasoningTokens = 0;
+    // Reasoning text has no tool-triggered accumulation path the way
+    // `accumulatedStepText` does (buildToolResultMessages only fires for
+    // steps with tool calls), so it is captured directly from the engine's
+    // per-chunk stream below — otherwise a plain one-shot thinking answer
+    // never surfaces its reasoning text at all.
+    let accumulatedReasoningText = "";
     // Track the final Anthropic stop_reason so we can surface finishReason
     // (notably "length" on token truncation) — the legacy native path always
     // reported "stop", hiding truncation from callers.
@@ -5959,15 +6131,30 @@ export class GoogleVertexProvider extends BaseProvider {
       },
     );
 
-    // Drained and discarded: generate() returns one result rather than
-    // streaming, and the per-step text is accumulated in
+    // Text chunks are discarded here: generate() returns one result rather
+    // than streaming, and the per-step text is accumulated in
     // buildToolResultMessages instead — appendStepText joins steps with a
     // NEWLINE, which a chunk-by-chunk `+=` here would silently drop, running
-    // consecutive steps' text together. The drain still has to happen:
-    // leaving the channel unread stalls the engine once its buffer fills.
+    // consecutive steps' text together. Reasoning has no such step-boundary
+    // hook (buildToolResultMessages only runs for steps WITH tool calls, so
+    // a plain one-shot thinking answer never reaches it), so it is captured
+    // directly off the chunk stream instead. The drain still has to happen
+    // regardless: leaving the channel unread stalls the engine once its
+    // buffer fills.
+    //
+    // The plain `+=` below is deliberate, not the same gap as the text path:
+    // each `chunk.reasoning` here is one `thinking_delta` from inside a
+    // single step (loopAdapter pushes one per delta, not one per step), so
+    // joining on a NEWLINE the way appendStepText does would insert a break
+    // before nearly every delta and fragment one coherent thinking block
+    // into one line per token. Concatenation across steps is a known,
+    // accepted blur — there is no per-step boundary on this channel to join
+    // on — while concatenation within a step is exactly what the API sent.
     const pump = (async () => {
       for await (const chunk of engineStream) {
-        void chunk;
+        if (chunk.reasoning) {
+          accumulatedReasoningText += chunk.reasoning;
+        }
       }
     })();
 
@@ -5996,6 +6183,7 @@ export class GoogleVertexProvider extends BaseProvider {
       totalOutputTokens += engineResult.usage.outputTokens;
       totalCacheReadTokens += engineResult.usage.cacheReadTokens ?? 0;
       totalCacheCreationTokens += engineResult.usage.cacheWriteTokens ?? 0;
+      totalReasoningTokens += engineResult.usage.reasoningTokens ?? 0;
       lastStopReason = engineResult.rawStopReason ?? lastStopReason;
       finalText = engineResult.text || finalText;
       // Replace in place: the terminal block and the finalization call both
@@ -6199,11 +6387,28 @@ export class GoogleVertexProvider extends BaseProvider {
               tools,
               messages: currentMessages,
             });
+            // budget_tokens must stay below max_tokens or Anthropic 400s the
+            // call; terminalMaxTokens can land far below the ceiling
+            // generateThinking was sized against (the context guard can
+            // shrink it well under the original request), so the budget is
+            // rebuilt for the shrunk limit rather than inherited through the
+            // spread below.
+            const backstopThinking = this.buildClaudeThinkingParam(
+              options,
+              terminalMaxTokens,
+              false,
+            );
             const response = await withTimeout(
               client.messages.create(
                 {
                   ...requestParams,
                   max_tokens: terminalMaxTokens,
+                  // Assigned outright, never a conditional spread: spreading
+                  // requestParams above may already carry a `thinking` sized
+                  // for the original max_tokens, and only adding a key when
+                  // backstopThinking is truthy would leave that stale value
+                  // in place instead of clearing it.
+                  thinking: backstopThinking,
                   tool_choice: { type: "none" as const },
                   system: cachedBackstop.system as Parameters<
                     typeof client.messages.create
@@ -6229,7 +6434,32 @@ export class GoogleVertexProvider extends BaseProvider {
               response.usage?.cache_read_input_tokens || 0;
             totalCacheCreationTokens +=
               response.usage?.cache_creation_input_tokens || 0;
+            // A SUBSET already included in totalOutputTokens above
+            // (Anthropic bills thinking as part of output_tokens) —
+            // additive only, matching the main loop's own accumulation.
+            totalReasoningTokens +=
+              response.usage?.output_tokens_details?.thinking_tokens ?? 0;
             lastStopReason = response.stop_reason;
+            // Extract<> rather than a hand-written object shape: the real
+            // SDK's ThinkingBlock also requires `signature`, which a literal
+            // `{ type: "thinking"; thinking: string }` predicate omits — TS
+            // then rejects the predicate as not assignable to ContentBlock.
+            // Extracting the union member sidesteps that without
+            // hard-coding its full shape here.
+            const backstopReasoning = response.content
+              .filter(
+                (
+                  block,
+                ): block is Extract<
+                  (typeof response.content)[number],
+                  { type: "thinking" }
+                > => block.type === "thinking",
+              )
+              .map((block) => block.thinking)
+              .join("");
+            if (backstopReasoning) {
+              accumulatedReasoningText += backstopReasoning;
+            }
             const backstopText = (
               response.content as VertexAnthropicContentBlock[]
             )
@@ -6360,6 +6590,10 @@ export class GoogleVertexProvider extends BaseProvider {
         ...(totalCacheCreationTokens > 0 && {
           cacheCreationTokens: totalCacheCreationTokens,
         }),
+        // A SUBSET already included in `output` above (Anthropic bills
+        // thinking tokens as part of output_tokens) — reported additively,
+        // never folded into output/total.
+        ...(totalReasoningTokens > 0 && { reasoning: totalReasoningTokens }),
       },
       responseTime,
       toolsUsed: externalToolCalls.map((tc) => tc.toolName),
@@ -6368,6 +6602,10 @@ export class GoogleVertexProvider extends BaseProvider {
         externalToolExecutions,
       ),
       enhancedWithTools: externalToolCalls.length > 0,
+      ...(accumulatedReasoningText && { reasoning: accumulatedReasoningText }),
+      ...(totalReasoningTokens > 0 && {
+        reasoningTokens: totalReasoningTokens,
+      }),
     };
 
     // Route through enhanceResult so analytics/evaluation/tracing are picked
@@ -8117,6 +8355,17 @@ export class GoogleVertexProvider extends BaseProvider {
   /**
    * Get model suggestions when a model is not found
    */
+  /**
+   * Candidate model ids for a "model not available" error.
+   *
+   * This list is static. It cannot know what the caller's project and region
+   * actually serve, so it must not claim to: it previously announced
+   * "always available" and included the requested model itself, which
+   * produced errors that recommended the very id that had just failed —
+   * `gemini-3-pro-preview-11-2025` suggesting `gemini-3-pro-preview-11-2025`.
+   * The requested model is now filtered out, and the wording says these are
+   * ids to try rather than ids known to work.
+   */
   private getModelSuggestions(requestedModel: string | undefined): string {
     const availableModels = {
       google: [
@@ -8143,22 +8392,34 @@ export class GoogleVertexProvider extends BaseProvider {
       ],
     };
 
-    let suggestions = "\n🤖 Google Models (always available):\n";
-    availableModels.google.forEach((model) => {
+    // Never offer the id that just failed back to the caller. Compared by
+    // base id (before "@") so a versioned request (e.g. "gemini-2.5-pro@002")
+    // still excludes the unversioned list entry it failed against.
+    const requestedBase = (requestedModel ?? "").split("@")[0].toLowerCase();
+    const notRequested = (model: string): boolean =>
+      model.split("@")[0].toLowerCase() !== requestedBase;
+    const google = availableModels.google.filter(notRequested);
+    const claude = availableModels.claude.filter(notRequested);
+
+    let suggestions =
+      "\n🤖 Google Models (availability depends on your project and region):\n";
+    google.forEach((model) => {
       suggestions += `  • ${model}\n`;
     });
 
     suggestions += "\n🧠 Claude Models (requires Anthropic integration):\n";
-    availableModels.claude.forEach((model) => {
+    claude.forEach((model) => {
       suggestions += `  • ${model}\n`;
     });
 
-    // If the requested model looks like a Claude model, provide specific guidance
+    // If the requested model looks like a Claude model, provide specific guidance.
+    // Worded without requestedModel so the just-failed id isn't echoed back here too.
     if (requestedModel && requestedModel.toLowerCase().includes("claude")) {
-      suggestions += `\n💡 Tip: "${requestedModel}" appears to be a Claude model.\n`;
+      suggestions +=
+        "\n💡 Tip: this model id appears to be a Claude model, which just failed.\n";
       suggestions +=
         "Ensure Anthropic integration is enabled in your Google Cloud project.\n";
-      suggestions += "Try using an available Claude model from the list above.";
+      suggestions += "Try another Claude model from the list above.";
     }
 
     return suggestions;
