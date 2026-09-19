@@ -80,6 +80,7 @@
     "test:context": "pnpm exec tsx test/continuous-test-suite-context.ts",
     "test:evaluation": "pnpm exec tsx test/continuous-test-suite-evaluation.ts",
     "test:handler-registry": "pnpm exec tsx test/continuous-test-suite-handler-registry.ts",
+    "test:harness-offline-timeout": "pnpm exec tsx test/continuous-test-suite-harness-offline-timeout.ts",
     "test:resolve-request-kind": "pnpm exec tsx test/continuous-test-suite-resolve-request-kind.ts",
     "test:mcp": "pnpm exec tsx test/continuous-test-suite-mcp-infra.ts",
     "test:tool-resolution": "pnpm exec tsx test/continuous-test-suite-tool-resolution.ts",
@@ -132,6 +133,7 @@
     "test:provider-fallback": "pnpm exec tsx test/continuous-test-suite-provider-fallback.ts",
     "test:provider-fallback-latency": "pnpm exec tsx test/continuous-test-suite-provider-fallback-latency.ts",
     "test:provider-wiring": "pnpm exec tsx test/continuous-test-suite-provider-wiring.ts",
+    "test:pdf-image-streaming": "pnpm exec tsx test/continuous-test-suite-pdf-image-streaming.ts",
     "test:rag": "pnpm exec tsx test/continuous-test-suite-rag.ts",
     "test:skills": "pnpm exec tsx test/continuous-test-suite-skills.ts",
     "test:servers": "pnpm exec tsx test/continuous-test-suite-servers.ts",
@@ -251,7 +253,8 @@
     "test:anthropic-execution-control": "tsx test/continuous-test-suite-anthropic-execution-control.ts",
     "test:aistudio-loop-characterization": "tsx test/continuous-test-suite-aistudio-loop-characterization.ts",
     "test:docs-mcp": "pnpm exec tsx test/continuous-test-suite-docs-mcp.ts",
-    "test:vertex-claude-characterization": "tsx test/continuous-test-suite-vertex-claude-characterization.ts"
+    "test:vertex-claude-characterization": "tsx test/continuous-test-suite-vertex-claude-characterization.ts",
+    "test:toolfree-guard-overhead": "pnpm exec tsx test/continuous-test-suite-toolfree-guard-overhead.ts"
   },
   "files": [
     "dist",
