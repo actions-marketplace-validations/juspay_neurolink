@@ -422,6 +422,60 @@ Consequences worth knowing before you go looking for them:
 directly.** If it does, it will be rejected, and the failure appears as a
 release-job error rather than anything resembling a permissions problem.
 
+### Stacked pull requests, and why they used to be unmergeable
+
+A **stacked** pull request is one whose base is another feature branch rather
+than `release`, opened so dependent work can proceed before its parent merges.
+They work now. They did not before, and the reason is worth keeping because it
+is invisible in exactly the way this repository keeps getting caught by.
+
+Four of the five required status contexts — `test`, `provider-safety-net`,
+`security-suites`, `build-check` — are **jobs inside `ci.yml`**. The fifth,
+`🔒 Single Commit Policy Validation`, comes from a separate workflow,
+`single-commit-enforcement.yml`. So a base-branch filter on `ci.yml`'s
+`pull_request` trigger does not decide whether those four checks pass. It
+decides whether they are **created at all**. Scoped to `branches: [release]`, a
+stacked PR got none of those four, and a check that was never created reports as
+_missing_, not as failing — which on a pull request is indistinguishable from
+"still queued". PR #1670 sat at **1 of 5** required contexts from the day it was
+opened, with nothing red to explain why.
+
+`single-commit-enforcement.yml` broke them a second, independent way. Its
+`pull_request` trigger was scoped to `[release, main]`, so a stacked PR fell
+through to the **push-event** path, which hardcoded `BASE_BRANCH="origin/release"`.
+Counting commits from `release` on a branch stacked on another feature branch
+includes the parent's commit, so a single-commit PR was reported as carrying two
+and failed a policy it had not broken.
+
+Both `pull_request` triggers are now unfiltered by base branch. The
+pull-request path already resolved the real base from `github.base_ref`; it was
+simply never reached. The push path now asks for the branch's open PR and uses
+its base, falling back to `release` when there is none.
+
+Two things to know when stacking:
+
+- **`push` in `ci.yml` is still scoped to `release`,** deliberately. Only
+  pull-request handling was widened.
+- **Merge the parent first, then rebase each child by hand.** Do not expect
+  GitHub to retarget a child for you, and omit `--delete-branch` on a parent
+  that still has an open child: deleting the base can **close** the child
+  outright rather than retarget it, which is the `#1696` incident recorded in
+  "⚠️ Merging a stack: `--delete-branch` closes the child" below. Rebase-merge
+  also replays the parent's commit under a new SHA, so the child still carries
+  the parent's old commit and fails the single-commit policy until it is
+  rebased — see "rebase-merge rewrites the parent, so rebase each child" for
+  the `git rebase --onto origin/release <parent-old-head>` recipe.
+
+  The same applies to a parent that is merely **force-pushed while still
+  open**, which is the more common case: rebasing a parent orphans the copy of
+  its commit that each child carries, and every child flips to `CONFLICTING`
+  the moment the parent is pushed. Rebasing #1668 and #1647 onto a moved
+  `release` did exactly that to #1670 and #1648, each of which needed
+  `git rebase --onto origin/<parent-branch> <parent-old-head>` before it was
+  mergeable again. Expect to fix up the whole stack, bottom-up, after touching
+  any link in it. A force-push does re-trigger stale bot reviews on the child,
+  but that is a cost of the rebase, not a reason to skip it.
+
 ### ⚠️ Reading a CI result: seven ways this repo has misread one
 
 Every incident below produced a confident wrong answer. The first four are the
@@ -676,6 +730,108 @@ by regenerating rather than by picking a side — `pnpm run build`, `pnpm run
 docs:api`, then `pnpm --dir docs-site run build` — and fold the result into the
 single commit. See the reproducible-generator section above for why a second
 build must produce zero drift.
+
+### ⚠️ The advisory gate is time-dependent: a green run expires
+
+`scripts/security-check.ts` — the "🔒 Security & Environment Validation" step
+inside `test-shards (validate)`, and therefore inside the required `test`
+check — runs `pnpm audit --prod --json` **live** against the advisory
+database. Nothing about its verdict is pinned to the commit.
+
+Two consequences, both of which have already produced wrong conclusions here:
+
+**A pull request's green is a statement about when it ran, not about its
+diff.** When the js-yaml and hono advisories were published, one PR's
+`validate` shard had run at 20:05 UTC and passed; another ran at 02:03 UTC
+and failed. Identical dependency trees. The first PR looked green and
+mergeable and was neither — a re-run would have failed it. **Do not treat a
+green `test` older than the newest advisory publication as current**, and
+never conclude from "this PR is green and that one is red" that the
+difference is in their diffs.
+
+**A red gate usually is not yours.** Because the audit is repo-wide and
+live, a newly published advisory turns `test` red on _every_ open pull
+request simultaneously, including ones that touch no manifest at all. The
+check's own output says so — it appends a note about the branch being behind
+`origin/release` and warns that the failure "may not originate in your
+changes." Before investigating your own diff, reproduce on the untouched
+`release` tip:
+
+```bash
+# A fixed path is not re-runnable: the second call dies with
+# `fatal: '/tmp/nl-audit' already exists` instead of auditing. Take a unique
+# directory, and remove the worktree outside the `&&` chain so a failed audit
+# still cleans up after itself.
+audit_dir="$(mktemp -d)/nl-audit"
+git fetch origin release \
+  && git worktree add "$audit_dir" origin/release \
+  && ( cd "$audit_dir" && pnpm install --frozen-lockfile \
+       && pnpm exec tsx scripts/security-check.ts )
+audit_status=$?
+# Guarded: if the fetch or the `worktree add` failed, there is nothing to
+# remove, and an unguarded remove prints `fatal: ... is not a working tree`
+# on exactly the failure path this section exists to de-confuse.
+[ -d "$audit_dir" ] && git worktree remove --force "$audit_dir"
+rm -rf "$(dirname "$audit_dir")"
+# Cleanup runs unconditionally, so the block's own exit status would otherwise
+# be the `rm`'s — 0 — and a caller that wraps this diagnostic in a script reads
+# a red gate as a pass, which is the exact misreading this section exists to
+# prevent. Restore the audit's status. `( exit N )` and not a bare
+# `exit "$audit_status"`: the latter closes the interactive shell you pasted
+# this into, while the subshell form still leaves `$?` correct for a script.
+( exit "$audit_status" )
+```
+
+Note `origin/release`, not `release`: the check reports how far behind
+`origin/release` you are, so auditing a stale local ref reproduces a tree CI
+never ran and sends you chasing a difference that is your own checkout. The
+throwaway worktree keeps it read-only — `git stash && git checkout` mutates
+the tree you are debugging, which is a poor trade for a diagnostic whose
+whole question is "was it already broken without me?" And `--frozen-lockfile`
+because that is how every CI job installs: a plain `pnpm install` may
+re-resolve a transitive range and hand you a tree CI never audited, which is
+the same class of mistake this whole section is about.
+
+If it fails there too, the fix belongs in its own dependency PR, not in
+whatever you were working on.
+
+**Fixing it: raise the floor, and move the override band with it.** Prefer
+bumping the declared range over adding an accepted-risk entry — an accepted
+risk silences the gate for everyone, while a floor bump is what actually
+protects downstream consumers, who resolve from `package.json` and never see
+our lockfile. Two things are easy to get wrong:
+
+- **A lockfile-only bump is not a fix.** It greens CI and leaves every
+  installer of the published package on the vulnerable version.
+- **A raised floor with a stale `pnpm.overrides` band is worse than no
+  override.** The entries lift transitive consumers to a version that was
+  patched for an _older_ advisory, which can sit inside the _new_ one's
+  vulnerable range.
+
+  The worked example is historical, and deliberately so — the repository has
+  since been fixed, so do not expect `package.json` to still show the broken
+  state. `GHSA-2883-xcg3-v3hh` covers `>=3.0.0 <3.15.2` **and**
+  `>=4.0.0 <4.3.2`; the js-yaml overrides then read `>=3.14.2` / `>=4.1.1`,
+  which are the fixes for an _earlier_ js-yaml advisory and sit **inside**
+  both of this one's bands. They now read `>=3.15.2` / `>=4.3.2`, on the band
+  edges, which is what correct looks like. The trap is the shape, not those
+  numbers: an override target that was patched for the advisory you fixed
+  last time.
+
+  A lockfile that happens to resolve a safe version hides this, so CI stays
+  green and the pin re-manifests on the next install that re-resolves a
+  transitive range. Note also that `pnpm audit` printed only the 4.x range —
+  the 3.x half was invisible. Check every range on the GHSA record, not just
+  the one the audit showed you:
+
+  ```bash
+  gh api graphql -f query='{securityVulnerabilities(first:10, ecosystem:NPM,
+    package:"<pkg>"){nodes{advisory{ghsaId} vulnerableVersionRange
+    firstPatchedVersion{identifier}}}}'
+  ```
+
+  `fast-xml-parser`, `undici` and now `js-yaml` in the same table are the
+  worked examples of a band kept in step with its floor.
 
 ### ⚠️ ffmpeg is deliberately not installed in CI
 
